@@ -1,0 +1,5 @@
+Enhancing Node app performance
+1.Use Node in 'Cluster' mode
+2.Use worker threads
+
+1.Clustering : creating multiple node server instances 

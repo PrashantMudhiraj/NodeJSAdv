@@ -1,0 +1,19 @@
+{
+  "name": "workerthreads",
+  "version": "1.0.0",
+  "description": "",
+  "license": "ISC",
+  "author": "",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "p-queue": "^9.0.1",
+    "piscina": "^5.1.4",
+    "poolifier": "^5.1.7",
+    "prom-client": "^15.1.3"
+  }
+}
