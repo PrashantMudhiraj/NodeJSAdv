@@ -11,10 +11,11 @@ app.get("/non-blocking/", (req, res) => {
 
 app.get("/blocking", async (req, res, next) => {
     try {
+        const buf = Buffer.from("Hello this is sample text !!!!!!!!!", "utf-8");
         const hash = await runWorker({
-            payload: Buffer.from(
-                "Hello this is sample text !!!!!!!!!",
-                "utf-8"
+            payload: buf.buffer.slice(
+                buf.byteOffset,
+                buf.byteOffset + buf.byteLength
             ),
         });
 
@@ -28,7 +29,14 @@ function runWorker(workerData) {
     return new Promise((resolve, reject) => {
         let settled = false;
 
-        const worker = new Worker("./worker.js", { workerData });
+        // Will create a new thread within same process, use IPC for communication between threads and shared libuv(thread pool -> no use)
+        // worker thread are used to run javascript code in parallel on multi thread within same Node.js process
+        // these are strictly used only for javascript code
+        // terminate the thread once task is done
+        // const worker = new Worker("./worker.js", { workerData });
+        const worker = new Worker("./worker.js");
+
+        worker.postMessage(workerData.payload, [workerData.payload]);
 
         const timeout = setTimeout(() => {
             if (settled) return;

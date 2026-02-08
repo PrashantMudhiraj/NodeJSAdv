@@ -1,0 +1,55 @@
+Communication between parent and child
+--------------------------------------
+
+1. Worker Threads
+        1. workerData
+                Parent
+                    new Worker("./worker.js", workerData : {x : 1})
+                child
+                    import {workerData , parentPort} from "node:worker_threads";
+                    console.log(workerData)
+
+        2. postMessage
+                Parent
+                    worker.postMessage({type : "start" , value : 10})
+                child
+                    import {workerData , parentPort} from "node:worker_threads";
+                    
+                    parentPort.on("message", (msg) => {
+                        console.log(msg)
+                    })
+
+        3. postMessage + Transferable Objects(Zero-Copy)
+                Parent
+                    // buf.buffer = arrayBuffer
+                    worker.postMessage(arrayBuffer , [arrayBuffer])
+                child
+                    parentPort.on("message" , (arrayBuffer) => {
+                        const buffer = Buffer.from(arrayBuffer);
+                        console.log(buffer.toString())
+                    })
+
+        4. SharedArrayBuffer (true shared memory)
+
+            - Memory visible to both threads
+            - No transfer, no copy
+            - requires Atomics - used for SharedArrayBuffer and ArrayBuffer
+
+                Parent
+                    const sab = new SharedArrayBuffer(4); // length 4 bytes
+                    const view = new Int32Array(sab);
+                    new Worker("./worker.js" , {workerData : sab})
+                child
+                    const arr = new Int32Array(workerData)
+                    Atomics.add(arr,0,1); // learn more about atomics'
+                    
+        5. MessageChannel() -> advanced
+
+
+2. Child_process/Cluster
+        Parent
+            child.send({task : "run"});
+        child
+            process.on("message" ,msg => {
+                console.log(msg)
+            })

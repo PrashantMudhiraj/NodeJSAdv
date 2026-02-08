@@ -1,0 +1,355 @@
+# NodeCodes
+
+### Coding Question on Nodejs
+
+- [NodeCodes](#nodecodes)
+    - [Coding Question on Nodejs](#coding-question-on-nodejs)
+    - [Websites](#websites)
+        - [1. Write a function in Node.js that reads a file named "data.txt" and logs its contents to the console](#1-write-a-function-in-nodejs-that-reads-a-file-named-datatxt-and-logs-its-contents-to-the-console)
+        - [2. Write a function in Node.js that creates a new directory named "logs" and logs a message to a file named "info.log" inside the directory](#2-write-a-function-in-nodejs-that-creates-a-new-directory-named-logs-and-logs-a-message-to-a-file-named-infolog-inside-the-directory)
+        - [3. Write a function in Node.js that fetches data from an API endpoint using the Axios library and returns the response](#3-write-a-function-in-nodejs-that-fetches-data-from-an-api-endpoint-using-the-axios-library-and-returns-the-response)
+        - [4. Write a function in Node.js that uses the native "http" module to create a simple HTTP server that listens on port 3000 and returns a "Hello, world!" message to any incoming request.](#4-write-a-function-in-nodejs-that-uses-the-native-http-module-to-create-a-simple-http-server-that-listens-on-port-3000-and-returns-a-hello-world-message-to-any-incoming-request)
+        - [5. Write a function in Node.js that accepts a command-line argument and logs it to the console](#5-write-a-function-in-nodejs-that-accepts-a-command-line-argument-and-logs-it-to-the-console)
+        - [6. Write a function in Node.js that reads a CSV file named "data.csv" and converts its contents to JSON format](#6-write-a-function-in-nodejs-that-reads-a-csv-file-named-datacsv-and-converts-its-contents-to-json-format)
+        - [7. Write a function in Node.js that uses the "fs" module to recursively list all files and directories in a given directory](#7-write-a-function-in-nodejs-that-uses-the-fs-module-to-recursively-list-all-files-and-directories-in-a-given-directory)
+        - [8. Write a function in Node.js that accepts a POST request containing JSON data and saves it to a file named "data.json"](#8-write-a-function-in-nodejs-that-accepts-a-post-request-containing-json-data-and-saves-it-to-a-file-named-datajson)
+        - [9. Write a function in Node.js that uses the "crypto" module to generate a random 32-byte hexadecimal string](#9-write-a-function-in-nodejs-that-uses-the-crypto-module-to-generate-a-random-32-byte-hexadecimal-string)
+        - [10. Write a function in Node.js that uses the "cluster" module to create a simple cluster of worker processes that each log a message to the console](#10-write-a-function-in-nodejs-that-uses-the-cluster-module-to-create-a-simple-cluster-of-worker-processes-that-each-log-a-message-to-the-console)
+        - [11. Write a function that returns a Promise which resolves with a random number after a delay of 1 second](#11-write-a-function-that-returns-a-promise-which-resolves-with-a-random-number-after-a-delay-of-1-second)
+        - [12. Write a function that returns a Promise which rejects with an error message after a delay of 500ms](#12-write-a-function-that-returns-a-promise-which-rejects-with-an-error-message-after-a-delay-of-500ms)
+        - [13. Write a function that takes an array of numbers as input and returns a Promise which resolves with the sum of all the numbers in the array](#13-write-a-function-that-takes-an-array-of-numbers-as-input-and-returns-a-promise-which-resolves-with-the-sum-of-all-the-numbers-in-the-array)
+        - [14. Write a function that takes an array of Promises as input and returns a Promise which resolves with an array of resolved values from the input Promises](#14-write-a-function-that-takes-an-array-of-promises-as-input-and-returns-a-promise-which-resolves-with-an-array-of-resolved-values-from-the-input-promises)
+        - [15. Write a function that fetches data from an API endpoint using the Axios library and returns a Promise which resolves with the response data. The function should reject the Promise if the API request fails](#15-write-a-function-that-fetches-data-from-an-api-endpoint-using-the-axios-library-and-returns-a-promise-which-resolves-with-the-response-data-the-function-should-reject-the-promise-if-the-api-request-fails)
+
+### Websites
+
+- [Mediums](https://medium.com/@nitinsgavane/node-js-coding-round-success-must-know-questions-and-solutions-3f7614d3278b)
+- [CodePard](https://coderpad.io/interview-questions/nodejs-interview-questions/)
+- [GeeksForGeeks](https://www.geeksforgeeks.org/node-js/nodejs-interview-questions-and-answers-intermediate-level/)
+- [Roadmap.sh](https://roadmap.sh/questions/nodejs)
+
+---
+
+#### 1. Write a function in Node.js that reads a file named "data.txt" and logs its contents to the console
+
+```js
+const fs = require("fs");
+
+function logFileContent() {
+    fs.readFile("./data.txt", "utf-8", (err, data) => {
+        if (err) throw err;
+        console.log(data);
+    });
+}
+
+logFileContent();
+```
+
+**[⬆ Back to Top](#coding-question-on-nodejs)**
+
+---
+
+#### 2. Write a function in Node.js that creates a new directory named "logs" and logs a message to a file named "info.log" inside the directory
+
+```js
+const fs = require("fs");
+
+function logToFile() {
+    let myData = "Logging to file info.log";
+    fs.mkdir("./logs", { recursive: true }, (err) => {
+        if (err) throw err;
+        else {
+            fs.writeFile("./logs/info.log", myData, (err) => {
+                if (err) throw err;
+            });
+        }
+    });
+}
+
+logToFile();
+```
+
+**[⬆ Back to Top](#coding-question-on-nodejs)**
+
+---
+
+#### 3. Write a function in Node.js that fetches data from an API endpoint using the Axios library and returns the response
+
+```js
+const axios = require("axios");
+
+async function fetchData() {
+    try {
+        const data = await axios.get(
+            "https://random-data-api.com/api/v2/users",
+        );
+        return data;
+    } catch (error) {
+        throw error;
+    }
+}
+
+fetchData()
+    .then((data) => console.log(data.data))
+    .catch((error) => console.log(error));
+```
+
+**[⬆ Back to Top](#coding-question-on-nodejs)**
+
+---
+
+#### 4. Write a function in Node.js that uses the native "http" module to create a simple HTTP server that listens on port 3000 and returns a "Hello, world!" message to any incoming request.
+
+```js
+const http = require("http");
+
+http.createServer((req, res) => {
+    res.end("Hello World!!");
+}).listen(3000);
+```
+
+**[⬆ Back to Top](#coding-question-on-nodejs)**
+
+---
+
+#### 5. Write a function in Node.js that accepts a command-line argument and logs it to the console
+
+```js
+function getArgs() {
+    let args = process.argv.slice(2);
+    console.log(args);
+}
+
+getArgs();
+```
+
+**[⬆ Back to Top](#coding-question-on-nodejs)**
+
+---
+
+#### 6. Write a function in Node.js that reads a CSV file named "data.csv" and converts its contents to JSON format
+
+```js
+const fs = require("fs").promises;
+
+async function csvToJSON() {
+    let data = await fs.readFile("./data.csv", "utf8");
+    let arr = data.split("\n");
+    let json = [];
+    let keys = arr[0].split(",");
+
+    for (let i = 1; i < arr.length; i++) {
+        let obj = {};
+        let values = arr[i].split(",");
+
+        for (let j = 0; j < keys.length; j++) {
+            obj[keys[j]] = values[j];
+        }
+
+        json[i - 1] = obj;
+    }
+
+    return JSON.stringify(json);
+}
+
+csvToJSON().then((data) => console.log(data));
+```
+
+**[⬆ Back to Top](#coding-question-on-nodejs)**
+
+---
+
+#### 7. Write a function in Node.js that uses the "fs" module to recursively list all files and directories in a given directory
+
+```js
+const fs = require("fs");
+const path = require("path");
+
+function listFiles() {
+    let directoryPath = "../";
+
+    fs.readdir(directoryPath, (err, directories) => {
+        if (err) throw err;
+        directories.forEach((directory) => {
+            fs.readdir(path.join(__dirname, "/..", directory), (err, files) => {
+                console.log("Directory: ", directory, "files: ", files);
+            });
+        });
+    });
+}
+
+listFiles();
+```
+
+**[⬆ Back to Top](#coding-question-on-nodejs)**
+
+---
+
+#### 8. Write a function in Node.js that accepts a POST request containing JSON data and saves it to a file named "data.json"
+
+```js
+const http = require("http");
+const fs = require("fs");
+
+http.createServer((req, res) => {
+    if (req.method === "POST" && req.url === "/") {
+        req.on("data", (chunk) => {
+            fs.writeFile("./data.json", chunk, (err) => {
+                if (err) throw err;
+            });
+        });
+
+        res.end();
+    }
+}).listen(3000);
+```
+
+**[⬆ Back to Top](#coding-question-on-nodejs)**
+
+---
+
+#### 9. Write a function in Node.js that uses the "crypto" module to generate a random 32-byte hexadecimal string
+
+```js
+const crypto = require("crypto");
+
+function getRandomHex() {
+    let bytes = crypto.randomBytes(32).toString("hex");
+    console.log(bytes);
+}
+
+getRandomHex();
+```
+
+**[⬆ Back to Top](#coding-question-on-nodejs)**
+
+---
+
+#### 10. Write a function in Node.js that uses the "cluster" module to create a simple cluster of worker processes that each log a message to the console
+
+```js
+const cluster = require("cluster");
+const { availableParallelism } = require("os");
+
+const numCPUs = availableParallelism();
+
+function generateClusters() {
+    if (cluster.isPrimary) {
+        console.log("Primary Cluster: ", process.pid);
+
+        for (let i = 0; i < numCPUs; i++) {
+            let worker = cluster.fork();
+
+            worker.on("online", () => {
+                console.log("Worker online: ", worker.process.pid);
+            });
+        }
+    }
+}
+
+generateClusters();
+```
+
+**[⬆ Back to Top](#coding-question-on-nodejs)**
+
+---
+
+#### 11. Write a function that returns a Promise which resolves with a random number after a delay of 1 second
+
+```js
+function randomPromise() {
+    let p = new Promise((resolve, reject) => {
+        setTimeout(() => {
+            resolve(Math.floor(Math.random() * 100));
+        }, 1000);
+    });
+
+    return p;
+}
+
+randomPromise().then((data) => console.log(data));
+```
+
+**[⬆ Back to Top](#coding-question-on-nodejs)**
+
+---
+
+#### 12. Write a function that returns a Promise which rejects with an error message after a delay of 500ms
+
+```js
+function rejectPromise() {
+    let p = new Promise((resolve, reject) => {
+        setTimeout(() => {
+            reject(new Error("Error Message"));
+        }, 500);
+    });
+
+    return p;
+}
+
+rejectPromise().catch((err) => console.log(err));
+```
+
+**[⬆ Back to Top](#coding-question-on-nodejs)**
+
+---
+
+#### 13. Write a function that takes an array of numbers as input and returns a Promise which resolves with the sum of all the numbers in the array
+
+```js
+function sumArray(arr) {
+    let p = new Promise((resolve, reject) => {
+        let sum = arr.reduce((acc, current) => (acc += current));
+        resolve(sum);
+    });
+
+    return p;
+}
+
+sumArray([1, 2, 3, 4]).then((data) => console.log(data));
+```
+
+**[⬆ Back to Top](#coding-question-on-nodejs)**
+
+---
+
+#### 14. Write a function that takes an array of Promises as input and returns a Promise which resolves with an array of resolved values from the input Promises
+
+```js
+function resolvePromise(p) {
+    return Promise.all(p);
+}
+
+let p1 = Promise.resolve(1);
+let p2 = Promise.resolve(2);
+let p3 = Promise.resolve(3);
+
+resolvePromise([p1, p2, p3])
+    .then((data) => console.log(data))
+    .catch((err) => console.log(err));
+```
+
+**[⬆ Back to Top](#coding-question-on-nodejs)**
+
+---
+
+#### 15. Write a function that fetches data from an API endpoint using the Axios library and returns a Promise which resolves with the response data. The function should reject the Promise if the API request fails
+
+```js
+const axios = require("axios");
+
+function fetchData() {
+    return axios
+        .get("https://random-data-api.com/api/v2/users")
+        .then((data) => data.data)
+        .catch((error) => error);
+}
+
+fetchData()
+    .then((data) => console.log(data))
+    .catch((err) => console.log(err));
+```
+
+**[⬆ Back to Top](#coding-question-on-nodejs)**
+
+---

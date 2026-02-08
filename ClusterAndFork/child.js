@@ -1,4 +1,4 @@
-const crypto = require("crypto");
+import crypto from "crypto";
 
 // child.js
 process.on("uncaughtException", (err) => {
@@ -16,6 +16,7 @@ process.on("uncaughtException", (err) => {
 
 process.on("message", (msg) => {
     console.log(msg);
+    doWork();
 });
 
 function doWork() {
@@ -27,7 +28,6 @@ function doWork() {
     process.send({ status: "done", message: "created hash", pid: process.pid });
 }
 
-doWork();
 process.on("error", (err) => {
     process.send({ type: "error", message: err.message, stack: err.stack });
 });

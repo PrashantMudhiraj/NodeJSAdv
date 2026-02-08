@@ -16,7 +16,7 @@ function doRequest() {
 }
 
 function doHash() {
-    // crypto used threadpool
+    // crypto used thread pool
     crypto.pbkdf2("a", "b", 100000, 512, "sha512", () => {
         console.log("Hash:", Date.now() - start);
     });

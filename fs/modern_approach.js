@@ -36,7 +36,7 @@ async function writeFileAsync() {
         const data = { name: "Prashant", age: 26, location: "Hyderabad" };
         await fs.writeFile(
             "data.json",
-            JSON.stringify(data, null, "\t"),
+            JSON.stringify(data, null, "\t"), // (value , replacer , space(tab))
             "utf-8"
         );
 

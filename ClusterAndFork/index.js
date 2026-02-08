@@ -1,7 +1,7 @@
-const cluster = require("cluster");
-const os = require("node:os");
-const crypto = require("crypto");
-const { fork } = require("node:child_process");
+import cluster from "cluster";
+import os from "node:os";
+import crypto from "crypto";
+import { fork } from "node:child_process";
 
 // //Check running on master mode
 // if (cluster.isPrimary) {
@@ -16,20 +16,23 @@ const { fork } = require("node:child_process");
 //     });
 // } else {
 //Im a child, Im going to act like a server and do nothing
-const express = require("express");
+import express from "express";
 
 const app = express();
 
 app.get("/", (req, res) => {
     console.log("GET /");
 
+    // Fork is a specialized version of spawn meant only for Node.js Scripts.
+    // Only for Javascript files
+    // child process has its own v8,event loop and memory
     const child = fork("./child.js");
     const child1 = fork("./child.js");
 
     child.on("message", (msg) => {
         console.log(msg);
         if (msg.type == "error") res.send("Task Failed " + msg.stack);
-        else res.send("Task Completed " + msg?.message);
+        else res.send("Task Completed " + msg?.message + " " + msg?.pid);
     });
 
     child1.on("message", (msg) => {

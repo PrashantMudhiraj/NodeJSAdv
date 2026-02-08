@@ -3,3 +3,100 @@ Enhancing Node app performance
 2.Use worker threads
 
 1.Clustering : creating multiple node server instances 
+
+
+1. cluster/fork (Processes) : independent libuv (per process)
+
+OS
+│
+├── Process 1
+│   ├── V8
+│   ├── Event Loop
+│   ├── libuv thread pool (4)
+│
+├── Process 2
+│   ├── V8
+│   ├── Event Loop
+│   ├── libuv thread pool (4)
+
+
+2. worker threads (Threads) : shared libuv
+
+SINGLE NODE.JS PROCESS
+│
+├── Main Thread
+│   ├── V8 Isolate
+│   ├── Event Loop (uv_loop_t)
+│
+├── Worker Thread 1
+│   ├── V8 Isolate
+│   ├── Event Loop (uv_loop_t)
+│
+├── Worker Thread 2
+│   ├── V8 Isolate
+│   ├── Event Loop (uv_loop_t)
+│
+└── libuv THREAD POOL (shared)
+    ├── Thread #1
+    ├── Thread #2
+    ├── Thread #3
+    └── Thread #4 (default)
+
+------------------------------------------------------------------------------
+
+| Aspect              | child_process (fork) | cluster                       | worker_threads        |
+| ------------------- | -------------------- | -----------------------------| --------------------- |
+| OS process          | ✅ New process       | ✅ New process per worker    | ❌ Same process        |
+| Threads             | 1 per process        | 1 per process                  | ✅ Multiple threads    |
+| V8 engine           | ✅ Separate          | ✅ Separate                    | ✅ Separate isolate    |
+| Event loop          | ✅ Separate          | ✅ Separate                    | ✅ Separate per thread |
+| libuv thread pool   | ✅ Separate          | ✅ Separate                    | ❌ Shared              |
+| JS parallelism      | ❌ No                | ❌ No                          | ✅ Yes                 |
+| Memory sharing      | ❌ No                | ❌ No                          | ✅ Optional            |
+| Crash isolation     | ✅ High              | ✅ High                        | ❌ Low                 |
+| Startup cost        | High                 | High                            | Low                   |
+| IPC speed           | Medium               | Medium                          | Fast                  |
+| HTTP load balancing | ❌ No                | ✅ Yes                         | ❌ No                  |
+| Best for            | Isolation, jobs      | Scaling traffic                 | CPU-heavy JS          |
+
+
+------------------------------------------------------------------------------
+
+child_process (fork)
+-------------------
+
+Creates a new Node.js process
+
+Strong isolation, safe crashes
+
+Best for background jobs and task separation
+
+Slower IPC, higher memory
+
+🧠 Remember: “fork = isolation”
+
+cluster
+-------
+
+Built on top of fork()
+
+Multiple Node.js processes share same port
+
+Best for scaling HTTP servers
+
+No shared memory
+
+🧠 Remember: “cluster = traffic scaling”
+
+worker_threads
+--------------
+
+Runs JS in parallel
+
+Same process, multiple threads
+
+Separate V8 + event loop per worker
+
+Shared libuv thread pool
+
+🧠 Remember: “workers = CPU parallelism”
