@@ -19,14 +19,14 @@ for (let i = 0; i < total; i++) {
             console.log("Elapsed:", Date.now() - start, "ms");
             console.log(
                 "Observed max concurrent finishes (approx):",
-                maxSimultaneousFinishes
+                maxSimultaneousFinishes,
             );
             console.log(
                 "process.env.UV_THREADPOOL_SIZE:",
-                process.env.UV_THREADPOOL_SIZE || 4
+                process.env.UV_THREADPOOL_SIZE || 4,
             );
             console.log(
-                "Note: if env var is undefined, libuv defaults to 4 threads."
+                "Note: if env var is undefined, libuv defaults to 4 threads.",
             );
         }
     });
