@@ -4,15 +4,6 @@
 
 This document expands the workspace summary into practical, in-depth notes for each advanced Node.js topic represented in this repository. Each section includes: conceptual explanation, key APIs, example snippets, best practices, common pitfalls, and links to example files in this workspace.
 
-> **📊 Diagram Rendering Note:** This document includes Mermaid diagrams which render best in:
->
-> - **GitHub** (fully supported)
-> - **VS Code** with Markdown Preview (Ctrl+Shift+V)
-> - **GitLab**, **Notion**, and other markdown viewers with Mermaid support
-> - Online renderers: [mermaid.live](https://mermaid.live)
->
-> If diagrams appear as code blocks, open this file in a markdown viewer with Mermaid support.
-
 ## Table of Contents
 
 **Phase 1 — Node.js Fundamentals & Internals**
