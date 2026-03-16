@@ -118,76 +118,117 @@ graph TD
 
 ### Module Resolution Algorithm
 
+> 📖 **What this example demonstrates:** When you type `require('something')`, Node doesn't magically find it — it follows a **strict search order**. Understanding this order helps you debug "Cannot find module" errors and understand why the same package can have multiple versions on disk.
+>
+> 🔑 **Key terms:**
+>
+> - **`require.resolve(name)`** — Tells you the **full file path** Node would load for that module, without actually loading it. Useful for debugging.
+> - **`node_modules/`** — The folder where npm installs packages. Node searches this folder starting from your file's directory, then checks every parent directory up to `/`.
+
 ```js
-// When you call require('my-module'), Node searches:
-// 1. Built-in modules (fs, http, path, etc.)
-// 2. node_modules in current directory
-// 3. node_modules in parent directory (repeats up to root)
-// 4. Global install paths
+// When you call require('my-module'), Node searches in this EXACT order:
+// 1. Built-in modules first — things like 'fs', 'http', 'path' that ship with Node itself
+// 2. node_modules/ in the SAME directory as the current file
+// 3. node_modules/ in the PARENT directory (goes all the way up to the root /)
+// 4. Global install paths (like /usr/local/lib/node_modules)
+// If nothing found → throws "Error: Cannot find module"
 
-// Exact resolution order for require('./utils'):
-// ./utils.js → ./utils.json → ./utils.node → ./utils/index.js → ./utils/index.json
+// For a RELATIVE path like require('./utils'), Node tries extensions in this order:
+// Step 1: ./utils.js       ← Is there a file named utils.js?
+// Step 2: ./utils.json     ← Is there a JSON file?
+// Step 3: ./utils.node     ← Is there a compiled native addon?
+// Step 4: ./utils/index.js ← Is 'utils' a folder with an index.js inside?
+// Step 5: ./utils/index.json
 
-// Check resolved path:
-console.log(require.resolve("express")); // Full absolute path to entry point
+// 🛠️ Debugging tip: See exactly which file gets loaded:
+console.log(require.resolve("express"));
+// Might print: C:\Users\you\project\node_modules\express\index.js
+// This is the ACTUAL file Node will load when you write require('express')
 ```
 
 ### Module Caching & Singletons
 
+> 📖 **What this example demonstrates:** Node loads each module **once** and caches the result. Every `require()` call for the same module returns the **exact same JavaScript object** from memory. This is not a copy — it's the same reference. This behaviour makes it easy to create **singletons** (objects that only exist once in your whole app, like a database connection).
+>
+> 🔑 **Key terms:**
+>
+> - **Singleton** — A design pattern where only ONE instance of something exists. Example: you want only one database connection pool, not a new one every time you call `require('./db')`.
+> - **`require.cache`** — An internal object Node uses to store all loaded modules. The key is the file path, the value is the module object.
+
 ```js
-// Modules are cached: require() returns SAME object every time
-// counter.js
-let count = 0;
+// ── FILE: counter.js ────────────────────────────────────────
+let count = 0; // This variable lives for the lifetime of the process
+
 module.exports = {
+    // ++count: increments THEN returns, so first call gives 1
     increment: () => ++count,
-    getCount: () => count,
+    getCount: () => count, // Returns current value without changing it
 };
 
-// app.js
-const counter1 = require("./counter");
-const counter2 = require("./counter");
-counter1.increment();
-console.log(counter2.getCount()); // 1 — Same instance!
+// ── FILE: app.js ─────────────────────────────────────────────
+const counter1 = require("./counter"); // First load: executes counter.js, caches it
+const counter2 = require("./counter"); // Second load: RETURNS THE CACHE — does NOT re-run counter.js
 
-// Verify caching:
-console.log(counter1 === counter2); // true
+counter1.increment(); // count is now 1 inside counter.js
+console.log(counter2.getCount()); // Prints: 1 — ← Both counter1 and counter2 point to the SAME object!
 
-// ⚠️ Force re-load (NOT recommended in production):
-delete require.cache[require.resolve("./counter")];
-const counter3 = require("./counter");
-console.log(counter3.getCount()); // 0 — Fresh instance
+// Proof they are literally the same object in memory:
+console.log(counter1 === counter2); // true — same reference, not a copy
+
+// ⚠️ Force a module to reload (ONLY use in development hot-reload scenarios)
+// 'require.resolve' gives us the full file path (the cache key)
+delete require.cache[require.resolve("./counter")]; // Remove from cache
+const counter3 = require("./counter"); // Now re-executes counter.js → fresh count = 0
+console.log(counter3.getCount()); // Prints: 0 — fresh start
+// NOTE: counter1 and counter2 still point to the OLD object. Only counter3 is fresh.
 ```
 
 ### Circular Dependencies
 
-```js
-// ❌ PROBLEM: Circular require
-// a.js
-const b = require("./b");
-console.log("In A, b.value =", b.value); // undefined (b hasn't finished!)
-module.exports = { value: "A" };
+> 📖 **What this example demonstrates:** A **circular dependency** happens when Module A loads Module B, and Module B also loads Module A. Node doesn't crash — instead it returns a **partially-filled exports object** for the module still being loaded. This leads to mysterious `undefined` values that are hard to debug.
+>
+> 🔑 **Key terms:**
+>
+> - **Circular dependency** — A → B → A loop. Like employee A needing employee B's phone number, but B's directory card says "see employee A" for contact info.
+> - **Partial exports** — When Node detects a cycle, it gives the requesting module whatever has been exported **so far** — which may be empty `{}` if the module hasn't finished running yet.
+> - **Lazy require** — Delaying a `require()` call until it's inside a function, so it runs **after** all modules have finished setting up.
+> - **Live bindings (ESM)** — ES Modules don't give you a snapshot of exports at load time. Instead they give you a **live reference** — like a pointer. When the exporting module later updates its value, all importers see the new value automatically.
 
-// b.js
-const a = require("./a");
-console.log("In B, a.value =", a.value); // 'A' or undefined depending on load order
+```js
+// ── ❌ PROBLEM: Circular require creates a chicken-and-egg problem ────────────
+
+// FILE: a.js — runs first
+const b = require("./b"); // Node starts loading b.js...
+// But b.js needs a.js! Node gives b.js the CURRENT (empty) exports of a.js
+console.log("In A, b.value =", b.value); // undefined — b.js hasn't finished yet!
+module.exports = { value: "A" }; // Too late — b.js already got the empty version
+
+// FILE: b.js — loaded while a.js is mid-execution
+const a = require("./a"); // a.js is currently being loaded — Node returns what a.js has exported SO FAR
+console.log("In B, a.value =", a.value); // Could print: undefined (if a.js hasn't set exports yet)
 module.exports = { value: "B" };
 
-// ✅ Fix 1: Lazy require (defer to function call)
+// ── ✅ Fix 1: Lazy require — wrap require() inside a function ─────────────────
+// By the time getB() is CALLED, both modules have fully loaded
 // a.js
 module.exports = {
     value: "A",
-    getB: () => require("./b"), // Loaded only when called
+    getB: () => require("./b"), // require() runs here (at call time), not at file load time
 };
+// Now: const a = require('./a'); a.getB() works correctly because b.js is fully loaded by then
 
-// ✅ Fix 2: Restructure — extract shared code into a third module
-// shared.js (no circular deps)
+// ── ✅ Fix 2: Extract shared code into a third module ─────────────────────────
+// If A and B both need the same thing, put it in shared.js
+// shared.js has no dependencies on A or B — no cycle possible
 module.exports = { sharedValue: "shared" };
+// Now A requires shared.js and B requires shared.js — no cycle
 
-// ✅ Fix 3: Use ESM (live bindings handle circular deps better)
+// ── ✅ Fix 3: ES Modules handle cycles gracefully with live bindings ──────────
+// In ESM, even if there's a cycle, the binding is always up-to-date
 // a.mjs
-import { value } from "./b.mjs";
+import { value } from "./b.mjs"; // ESM: a.mjs gets a LIVE REFERENCE to b.mjs's 'value' export
 export const aValue = "A";
-// ESM provides live binding — value updates when b.mjs sets it
+// When b.mjs finally sets value = "B", this import automatically reflects that — no undefined!
 ```
 
 ### Senior-Level Q&A
@@ -200,33 +241,58 @@ A: `require()` is synchronous (CJS), `import` is asynchronous (ESM). You can:
 - Use `createRequire()` to use `require()` inside ESM files
 - Cannot use static `import` in CJS files
 
+> 📖 **What this example demonstrates:** CJS and ESM are different systems but you sometimes need to mix them — e.g., your project is CJS but you want to use a package that only ships as ESM, or vice versa.
+>
+> 🔑 **Key terms:**
+>
+> - **Dynamic import `import()`** — A function (not a keyword) that loads an ES Module asynchronously at runtime. Works inside CJS files. Returns a Promise.
+> - **`createRequire()`** — A utility that creates a `require` function you can use inside an ES Module file (`.mjs`). Normally `.mjs` files can't use `require()`.
+> - **`import.meta.url`** — Inside an ES Module, this gives you the full URL/path of the current file. `createRequire` needs this to resolve paths correctly.
+
 ```js
-// CJS file using dynamic import
+// ── CJS file (.js) using dynamic import to load an ES Module ─────────────────
 const loadESM = async () => {
+    // import() returns a Promise — we must await or .then() it
+    // The result is an object where 'default' is the module's default export
     const { default: esModule } = await import("./es-module.mjs");
     return esModule;
 };
+// Why: Your project is CJS but you want to use a modern ESM-only library
 
-// ESM file using require
-import { createRequire } from "module";
-const require = createRequire(import.meta.url);
-const cjsModule = require("./cjs-module.js");
+// ── ESM file (.mjs) using createRequire to load a CommonJS module ─────────────
+import { createRequire } from "module"; // Built-in Node.js 'module' package
+// createRequire() creates a require() function anchored to this file's location
+const require = createRequire(import.meta.url); // import.meta.url = path of this .mjs file
+const cjsModule = require("./cjs-module.js"); // Now require() works inside an .mjs file
+// Why: Your project is ESM but you depend on an old CJS-only library
 ```
 
 **Q2: How does `require.cache` work? When would you clear it?**
 
 A: `require.cache` is an object mapping resolved filenames to loaded modules. Clearing it forces re-evaluation.
 
-```js
-// Inspect the cache
-console.log(Object.keys(require.cache)); // All loaded module paths
+> 📖 **What this example demonstrates:** `require.cache` is like a dictionary/map where each key is a full file path and each value is the loaded module. Deleting an entry forces Node to re-read and re-execute that file on the next `require()` call. Useful for **hot config reload** in development — change a config file while the server is running, call `reloadConfig()`, and the server picks up the changes without restarting.
 
-// Use case: Hot-reload config in development
+```js
+// require.cache looks like this internally:
+// {
+//   '/app/node_modules/express/index.js': { exports: {...}, loaded: true, ... },
+//   '/app/config.js': { exports: { port: 3000 }, loaded: true, ... },
+//   ...one entry per loaded file
+// }
+console.log(Object.keys(require.cache)); // List all currently cached module file paths
+
+// Use case: Hot-reload config file during development
+// (NOT recommended in production — use environment variables or a config service instead)
 function reloadConfig() {
-    const configPath = require.resolve("./config");
-    delete require.cache[configPath];
-    return require("./config");
+    const configPath = require.resolve("./config"); // Gets the full absolute path (the cache key)
+    delete require.cache[configPath]; // Remove this file from cache — next require will re-read the file
+    return require("./config"); // Re-executes config.js and returns fresh exports
 }
+
+// Example use:
+// Before: process.env change or file edit
+// const freshConfig = reloadConfig(); → config.js runs again, new values returned
 ```
 
 **Q3: Your app has a circular dependency bug. How do you detect and fix it?**
@@ -261,30 +327,377 @@ A:
 
 ### Concepts
 
-The event loop is the **heart of Node.js**. It's what allows Node to handle thousands of concurrent operations using just a single thread. Understanding it deeply is the difference between writing fast Node code and writing code that mysteriously hangs.
+The event loop is the **heart of Node.js**. It allows a single thread to manage thousands of concurrent I/O operations without blocking — the core architectural advantage over thread-per-request servers.
 
-**The simple analogy:** Imagine you're a chef (the single thread) in a busy kitchen. You don't stand and watch each pot boil — you start cooking rice, then while it boils, you chop vegetables, then while they sauté, you prepare the sauce. The event loop is your system for checking back on each task at the right time.
+**The chef analogy:** You're the only chef in a restaurant (single thread). When an order comes in for pasta (async I/O), you start boiling water and hand it off to kitchen staff (libuv) — you don't stand watching the pot. You immediately serve the next customer. When the water boils (I/O complete), a waiter places a ticket on your counter (callback in queue). The event loop is your routine of working through those tickets in a fixed order.
 
 **How it works technically:**
-Node runs your JavaScript on **one main thread**. When your code calls something asynchronous (like reading a file or making an HTTP request), Node doesn't block — it hands the work to the operating system or a background thread pool (libuv), and continues running your next line of code. When the async work finishes, a callback is placed in a queue. The event loop's job is to continuously check these queues and execute callbacks when the main thread is free.
+Node.js runs JavaScript on **one V8 main thread**. When you call an async operation, Node delegates it to **libuv**, which uses:
 
-**The phases:** Each "tick" of the event loop goes through these phases in order:
+- **Thread pool** (default 4 threads) — for blocking OS calls: `fs.*`, `crypto.*`, `zlib.*`, `dns.lookup()`
+- **OS-level async I/O** — for non-blocking ops: TCP, HTTP, UDP, `dns.resolve()` — `epoll` on Linux, `kqueue` on macOS, `IOCP` on Windows
 
-1. **Timers** — Execute callbacks from `setTimeout()` and `setInterval()` whose time has expired
-2. **Pending callbacks** — Execute I/O callbacks deferred from the previous loop (e.g., TCP errors)
-3. **Idle/Prepare** — Internal housekeeping (you never interact with this directly)
-4. **Poll** — The most important phase. Retrieves new I/O events and executes I/O callbacks (file reads, network responses, etc.). If there's nothing to do, it **waits here** for new events
-5. **Check** — Execute `setImmediate()` callbacks
-6. **Close callbacks** — Execute close event callbacks (e.g., `socket.on('close', ...)`)
+When background work finishes, the callback lands in the correct queue. The event loop processes these queues in a strict **6-phase order per iteration (tick)**:
 
-**Between every phase**, Node drains the **microtask queues**: first all `process.nextTick()` callbacks, then all Promise `.then()` callbacks. This is why `process.nextTick` has the highest priority — it runs before the event loop can move to the next phase. But be careful: if you recursively call `process.nextTick`, you'll **starve** the event loop (I/O callbacks never run).
+| #   | Phase            | What runs                                      | Key API                  |
+| --- | ---------------- | ---------------------------------------------- | ------------------------ |
+| 1   | **Timers**       | Expired `setTimeout` / `setInterval` callbacks | `setTimeout(cb, 100)`    |
+| 2   | **Pending**      | I/O error callbacks deferred from prior tick   | TCP `ECONNREFUSED`       |
+| 3   | **Idle/Prepare** | Internal libuv housekeeping only               | —                        |
+| 4   | **Poll**         | New I/O events; **blocks & waits** when idle   | `fs.readFile` callback   |
+| 5   | **Check**        | `setImmediate` callbacks                       | `setImmediate(cb)`       |
+| 6   | **Close**        | `.on('close', ...)` handlers                   | `socket.on('close', cb)` |
 
-**Key rules to remember:**
+**Microtask queues — drain between EVERY phase and after every callback:**
 
-- Synchronous code always runs first and blocks everything
-- `process.nextTick` > Promises > `setTimeout(0)` > `setImmediate` (in priority order)
-- `setTimeout(fn, 0)` and `setImmediate(fn)` ordering is **non-deterministic** in the main module, but inside an I/O callback, `setImmediate` always runs first
-- Any blocking operation (heavy loop, sync file read) **freezes the entire server** — no requests can be handled
+After each phase (and after each individual macrotask callback), Node fully empties two microtask queues **before** moving to the next phase:
+
+1. **`process.nextTick()` queue** — exhausted entirely first (highest async priority)
+2. **`Promise.then()` / `queueMicrotask()` queue** — exhausted entirely second
+
+If a `nextTick` callback enqueues more `nextTick` calls, those run **before** any Promises. If Promises enqueue more Promises, all run before the next phase. This recursive exhaustion can **starve** the event loop — I/O callbacks never execute.
+
+**Priority order (highest → lowest):**
+
+```
+Synchronous code  →  process.nextTick  →  Promise.then  →  setTimeout(0)  →  setImmediate
+```
+
+---
+
+### Diagram 1: Node.js Runtime Architecture
+
+How your JavaScript code flows through V8, libuv, OS, and back as callbacks.
+
+```mermaid
+graph LR
+    subgraph APP ["Your Application"]
+        CODE["JavaScript Code<br/>async/await · callbacks · events"]
+    end
+
+    subgraph V8 ["V8 Engine — Main Thread"]
+        STACK["Call Stack<br/>Synchronous JS execution"]
+    end
+
+    subgraph EL ["Event Loop — libuv Phase Runner"]
+        T1["① Timers<br/>setTimeout<br/>setInterval"]
+        T2["② Pending<br/>deferred I/O errors"]
+        T4["③ Poll<br/>new I/O events<br/>WAITS here when idle"]
+        T5["④ Check<br/>setImmediate"]
+        T6["⑤ Close<br/>socket.on close"]
+        T1 --> T2 --> T4 --> T5 --> T6 --> T1
+    end
+
+    subgraph MQ ["Microtask Queues — drain between every phase"]
+        NTQ["① process.nextTick<br/>HIGHEST PRIORITY"]
+        PMQ["② Promise.then<br/>queueMicrotask"]
+        NTQ --> PMQ
+    end
+
+    subgraph LIBUV ["libuv — Background Work"]
+        TP["Thread Pool — 4 threads<br/>fs · crypto · zlib · dns.lookup"]
+        OA["OS Async I/O<br/>epoll · kqueue · IOCP<br/>TCP · HTTP · dns.resolve"]
+    end
+
+    CODE --> STACK
+    STACK -->|"schedules async work"| EL
+    EL -->|"between every phase"| MQ
+    EL -->|"blocking I/O"| TP
+    EL -->|"network I/O"| OA
+    TP -->|"done → callback"| T4
+    OA -->|"done → callback"| T4
+
+    style NTQ fill:#c62828,color:#fff
+    style PMQ fill:#e65100,color:#fff
+    style T4 fill:#1b5e20,color:#fff
+    style TP fill:#1565c0,color:#fff
+    style OA fill:#0d47a1,color:#fff
+```
+
+---
+
+### Diagram 2: Event Loop — Complete Tick (Phase Cycle)
+
+One full iteration. **Red** = microtask drain (must fully empty before next phase). **Green** = Poll phase where Node waits for I/O.
+
+```mermaid
+graph TD
+    START(["🔄 New Loop Iteration"])
+
+    START --> TIMERS
+
+    subgraph PH1 ["① TIMERS"]
+        TIMERS["Run all expired<br/>setTimeout and setInterval callbacks"]
+    end
+
+    TIMERS --> MT1("🔴 Drain Microtasks<br/>nextTick queue entirely first — then Promise queue entirely")
+
+    subgraph PH2 ["② PENDING CALLBACKS"]
+        PENDING["Run deferred I/O error callbacks<br/>from the previous loop iteration<br/>e.g. TCP ECONNREFUSED"]
+    end
+
+    MT1 --> PENDING
+    PENDING --> MT2("🔴 Drain Microtasks")
+
+    subgraph PH4 ["③ POLL PHASE — Most Important"]
+        POLLQ{"I/O callbacks<br/>ready in queue?"}
+        RUNIO["Run all ready I/O callbacks<br/>fs · net · http · dns..."]
+        SKIPCK["No I/O + setImmediate pending<br/>→ exit to Check phase"]
+        WAITIO["No I/O + nothing pending<br/>→ BLOCK: wait for I/O event<br/>or until next timer expires"]
+        MT_IO("🔴 Drain Microtasks after each callback")
+        POLLQ -->|"Yes"| RUNIO
+        POLLQ -->|"No + setImmediate"| SKIPCK
+        POLLQ -->|"No + nothing"| WAITIO
+        WAITIO --> RUNIO
+        RUNIO --> MT_IO
+    end
+
+    MT2 --> POLLQ
+    MT_IO --> CHECK
+    SKIPCK --> CHECK
+
+    subgraph PH5 ["④ CHECK PHASE"]
+        CHECK["Run all setImmediate callbacks<br/>Always runs after Poll phase"]
+    end
+
+    CHECK --> MT4("🔴 Drain Microtasks")
+
+    subgraph PH6 ["⑤ CLOSE CALLBACKS"]
+        CLOSE["socket.destroy · server.close<br/>close event handlers fire here"]
+    end
+
+    MT4 --> CLOSE
+    CLOSE --> MT5("🔴 Drain Microtasks")
+    MT5 --> START
+
+    style MT1 fill:#c62828,color:#fff
+    style MT2 fill:#c62828,color:#fff
+    style MT_IO fill:#c62828,color:#fff
+    style MT4 fill:#c62828,color:#fff
+    style MT5 fill:#c62828,color:#fff
+    style PH4 fill:#1a3a1a,color:#fff
+    style WAITIO fill:#2e7d32,color:#fff
+```
+
+---
+
+### Diagram 3: Microtask Queue — Priority & Drain Logic
+
+`process.nextTick` always runs **before** Promises. If a Promise callback schedules a new `nextTick`, that `nextTick` gets priority and the loop restarts from the top. This recursive cycle can starve the event loop.
+
+```mermaid
+graph TD
+    ENTER(["Phase N finishes<br/>Begin microtask drain"])
+
+    subgraph NT_LOOP ["process.nextTick Queue — Priority 1 HIGHEST"]
+        NT_CHECK{"nextTick<br/>queue empty?"}
+        NT_RUN["Run next nextTick callback<br/>May add more nextTick or Promises"]
+        NT_CHECK -->|"Not empty"| NT_RUN --> NT_CHECK
+    end
+
+    subgraph PM_LOOP ["Promise Microtask Queue — Priority 2"]
+        PM_CHECK{"Promise queue<br/>empty?"}
+        PM_RUN["Run next Promise.then callback<br/>May add more nextTick or Promises"]
+        PM_CHECK -->|"Not empty"| PM_RUN --> PM_CHECK
+    end
+
+    subgraph RECHECK ["Re-check: new nextTick added during Promise drain?"]
+        RC{"nextTick<br/>queue empty?"}
+    end
+
+    ENTER --> NT_CHECK
+    NT_CHECK -->|"Empty ✓"| PM_CHECK
+    PM_CHECK -->|"Empty ✓"| RC
+    RC -->|"Not empty — loop back up!"| NT_CHECK
+    RC -->|"Empty — all clear ✓"| DONE(["Proceed to Phase N+1"])
+
+    NT_CHECK -. "⚠️ Infinite nextTick recursion<br/>starves I/O — never reaches Promise queue<br/>or Phase N+1" .-> PM_CHECK
+
+    style NT_CHECK fill:#b71c1c,color:#fff
+    style NT_RUN fill:#b71c1c,color:#fff
+    style PM_CHECK fill:#e65100,color:#fff
+    style PM_RUN fill:#e65100,color:#fff
+    style DONE fill:#1b5e20,color:#fff
+```
+
+---
+
+### Diagram 4: Poll Phase Deep Dive
+
+The Poll phase is the most important — it's where Node actually sleeps waiting for I/O. Its decision tree answers most "why doesn't my callback run?" questions.
+
+```mermaid
+graph TD
+    ENTER_POLL(["Enter Poll Phase"])
+
+    ENTER_POLL --> CB_READY{"I/O callbacks<br/>waiting in queue?"}
+
+    subgraph PATH_A ["Path A — Callbacks available: run them"]
+        RUN_ONE["Run next I/O callback<br/>fs.readFile · net.connect · http.get"]
+        DRAIN_A("🔴 Drain microtasks")
+        MORE{"More callbacks<br/>in queue?"}
+        TIMER_RDY{"Expired timer<br/>now ready?"}
+        RUN_ONE --> DRAIN_A --> MORE
+        MORE -->|"Yes"| RUN_ONE
+        MORE -->|"No"| TIMER_RDY
+        TIMER_RDY -->|"Yes"| EXIT_T["Exit → Timers phase next tick"]
+        TIMER_RDY -->|"No"| EXIT_C["Exit → Check phase"]
+    end
+
+    subgraph PATH_B ["Path B — Queue empty: decide what to do"]
+        HAS_IMM{"setImmediate<br/>registered?"}
+        HAS_TIM{"Timers<br/>pending?"}
+        GO_IMM["Exit immediately<br/>go to Check phase"]
+        SLEEP_T["SLEEP here<br/>block waiting for I/O<br/>up to the nearest timer deadline<br/>OS wakes the process when ready"]
+        SLEEP_INF["SLEEP here indefinitely<br/>block waiting for any I/O<br/>OS wakes the process when ready"]
+        HAS_IMM -->|"Yes"| GO_IMM
+        HAS_IMM -->|"No"| HAS_TIM
+        HAS_TIM -->|"Yes"| SLEEP_T
+        HAS_TIM -->|"No"| SLEEP_INF
+        SLEEP_T --> RUN_ONE
+        SLEEP_INF --> RUN_ONE
+    end
+
+    CB_READY -->|"Yes"| RUN_ONE
+    CB_READY -->|"No"| HAS_IMM
+
+    style RUN_ONE fill:#1565c0,color:#fff
+    style DRAIN_A fill:#c62828,color:#fff
+    style SLEEP_T fill:#1b5e20,color:#fff
+    style SLEEP_INF fill:#1b5e20,color:#fff
+```
+
+---
+
+### Diagram 5: Step-by-Step Execution Order Trace
+
+Tracing this exact code through the event loop:
+
+```js
+console.log("1: sync start");
+process.nextTick(() => console.log("2: nextTick"));
+Promise.resolve().then(() => console.log("3: promise"));
+setTimeout(() => console.log("4: setTimeout"), 0);
+setImmediate(() => console.log("5: setImmediate"));
+console.log("6: sync end");
+// Output: 1 → 6 → 2 → 3 → 4 → 5
+```
+
+```mermaid
+sequenceDiagram
+    participant S  as Call Stack
+    participant NT as nextTick Queue
+    participant PM as Promise Queue
+    participant TQ as Timer Queue
+    participant CQ as Check Queue
+
+    rect rgb(20, 50, 100)
+        Note over S,CQ: ── SYNCHRONOUS EXECUTION ──
+        S->>S: console.log("1: sync start")  → OUTPUT: 1
+        S->>NT: process.nextTick(cb)          → enqueued
+        S->>PM: Promise.resolve().then(cb)    → enqueued
+        S->>TQ: setTimeout(cb, 0)             → scheduled
+        S->>CQ: setImmediate(cb)              → enqueued
+        S->>S: console.log("6: sync end")    → OUTPUT: 6
+        Note over S: Call stack is now empty
+    end
+
+    rect rgb(140, 20, 20)
+        Note over S,CQ: ── MICROTASK DRAIN (before any event loop phase) ──
+        NT-->>S: nextTick callback fires       → OUTPUT: 2
+        Note over NT: nextTick queue empty ✓
+        PM-->>S: Promise.then callback fires   → OUTPUT: 3
+        Note over PM: Promise queue empty ✓
+    end
+
+    rect rgb(40, 30, 100)
+        Note over S,CQ: ── EVENT LOOP: TIMERS PHASE ──
+        TQ-->>S: setTimeout(0) callback fires  → OUTPUT: 4
+        Note over TQ: Timer queue empty ✓
+    end
+
+    rect rgb(15, 55, 20)
+        Note over S,CQ: ── EVENT LOOP: POLL PHASE ──
+        Note over S: No I/O pending
+        Note over S: setImmediate registered → exit Poll immediately
+    end
+
+    rect rgb(25, 80, 30)
+        Note over S,CQ: ── EVENT LOOP: CHECK PHASE ──
+        CQ-->>S: setImmediate callback fires   → OUTPUT: 5
+    end
+
+    Note over S,CQ: FINAL OUTPUT ORDER:  1 → 6 → 2 → 3 → 4 → 5
+```
+
+---
+
+### Diagram 6: setTimeout(0) vs setImmediate — Why Order is Non-Deterministic
+
+```mermaid
+graph TD
+    BOOT(["node app.js starts"])
+
+    BOOT --> REG["setTimeout fn,0 and setImmediate fn<br/>are both registered in the main module"]
+    REG --> STARTUP{"How long did Node.js<br/>startup initialization take?"}
+
+    STARTUP -->|"Less than 1ms<br/>timer not expired yet"| FAST["① TIMERS: not ready — skip<br/>② POLL: entered<br/>③ CHECK: setImmediate FIRST ✅<br/>④ Next tick TIMERS: setTimeout SECOND ✅"]
+    STARTUP -->|"More than 1ms<br/>timer already expired"| SLOW["① TIMERS: setTimeout FIRST ✅<br/>② POLL: entered<br/>③ CHECK: setImmediate SECOND ✅"]
+
+    FAST --> ND["⚠️ Non-deterministic in main module<br/>depends on OS scheduler and startup time"]
+    SLOW --> ND
+
+    ND --> INSIDE["FIX: Wrap both inside an I/O callback<br/>Order becomes 100% deterministic"]
+
+    subgraph IO_CB ["Inside fs.readFile callback — currently in POLL phase"]
+        I3["POLL phase ends"]
+        I4["✅ CHECK: setImmediate ALWAYS FIRST"]
+        I5["✅ Next tick TIMERS: setTimeout ALWAYS SECOND"]
+        I3 --> I4 --> I5
+    end
+
+    INSIDE --> I3
+
+    style FAST fill:#6a1b9a,color:#fff
+    style SLOW fill:#1565c0,color:#fff
+    style I4 fill:#1b5e20,color:#fff
+    style ND fill:#e65100,color:#fff
+```
+
+---
+
+### Diagram 7: Event Loop Starvation — Cause and Fix
+
+```mermaid
+graph TD
+    subgraph BAD ["❌ BAD — Infinite nextTick Starves Everything"]
+        B1["function recurse<br/>  process.nextTick(recurse)<br/>recurse()  ← called once"]
+        B2["nextTick #1 runs → schedules #2"]
+        B3["nextTick #2 runs → schedules #3"]
+        B4["nextTick #N → schedules #N+1<br/>... forever ..."]
+        STARVIO["❌ Poll phase: fs.readFile callback<br/>NEVER RUNS"]
+        STARVTQ["❌ Timers phase: setTimeout callback<br/>NEVER RUNS"]
+        B1 --> B2 --> B3 --> B4
+        B4 --> STARVIO
+        B4 --> STARVTQ
+    end
+
+    subgraph GOOD ["✅ GOOD — Yield to I/O with setImmediate"]
+        G1["Process current batch of 100 items"]
+        G_IO["✅ Poll: I/O callbacks run normally"]
+        G_TQ["✅ Timers: setTimeout runs normally"]
+        G2["setImmediate schedules NEXT batch"]
+        G3["Check phase: next batch starts"]
+        G1 --> G_IO --> G_TQ --> G2 --> G3 --> G1
+    end
+
+    style STARVIO fill:#b71c1c,color:#fff
+    style STARVTQ fill:#b71c1c,color:#fff
+    style G_IO fill:#1b5e20,color:#fff
+    style G_TQ fill:#1b5e20,color:#fff
+```
+
+---
 
 ### Key APIs / Patterns
 
@@ -292,59 +705,6 @@ Node runs your JavaScript on **one main thread**. When your code calls something
 - `setImmediate(cb)` — runs in **check phase** (after I/O polling).
 - `process.nextTick(cb)` — runs _before_ next phase (microtask, highest priority).
 - `Promise.resolve().then(cb)` — runs as microtask (after `process.nextTick` queue empties).
-
-### Event Loop Phases Diagram
-
-This diagram shows exactly what happens during one complete "tick" of the event loop. Notice how microtask queues (pink) are drained between **every** phase — this is why `process.nextTick` and Promises have such high priority.
-
-```mermaid
-graph TD
-    A["START New Loop Iteration"] --> B
-
-    subgraph Phase1 ["1. TIMERS PHASE"]
-        B["Execute expired callbacks<br/>setTimeout & setInterval"]
-    end
-
-    B --> MT1["Drain Microtask Queue<br/>nextTick first, then Promises"]
-
-    subgraph Phase2 ["2. PENDING CALLBACKS"]
-        D["Execute deferred I/O callbacks<br/>TCP errors, DNS failures"]
-    end
-
-    MT1 --> D
-    D --> MT2["Drain Microtask Queue"]
-
-    subgraph Phase3 ["3. POLL PHASE — Most Important"]
-        H["Retrieve new I/O events<br/>fs callbacks, network data<br/>Waits here if idle"]
-    end
-
-    MT2 --> H
-    H --> MT3["Drain Microtask Queue"]
-
-    subgraph Phase4 ["4. CHECK PHASE"]
-        J["Execute setImmediate callbacks<br/>Runs right after Poll"]
-    end
-
-    MT3 --> J
-    J --> MT4["Drain Microtask Queue"]
-
-    subgraph Phase5 ["5. CLOSE CALLBACKS"]
-        L["Execute close handlers<br/>socket.on close, server.close"]
-    end
-
-    MT4 --> L
-    L --> MT5["Drain Microtask Queue"]
-    MT5 --> A
-
-    style MT1 fill:#ef5350,color:#fff
-    style MT2 fill:#ef5350,color:#fff
-    style MT3 fill:#ef5350,color:#fff
-    style MT4 fill:#ef5350,color:#fff
-    style MT5 fill:#ef5350,color:#fff
-    style Phase3 fill:#66bb6a,color:#fff
-```
-
-**Key insight:** Microtask queues (pink) are drained between **every** phase. The Poll phase (green) is where Node spends most of its time — waiting for I/O to complete.
 
 ### Simple Example
 
@@ -356,11 +716,11 @@ process.nextTick(() => console.log("nextTick"));
 console.log("sync");
 
 // Output order:
-// sync
-// nextTick
-// microtask
-// timer (usually before immediate, but depends on prior I/O)
-// immediate
+// sync          ← synchronous, always first
+// nextTick      ← microtask, highest async priority
+// microtask     ← Promise microtask
+// timer         ← timers phase (may swap with immediate in main module)
+// immediate     ← check phase
 ```
 
 ### Senior-Level Q&A
@@ -517,46 +877,6 @@ setTimeout(() => console.log("large"), 2 ** 31); // May wrap on some systems; us
 
 ### Example file: [eventloop.js](eventloop.js)
 
-### Execution Order Visualization
-
-This shows how different async operations execute in a real program. Follow the arrows to understand the exact order.
-
-```mermaid
-sequenceDiagram
-    participant Main as Your Code
-    participant Stack as Call Stack
-    participant Micro as Microtask Queue
-    participant Timer as Timer Queue
-    participant IO as I/O Queue
-    participant Check as Check Queue
-
-    Main->>Stack: console.log('sync')
-    Note over Stack: Runs immediately
-
-    Main->>Micro: process.nextTick(cb)
-    Main->>Micro: Promise.then(cb)
-    Main->>Timer: setTimeout(cb, 0)
-    Main->>IO: fs.readFile(cb)
-    Main->>Check: setImmediate(cb)
-
-    Note over Stack: Sync code done
-
-    Stack->>Micro: Drain nextTick first
-    Micro->>Micro: nextTick callback runs
-    Micro->>Micro: Promise callback runs
-
-    Note over Stack: Enter Timers phase
-    Timer->>Stack: setTimeout callback runs
-
-    Note over Stack: Enter Poll phase
-    IO->>Stack: fs.readFile callback runs
-
-    Note over Stack: Enter Check phase
-    Check->>Stack: setImmediate callback runs
-
-    Note over Stack: Loop complete, repeat
-```
-
 [↑ Back to Index](#table-of-contents)
 
 ---
@@ -627,32 +947,51 @@ graph TB
 
 ### Thread Pool Saturation Problem
 
-```js
-// ❌ PROBLEM: 4 concurrent crypto operations saturate the pool
-// All other fs/dns operations must wait!
+> 📖 **What this example demonstrates:** The 4 default libuv threads are a shared resource. If all 4 are busy doing heavy crypto work, they can't also work on file reads or DNS lookups. Your `fs.readFile()` call will just sit in a queue and wait — like being stuck behind 4 people at a one-cashier store.
+>
+> 🔑 **Key terms:**
+>
+> - **`pbkdf2`** — "Password-Based Key Derivation Function 2" — a deliberately **slow** algorithm used to hash passwords securely. It runs thousands of iterations of SHA-512. This is CPU-heavy work that uses a full thread.
+> - **Thread saturation** — When all threads in the pool are busy. New work queues up and waits instead of running in parallel.
+> - **`UV_THREADPOOL_SIZE`** — An environment variable that sets how many threads libuv creates. Must be set **before** the Node.js process starts any async operations.
 
+```js
 const crypto = require("crypto");
 const fs = require("fs");
 
-// These 4 crypto ops occupy ALL 4 threads
+// ❌ PROBLEM: Starting 4 crypto operations EXACTLY fills all 4 threads.
+// Each pbkdf2 call runs 100,000 SHA-512 iterations — takes ~200-500ms per call.
+// With 4 threads all occupied, NO other thread-pool work can start until one finishes.
 for (let i = 0; i < 4; i++) {
-    crypto.pbkdf2("password", "salt", 100000, 64, "sha512", () => {
-        console.log(`Crypto ${i} done`);
-    });
+    crypto.pbkdf2(
+        "password", // The string to hash (e.g., user's password)
+        "salt", // A random string added before hashing to prevent pre-computed attacks
+        100000, // Iterations: how many times to apply the hash (more = slower = safer)
+        64, // Output key length in bytes
+        "sha512", // Hash algorithm to use
+        () => {
+            console.log(`Crypto ${i} done`); // This fires after ~300ms
+        },
+    );
 }
 
-// This fs operation must WAIT until a thread frees up
+// This fs.readFile would normally finish in <1ms (fast disk read).
+// But RIGHT NOW all 4 libuv threads are busy with crypto above.
+// So this readFile cannot even START until one crypto finishes — delayed by ~300ms!
 fs.readFile("config.json", (err, data) => {
-    console.log("File read done"); // Delayed by crypto operations!
+    console.log("File read done"); // ← Delayed even though disk read is fast!
 });
 
-// ✅ FIX: Increase thread pool size
-// Set BEFORE any async operations (at very top of entry file)
-process.env.UV_THREADPOOL_SIZE = 16; // Max recommended: 128
+// ✅ FIX: Increase thread pool size BEFORE any async work starts.
+// Put this at the very top of your main entry file (e.g., index.js)
+// CANNOT be set after the process has already started doing async work
+process.env.UV_THREADPOOL_SIZE = 16; // Now 16 threads — crypto gets 4, fs/dns gets the rest
 
-// Or set via command line:
+// Alternative: Set via command line when starting your app:
 // UV_THREADPOOL_SIZE=16 node app.js
 ```
+
+> ⚠️ **Real-world impact:** In a web server handling many requests, if each request does a `crypto.pbkdf2` (like hashing user passwords on login), and you have 4 threads, only 4 logins can run concurrently. The 5th login attempt waits. This is why login endpoints can become a bottleneck under high traffic.
 
 ### Senior-Level Q&A
 
@@ -660,24 +999,38 @@ process.env.UV_THREADPOOL_SIZE = 16; // Max recommended: 128
 
 A: `dns.lookup()` uses the libuv thread pool (not OS async). If pool is saturated (e.g., heavy `fs` or `crypto` ops), DNS lookups queue behind them.
 
+> 📖 **What this example demonstrates:** `http.get()` internally uses `dns.lookup()` to resolve domain names. `dns.lookup()` goes through the thread pool. If the thread pool is full, even a simple HTTP request must wait before it can even look up the server's IP address. `dns.resolve4()` bypasses the pool entirely by using the OS's async DNS machinery.
+>
+> 🔑 **Key terms:**
+>
+> - **`getaddrinfo()`** — An OS-level C function that resolves a hostname to an IP address. It’s **blocking** (waits for an answer before returning), so libuv must run it in a thread.
+> - **c-ares** — A C library that does DNS lookups using non-blocking network I/O (same way Node handles HTTP). Since it’s already async, it doesn’t need a thread.
+> - **TTL (Time-To-Live)** — How long a DNS record is valid/cached before needing a fresh lookup. `ttl: 300` means cache DNS results for 300 seconds (5 minutes).
+
 ```js
-// ❌ Slow: dns.lookup uses thread pool
+// ❌ Slow path: http.get → dns.lookup → uses thread pool
+// If thread pool is saturated by crypto/fs, this DNS lookup queues up and waits
 const http = require("http");
-// http.get uses dns.lookup by default
+http.get("http://example.com", ...); // Internally calls dns.lookup('example.com') — uses a thread
 
-// ✅ Fix 1: Increase pool size
-process.env.UV_THREADPOOL_SIZE = 16;
+// ✅ Fix 1: Give the pool more threads so DNS doesn’t have to wait
+process.env.UV_THREADPOOL_SIZE = 16; // Must be set before any async operations start!
 
-// ✅ Fix 2: Use dns.resolve (bypasses thread pool, uses OS async)
+// ✅ Fix 2: Use dns.resolve4 instead of dns.lookup
+// dns.resolve4 uses c-ares (async library) — it does NOT use a libuv thread at all
 const dns = require("dns");
 const { Resolver } = dns;
-const resolver = new Resolver();
+const resolver = new Resolver(); // Create a resolver instance
 resolver.resolve4("example.com", (err, addresses) => {
-    // Uses OS async — not affected by thread pool saturation
+    // 'addresses' is an array of IPv4 addresses, e.g. ['93.184.216.34']
+    // This callback runs via the OS async I/O path — no thread needed!
+    console.log(addresses);
 });
 
-// ✅ Fix 3: Cache DNS results
+// ✅ Fix 3: Cache DNS results to avoid repeated lookups entirely
+// dnscache intercepts dns.lookup and remembers answers for 'ttl' seconds
 const dnscache = require("dnscache")({ enable: true, ttl: 300 });
+// Now repeated calls to the same hostname skip the thread pool completely
 ```
 
 **Q2: How do you determine the right `UV_THREADPOOL_SIZE` for your app?**
@@ -779,48 +1132,93 @@ graph LR
 
 ### Buffer Safety
 
+> 📖 **What this example demonstrates:** There are two ways to create a Buffer — the safe way (`alloc`) and the fast-but-dangerous way (`allocUnsafe`). It also shows the most dangerous gotcha: `Buffer.slice()` shares memory with the original, so modifying the slice **silently mutates** what you thought was untouched data.
+>
+> 🔑 **Key terms:**
+>
+> - **Zero-filled** — Every byte in the buffer is set to `0` before use. Like getting a blank piece of paper. Safe because there's no leftover data from previous operations.
+> - **Old memory data** — When your process allocates memory, it might get a block previously used by another part of the program. That old block still has its old bytes. `allocUnsafe` doesn't wipe these old bytes, so they could contain old passwords, tokens, or any other sensitive data.
+> - **ASCII code 74** — The number that represents the letter `'J'` in the ASCII encoding table. Each character maps to a number: `'A'=65, 'B'=66, ..., 'J'=74, ..., 'Z'=90`.
+> - **Buffer.from(buf)** — Creates a completely new buffer with the same bytes but **independent memory**. Changes to the copy don't affect the original.
+
 ```js
-// ✅ SAFE: Zero-filled (no old data leakage)
+// ────────────────────────────────────────────────────────
+// ✅ SAFE: alloc(256) creates 256 bytes, ALL set to 0
+// Like getting a freshly erased whiteboard — guaranteed clean
 const safeBuf = Buffer.alloc(256);
+// safeBuf[0] through safeBuf[255] are all 0. Safe to send to users.
 
-// ⚠️ UNSAFE: May contain old memory data (faster)
+// ⚠️ UNSAFE: allocUnsafe(256) creates 256 bytes WITHOUT wiping them
+// Node reuses memory from its internal pool — faster, but bytes might have old values
 const unsafeBuf = Buffer.allocUnsafe(256);
-// Only use when you will immediately overwrite all bytes
+// unsafeBuf might contain old password bytes, old HTTP headers, etc.
+// ONLY use this when you are 100% sure you will write ALL 256 bytes yourself immediately after
 
-// ✅ From string
+// ────────────────────────────────────────────────────────
+// ✅ Creating a Buffer FROM a string (most common usage)
 const greeting = Buffer.from("Hello, World!", "utf8");
-console.log(greeting.toString()); // 'Hello, World!'
-console.log(greeting.toString("base64")); // 'SGVsbG8sIFdvcmxkIQ=='
-console.log(greeting.toString("hex")); // '48656c6c6f2c20576f726c6421'
+// Node converts each character to its UTF-8 byte representation
+// 'H'=72, 'e'=101, 'l'=108, 'l'=108, 'o'=111, ','=44, ' '=32, ...
+console.log(greeting.toString()); // 'Hello, World!' ← converts bytes back to text
+console.log(greeting.toString("base64")); // 'SGVsbG8sIFdvcmxkIQ==' ← binary as printable ASCII
+console.log(greeting.toString("hex")); // '48656c6c6f2c20576f726c6421' ← each byte as 2 hex digits
 
-// ⚠️ Slice shares memory (mutation affects original!)
-const original = Buffer.from("Hello");
-const slice = original.slice(0, 3);
-slice[0] = 74; // ASCII 'J'
-console.log(original.toString()); // 'Jello' — Original mutated!
+// ────────────────────────────────────────────────────────
+// ⚠️ DANGEROUS: slice() does NOT make a copy — it's a VIEW into the SAME memory!
+const original = Buffer.from("Hello"); // bytes: [72, 101, 108, 108, 111]
+const slice = original.slice(0, 3); // View of bytes 0,1,2: [72, 101, 108] = 'Hel'
+// slice and original point to THE SAME physical memory
 
-// ✅ Safe copy
-const copy = Buffer.from(original); // Independent copy
+slice[0] = 74; // Change byte index 0 to ASCII 74, which is the letter 'J'
+console.log(original.toString()); // Prints: 'Jello' — The ORIGINAL was silently changed!
+// This is the most common Buffer-related bug — you think you're changing a copy but you're not
+
+// ✅ SAFE copy: Buffer.from(buf) creates INDEPENDENT memory
+const copy = Buffer.from(original); // Copies every byte into a brand new memory location
+// Now original and copy are completely independent — changing one doesn't affect the other
 ```
 
 ### Encoding Conversions
 
+> 📖 **What this example demonstrates:** How to convert between binary data (Buffers) and human-readable string formats. Base64 is widely used in APIs and file uploads. Hex is used in cryptographic hashes. Understanding these conversions is essential when working with authentication tokens, file uploads, or any binary protocol.
+>
+> 🔑 **Key terms:**
+>
+> - **Base64** — An encoding scheme that represents binary data as 64 safe ASCII characters (A-Z, a-z, 0-9, +, /). Every 3 bytes of input become 4 characters of output. Used in Basic Auth headers (`Authorization: Basic dXNlcjpwYXNz`), data URLs, and email attachments.
+> - **SHA-256** — A cryptographic hash function that takes any input and produces a fixed 256-bit (32-byte) output. The output is always exactly the same length, and you can't reverse it back to the input.
+> - **`digest('hex')`** — The final step of hashing — outputs the hash result as a hex string (64 characters for SHA-256).
+> - **PNG magic bytes** — The first few bytes of a file that identify its format. PNG files always start with `[137, 80]` (hex: `89 50`). Applications read these bytes to confirm the file type without relying on the extension.
+
 ```js
-// Base64 encode/decode (common for API tokens, file uploads)
-const text = "user:password";
-const base64 = Buffer.from(text).toString("base64"); // 'dXNlcjpwYXNzd29yZA=='
-const decoded = Buffer.from(base64, "base64").toString(); // 'user:password'
+// ── BASE64: converting text to a safe ASCII representation ──────────────────
+const text = "user:password"; // This is what a Basic Auth header contains before encoding
+// Step 1: Convert string to Buffer (raw bytes)
+// Step 2: Convert those bytes to base64 string (safe for HTTP headers)
+const base64 = Buffer.from(text).toString("base64");
+console.log(base64); // 'dXNlcjpwYXNzd29yZA==' ← safe to put in an HTTP header
 
-// Hex for hashes
+// Decoding: reverse the process
+const decoded = Buffer.from(base64, "base64").toString();
+console.log(decoded); // 'user:password' ← original text restored
+// Real-world: When you send Authorization: Basic dXNlcjpwYXNz, the server does exactly this decode
+
+// ── HEX: for cryptographic hashes ─────────────────────────────────────
 const crypto = require("crypto");
+// createHash('sha256') → starts a hash computation using the SHA-256 algorithm
+// .update('data')      → feeds the string 'data' into the hasher
+// .digest('hex')       → finalizes the hash and returns it as a 64-character hex string
 const hash = crypto.createHash("sha256").update("data").digest("hex");
-// '3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7'
+console.log(hash); // '3a6eb079...adc8b7' ← ALWAYS the same 64 chars for 'data', can't be reversed
+// Real-world: storing password hashes in databases, generating ETags, signing documents
 
-// Binary file handling
+// ── BINARY FILES: working with raw file bytes ────────────────────────────
 const fs = require("fs");
-const fileBuffer = fs.readFileSync("image.png"); // Returns Buffer
-console.log(fileBuffer.length); // File size in bytes
-console.log(fileBuffer[0], fileBuffer[1]); // First 2 bytes (PNG magic: 137, 80)
+// readFileSync with no encoding = returns raw Buffer (not a string)
+const fileBuffer = fs.readFileSync("image.png");
+console.log(fileBuffer.length); // File size in bytes (e.g., 245760 for a 240KB image)
+console.log(fileBuffer[0], fileBuffer[1]); // 137, 80 ← these 2 magic bytes PROVE it's a PNG file
+// All PNG files start with: 137 80 78 71 13 10 26 10 (in decimal)
+// If fileBuffer[0] is NOT 137, the file is corrupted or not actually a PNG
 ```
 
 ### Senior-Level Q&A
@@ -835,11 +1233,22 @@ Use `allocUnsafe()` only when you will **immediately fill** the entire buffer (e
 
 A: Streams internally use Buffers as chunks. Each `data` event emits a Buffer (unless in object mode). `highWaterMark` controls the Buffer size threshold for backpressure.
 
+> 📖 **What this example demonstrates:** When you stream a file, Node doesn't give you the whole file at once. It breaks it into Buffer chunks and fires the `data` event repeatedly. Each chunk is a Buffer object. You can inspect its size and content.
+>
+> 🔑 **Key terms:**
+>
+> - **`highWaterMark`** — A threshold (in bytes) that controls how much data Node buffers before pausing the source. Default is 16KB (16,384 bytes). When the buffer exceeds this, Node tells the source to stop sending (backpressure).
+> - **`chunk instanceof Buffer`** — Checks if the variable is a Buffer object. This returns `true` for binary streams. If you set `encoding: 'utf8'` on the stream, chunks become strings instead.
+
 ```js
 const readable = fs.createReadStream("file.txt");
+// The 'data' event fires once per chunk as Node reads pieces of the file
 readable.on("data", (chunk) => {
-    console.log(chunk instanceof Buffer); // true
-    console.log(chunk.length); // Bytes in this chunk (≤ highWaterMark)
+    // chunk is a Buffer unless you passed { encoding: 'utf8' } to createReadStream
+    console.log(chunk instanceof Buffer); // true ← it's binary data, not a string
+    console.log(chunk.length); // How many bytes in this particular chunk
+    // Will be <= highWaterMark (default: 16384 bytes = 16KB)
+    // To work with text: chunk.toString() or chunk.toString('utf8')
 });
 ```
 
@@ -847,17 +1256,37 @@ readable.on("data", (chunk) => {
 
 A: Yes — `Buffer.slice()` shares memory with the original. If you keep a small slice reference, the entire original buffer stays in memory (can't be GC'd).
 
+> 📖 **What this example demonstrates:** The memory leak from `Buffer.slice()`. The garbage collector (GC) can only free memory when nothing references it. A 10-byte slice still secretly references the 10MB buffer underneath — so the GC can't free those 10MB.
+>
+> 🔑 **Key terms:**
+>
+> - **Garbage Collector (GC)** — An automatic memory manager built into V8. It finds objects in memory that nothing is pointing to anymore, and frees that memory. If something still points to an object, the GC won't touch it.
+> - **`10 * 1024 * 1024`** — Math for 10 megabytes: 10 × 1024 bytes/KB × 1024 KB/MB = 10,485,760 bytes.
+
 ```js
-// ❌ Memory leak: Keeping small slice prevents GC of large buffer
+// ❌ MEMORY LEAK: slice() looks innocent but secretly keeps 10MB alive
 function leak() {
+    // Allocate 10MB buffer (this goes into C++ memory outside V8's heap)
     const bigBuffer = Buffer.alloc(10 * 1024 * 1024); // 10MB
-    return bigBuffer.slice(0, 10); // 10 bytes, but 10MB stays in memory!
+
+    // Create a slice of just the first 10 bytes
+    // This looks like a tiny 10-byte object, but internally it holds a reference to bigBuffer!
+    // As long as this slice exists, bigBuffer CANNOT be freed by the garbage collector
+    return bigBuffer.slice(0, 10);
+    // After this function returns, bigBuffer goes out of scope...
+    // but the slice still exists, so the 10MB stays allocated. Memory wasted!
 }
 
-// ✅ Fix: Copy the needed bytes
+// After calling leak() 1000 times: 10GB of memory slowly accumulates
+
+// ✅ FIX: Use Buffer.from() to copy only the bytes you need
 function noLeak() {
-    const bigBuffer = Buffer.alloc(10 * 1024 * 1024);
-    return Buffer.from(bigBuffer.slice(0, 10)); // Independent 10-byte copy
+    const bigBuffer = Buffer.alloc(10 * 1024 * 1024); // 10MB
+    // Buffer.from() creates a BRAND NEW INDEPENDENT buffer with just those 10 bytes
+    // Now there are TWO separate allocations: the 10MB (bigBuffer) and the 10-byte copy
+    const safeCopy = Buffer.from(bigBuffer.slice(0, 10)); // Only 10 bytes kept alive
+    // bigBuffer now has NO references — GC will free its 10MB on next collection
+    return safeCopy; // Only 10 bytes returned and kept alive
 }
 ```
 
@@ -1008,81 +1437,107 @@ sequenceDiagram
 
 #### Callback Hell & Alternatives
 
-```js
-// Callback hell (hard to read and maintain)
-fs.readFile("file1.txt", (err, data1) => {
-    if (err) return console.error(err);
-    fs.readFile("file2.txt", (err, data2) => {
-        if (err) return console.error(err);
-        fs.readFile("file3.txt", (err, data3) => {
-            if (err) return console.error(err);
-            console.log(data1, data2, data3);
-        });
-    });
-});
+> 📖 **What this example demonstrates:** Three ways to write the same logic — reading 3 files sequentially. Each approach is more readable than the last. The callback version is the hardest to maintain because error handling must be repeated and nesting grows with each step.
+>
+> 🔑 **Key terms:**
+>
+> - **Callback hell** (also called "Pyramid of Doom") — When callbacks are nested inside callbacks inside callbacks, creating a staircase-shaped code structure. Hard to read, hard to add error handling, impossible to exit early.
+> - **Promise chaining** — Each `.then()` returns a new Promise. You can `.catch()` at the end and it catches errors from any step in the chain.
+> - **`async/await`** — The `async` keyword marks a function as one that returns a Promise. Inside it, `await` pauses ONLY that function (not the whole thread!) until a Promise resolves or rejects. Errors become catchable with normal `try/catch`.
 
-// Promise chaining (clearer)
+````js
+// ── APPROACH 1: Callback Style (the old way) ──────────────────────────────
+// Notice how the code drifts right with each file — this is callback hell
+fs.readFile("file1.txt", (err, data1) => {    // Level 1
+    if (err) return console.error(err);        // Must check error at EVERY level
+    fs.readFile("file2.txt", (err, data2) => { // Level 2
+        if (err) return console.error(err);    // Repeated error check
+        fs.readFile("file3.txt", (err, data3) => { // Level 3 ← getting deep!
+            if (err) return console.error(err);
+            console.log(data1, data2, data3);  // Finally have all 3 files
+        }); // closing ) for readFile 3
+    }); // closing ) for readFile 2
+}); // closing ) for readFile 1
+// Problem: Adding a 4th file means adding another level. Bugs are hard to spot.
+
+// ── APPROACH 2: Promise Chaining (better, but still complex) ─────────────────
+// Each .then() receives the result of the previous step
+// The nested .then() is needed to "carry" data1 to the next step
 fs.promises
-    .readFile("file1.txt", "utf8")
-    .then((data1) =>
+    .readFile("file1.txt", "utf8")   // Returns a Promise
+    .then((data1) =>                   // data1 = contents of file1.txt
         fs.promises
             .readFile("file2.txt", "utf8")
-            .then((data2) => [data1, data2]),
+            .then((data2) => [data1, data2]), // Bundle data1+data2 together to pass to next .then()
     )
-    .then(([data1, data2]) =>
+    .then(([data1, data2]) =>           // Receives [file1contents, file2contents]
         fs.promises
             .readFile("file3.txt", "utf8")
-            .then((data3) => [data1, data2, data3]),
+            .then((data3) => [data1, data2, data3]), // Bundle all 3
     )
     .then(([data1, data2, data3]) => console.log(data1, data2, data3))
-    .catch((err) => console.error(err));
+    .catch((err) => console.error(err)); // ONE catch handles errors from ALL steps → improvement!
 
-// Async/await (most readable)
-async function loadFiles() {
+// ── APPROACH 3: Async/Await (most readable) ────────────────────────────
+async function loadFiles() { // 'async' = this function always returns a Promise
     try {
+        // 'await' pauses loadFiles() here until file1 is read. Other code in Node keeps running.
         const data1 = await fs.promises.readFile("file1.txt", "utf8");
-        const data2 = await fs.promises.readFile("file2.txt", "utf8");
-        const data3 = await fs.promises.readFile("file3.txt", "utf8");
+        const data2 = await fs.promises.readFile("file2.txt", "utf8"); // waits for data1 first
+        const data3 = await fs.promises.readFile("file3.txt", "utf8"); // waits for data2 first
+        // Note: these 3 reads are SEQUENTIAL (one after another).
+        // For PARALLEL reads, use Promise.all() — see Q4 below.
         console.log(data1, data2, data3);
     } catch (err) {
-        console.error(err);
+        console.error(err); // ONE catch handles errors from all 3 reads
     }
 }
-```
 
 #### Error Handling Patterns
 
-```js
-// Pattern 1: Promise.catch()
-fetchUser(id)
-    .then((user) => fetchPosts(user.id))
-    .then((posts) => console.log(posts))
-    .catch((err) => console.error("Error:", err.message));
+> 📖 **What this example demonstrates:** Three progressively more sophisticated ways to handle async errors. Pattern 3 shows how to let expected errors fall through gracefully while still re-throwing unexpected ones.
+>
+> 🔑 **Key terms:**
+> - **`err.code`** — A short machine-readable error code like `'ENOENT'` (file not found), `'ECONNREFUSED'` (connection refused), `'ETIMEDOUT'` (timeout). More reliable to check than the error message text which can change.
+> - **Re-throw** — Catching an error just to throw it again (with `throw err`). Used when you want to handle only certain error types but let other unexpected errors propagate to a higher-level handler.
 
-// Pattern 2: Async/await with try/catch
+```js
+// ── PATTERN 1: Promise .catch() at the end of a chain ─────────────────────
+fetchUser(id)
+    .then((user) => fetchPosts(user.id))   // If fetchUser fails, this .then() is skipped
+    .then((posts) => console.log(posts))   // If fetchPosts fails, this is also skipped
+    .catch((err) => console.error("Error:", err.message)); // Catches error from ANY .then() above
+
+// ── PATTERN 2: async/await with try/catch ──────────────────────────────
 async function loadUserPosts(id) {
     try {
-        const user = await fetchUser(id);
-        const posts = await fetchPosts(user.id);
+        const user = await fetchUser(id);      // If this throws, jumps to catch
+        const posts = await fetchPosts(user.id); // Only runs if fetchUser succeeded
         console.log(posts);
     } catch (err) {
+        // err could be from EITHER fetchUser OR fetchPosts — same handler
         console.error("Error:", err.message);
     }
 }
 
-// Pattern 3: Catching specific errors
+// ── PATTERN 3: Handling SPECIFIC errors, re-throwing others ──────────────────
 async function robustFetch(id) {
     try {
         return await fetchUser(id);
     } catch (err) {
+        // err.code is a short machine-readable error string (e.g., 'ENOENT', 'ECONNREFUSED')
         if (err.code === "ENOENT") {
-            console.log("Not found, using default");
+            // This is an EXPECTED case — user simply doesn't exist yet
+            // Gracefully return a sensible default instead of crashing
+            console.log("User not found, using default");
             return { id, name: "Default" };
         }
-        throw err; // Re-throw unexpected errors
+        // If it's any OTHER error (network failure, DB crash, etc.) — we can't handle it here
+        // Re-throw it so the CALLER can decide what to do
+        throw err;
     }
 }
-```
+````
 
 ### Senior-Level Q&A
 
@@ -1105,19 +1560,28 @@ A:
 
 ```js
 // Example: Batch API calls with mixed success/failure
+// Promise.allSettled() sends ALL 3 requests simultaneously, then waits for ALL to finish
+// Unlike Promise.all(), it does NOT abort if one fails
 const results = await Promise.allSettled([
-    fetchUser(1),
-    fetchUser(2),
-    fetchUser(3), // One might fail
+    fetchUser(1), // Might succeed
+    fetchUser(2), // Might succeed or fail
+    fetchUser(3), // Might fail (e.g., user 3 doesn't exist)
 ]);
 
+// results is always an array with one entry per input promise:
+// { status: 'fulfilled', value: userData }  ← if it succeeded
+// { status: 'rejected',  reason: errorObj } ← if it failed
 results.forEach((result, idx) => {
     if (result.status === "fulfilled") {
-        console.log(`User ${idx}:`, result.value);
+        console.log(`User ${idx}:`, result.value); // Access result.VALUE for successes
     } else {
-        console.log(`User ${idx} failed:`, result.reason.message);
+        console.log(`User ${idx} failed:`, result.reason.message); // Access result.REASON for failures
     }
 });
+// Output example:
+// User 0: { id: 1, name: 'Alice' }
+// User 1: { id: 2, name: 'Bob' }
+// User 2 failed: User not found
 ```
 
 **Q2: Explain how promise chaining can cause "horizontal drift" and how to avoid it.**
@@ -1125,35 +1589,36 @@ results.forEach((result, idx) => {
 A: **Horizontal drift:** Each `.then()` adds nesting indentation, reducing readability of long chains.
 
 ```js
-// Horizontal drift (hard to read)
+// Horizontal drift (hard to read) — notice how each .then() goes INSIDE the previous one
 user()
     .then((u) =>
         posts(u.id).then((p) =>
-            likes(p[0].id).then((l) =>
-                comments(l[0].id).then((c) => console.log(c)),
+            likes(p[0].id).then(
+                (l) => comments(l[0].id).then((c) => console.log(c)), // 4 levels deep!
             ),
         ),
     )
     .catch(console.error);
 
-// Fix: Flatten the chain by returning values
+// Fix: Flatten by returning the next Promise from .then() instead of nesting
+// When a .then() returns a Promise, the NEXT .then() waits for that promise to resolve
 user()
-    .then((u) => posts(u.id))
-    .then((p) => likes(p[0].id))
-    .then((l) => comments(l[0].id))
-    .then((c) => console.log(c))
-    .catch(console.error);
+    .then((u) => posts(u.id)) // Returns a promise → next .then() gets the posts
+    .then((p) => likes(p[0].id)) // Returns a promise → next .then() gets the likes
+    .then((l) => comments(l[0].id)) // Returns a promise → next .then() gets the comments
+    .then((c) => console.log(c)) // Gets the final result
+    .catch(console.error); // ONE catch for all errors — clean!
 
-// Best: Use async/await
+// Best: async/await — reads exactly like synchronous code
 async function getComments() {
     try {
-        const u = await user();
-        const p = await posts(u.id);
-        const l = await likes(p[0].id);
-        const c = await comments(l[0].id);
+        const u = await user(); // Wait for user, store result in 'u'
+        const p = await posts(u.id); // Wait for posts for that user
+        const l = await likes(p[0].id); // Wait for likes on first post
+        const c = await comments(l[0].id); // Wait for comments on first like
         console.log(c);
     } catch (err) {
-        console.error(err);
+        console.error(err); // Any failure in any step lands here
     }
 }
 ```
@@ -1203,28 +1668,54 @@ async function fetchDataFast() {
 }
 ```
 
-A: **Time complexity:**
-
-- **Pattern A:** Sequential. Total time = `fetch1()` + `fetch2()` (if fetch2 depends on a, this is correct).
-- **Pattern B:** Parallel. Total time = max(`fetch1()`, `fetch2()`) (both run concurrently).
-
-**Pattern B is faster if fetch1 and fetch2 are independent.** Use Pattern A only if the second operation depends on the first result.
+> 📖 **What this example demonstrates:** Pattern A runs operations one after another (sequential). Pattern B runs them at the same time (parallel). If the operations are independent, Pattern B is always faster. If the second depends on the first result, Pattern A is the only correct choice.
+>
+> 🔑 **Key terms:**
+>
+> - **Sequential** — Operations happen one after another. Total time = sum of all times: 200ms + 150ms = 350ms.
+> - **Parallel** — All operations start simultaneously. Total time = the slowest one: max(200ms, 150ms) = 200ms.
+> - **`Promise.all([a, b, c])`** — Starts all three promises AT THE SAME TIME, then waits until ALL finish. Like starting 3 download timers simultaneously.
 
 ```js
-// Pattern A: Sequential (fetch2 needs data from fetch1)
+// ── PATTERN A: Sequential ───────────────────────────────────────────────
+async function fetchData() {
+    const a = await fetch1(); // fetch1 starts and we WAIT here until it finishes (~200ms)
+    const b = await fetch2(); // ONLY THEN does fetch2 start (another ~150ms)
+    // Total time: ~350ms (200 + 150)
+    return [a, b];
+}
+// Use this ONLY when fetch2 needs data from fetch1 — e.g. fetch2 = fetchPosts(user.id)
+
+// ── PATTERN B: Parallel ────────────────────────────────────────────────
+async function fetchDataFast() {
+    // fetch1() and fetch2() are BOTH called here — they start running in the background simultaneously
+    // Promise.all waits until BOTH are done, returns an array in the same order
+    const [a, b] = await Promise.all([fetch1(), fetch2()]);
+    // Total time: ~200ms (they ran in parallel; we only wait for the slower one)
+    return [a, b];
+}
+// Use this when fetch1 and fetch2 are INDEPENDENT (don't need each other's results)
+```
+
+```js
+// ── When to use sequential (Pattern A): fetch2 REQUIRES fetch1's result ───────
 async function getUser(id) {
-    const user = await fetchUser(id); // Must come first
-    const posts = await fetchPosts(user.id); // Depends on user.id
+    const user = await fetchUser(id); // Must fetch user first
+    const posts = await fetchPosts(user.id); // user.id only available after user is fetched
+    // Can't parallelize: we literally don't know what user.id is until user loads
     return { user, posts };
 }
 
-// Pattern B: Parallel (independent operations)
+// ── When to use parallel (Pattern B): all fetches are independent ──────────
 async function getMetrics() {
+    // All three fetch calls start at the SAME time
+    // None of them needs data from the others
     const [users, posts, comments] = await Promise.all([
-        fetchAllUsers(), // Independent
-        fetchAllPosts(), // Independent
-        fetchAllComments(), // Independent
+        fetchAllUsers(), // Starts immediately
+        fetchAllPosts(), // Starts immediately (doesn't need users first)
+        fetchAllComments(), // Starts immediately (doesn't need posts first)
     ]);
+    // All three run in parallel — total time = time of the SLOWEST one
     return { users, posts, comments };
 }
 ```
@@ -1259,30 +1750,37 @@ const fastest = await Promise.race([...]); // Could return an error
 - **Serial instead of parallel:** Using sequential `await` in loops when operations are independent (performance regression).
 
     ```js
-    // ❌ BAD: Serial (slow)
+    // ❌ BAD: Serial (slow) — waits for each fetch to finish before starting the next
+    // If each fetch takes 100ms and there are 5 IDs, total = 500ms
     for (const id of ids) {
-        await fetchData(id); // Wait for each one
+        await fetchData(id); // 'await' inside a regular for loop = sequential execution
     }
 
-    // ✅ GOOD: Parallel (fast)
+    // ✅ GOOD: Parallel (fast) — all fetches start at the same time
+    // ids.map() creates an array of Promises (all started simultaneously)
+    // Promise.all() waits until ALL finish — total time = slowest single fetch
     await Promise.all(ids.map((id) => fetchData(id)));
     ```
 
 - **Mixing callbacks and promises:** Error in callbacks don't automatically reject the promise.
 
     ```js
-    // ❌ BAD: Callback error not caught by promise
+    // ❌ BAD: The callback-style error (throw err) is thrown INSIDE a callback
+    // It's NOT inside the Promise executor, so the Promise has no way to catch it
+    // The error becomes an unhandled exception that crashes the process
     new Promise((resolve) => {
         fs.readFile("file", "utf8", (err, data) => {
-            if (err) throw err; // Error escapes!
+            if (err) throw err; // ← This 'throw' is inside a callback, NOT inside the Promise
+            // The Promise executor has already returned — this error escapes!
         });
     });
 
-    // ✅ GOOD
+    // ✅ GOOD: Manually call reject() in the callback error path
+    // reject() is the Promise-aware way to signal failure from inside a callback
     new Promise((resolve, reject) => {
         fs.readFile("file", "utf8", (err, data) => {
-            if (err) return reject(err);
-            resolve(data);
+            if (err) return reject(err); // ← Tells the Promise: "you failed with this error"
+            resolve(data); // ← Tells the Promise: "you succeeded with this data"
         });
     });
     ```
@@ -1343,101 +1841,156 @@ Error handling in Node.js is not just about catching exceptions — it's about *
 
 ### Custom Error Classes
 
+> 📖 **What this example demonstrates:** Instead of throwing generic `new Error('something went wrong')`, you create **typed error classes** that carry structured data like HTTP status codes. This lets your error middleware make smart decisions (e.g., send a 404 vs a 500 response) without parsing error messages.
+>
+> 🔑 **Key terms:**
+>
+> - **`extends Error`** — Inheritance. `AppError` IS an Error (you can catch it with `try/catch`), but it has extra properties like `statusCode`.
+> - **`super(message)`** — Calls the parent `Error` constructor. This sets `this.message` and ensures the error behaves like a real JS Error.
+> - **`isOperational = true`** — A flag you add to distinguish between _expected_ errors (operational, `true`) and unexpected bugs (programmer errors, `false`). A `NotFoundError` is operational — it's normal that sometimes a user doesn't exist. A `DatabaseError` triggered by a null pointer is NOT operational — it's a bug.
+> - **`Error.captureStackTrace(this, this.constructor)`** — Removes the constructor call itself from the stack trace. Without this, the stack trace starts with `AppError (new AppError)` which is noise. With it, the trace starts at the code that actually threw the error.
+
 ```js
-// Base application error
+// ── BASE CLASS: All application errors extend this ─────────────────────────
 class AppError extends Error {
     constructor(message, statusCode, isOperational = true) {
-        super(message);
-        this.statusCode = statusCode;
-        this.isOperational = isOperational;
-        this.name = this.constructor.name;
-        Error.captureStackTrace(this, this.constructor);
+        super(message); // Sets this.message (standard Error behaviour)
+        this.statusCode = statusCode; // HTTP status code (404, 400, 500, etc.)
+        this.isOperational = isOperational; // true = expected/handled; false = bug/crash
+        this.name = this.constructor.name; // 'NotFoundError', 'ValidationError', etc.
+        Error.captureStackTrace(this, this.constructor); // Clean stack trace
     }
 }
 
+// ── SPECIFIC ERRORS: Each type pre-fills the right status code ───────────────
 class NotFoundError extends AppError {
+    // Usage: throw new NotFoundError('User')  →  message = 'User not found', status = 404
     constructor(resource = "Resource") {
-        super(`${resource} not found`, 404);
+        super(`${resource} not found`, 404); // 404 = HTTP 'Not Found'
     }
 }
 
 class ValidationError extends AppError {
+    // Usage: throw new ValidationError('Email is required')  →  status = 400
     constructor(message) {
-        super(message, 400);
+        super(message, 400); // 400 = HTTP 'Bad Request' (user sent invalid data)
     }
 }
 
 class DatabaseError extends AppError {
+    // Usage: throw new DatabaseError('Connection refused')  →  status = 500, isOperational = FALSE
+    // isOperational = false means this is a BUG or infrastructure failure, not a user error
     constructor(message) {
-        super(message, 500, false); // Not operational — bug
+        super(message, 500, false); // 500 = HTTP 'Internal Server Error'
     }
 }
 
-// Usage
+// ── USAGE: Clean, descriptive errors with structured data ──────────────────
 async function getUser(id) {
     const user = await db.findById(id);
-    if (!user) throw new NotFoundError("User");
+    if (!user) throw new NotFoundError("User"); // self-documenting AND carries status code
     return user;
+    // Before custom errors: throw new Error('User not found') ← how does middleware know it's 404?
+    // After custom errors: throw new NotFoundError('User') ← middleware reads err.statusCode = 404
 }
 ```
 
 ### Express Error Handling Middleware
 
+> 📖 **What this example demonstrates:** Express has a special pattern for error handling: a middleware function that takes **4 parameters** `(err, req, res, next)`. Express automatically routes to this middleware whenever any other middleware calls `next(err)` or when an async handler throws. This centralizes all error responses in one place instead of repeating error-handling code in every route.
+>
+> 🔑 **Key terms:**
+>
+> - **Middleware** — A function that runs between a request arriving and the response being sent. Express chains these together. The 4-parameter signature is how Express knows this one handles errors (not normal requests).
+> - **`next(err)`** — Passing an error to Express's middleware chain. Calling `next(err)` says "skip all normal middlewares and go straight to the error handler".
+> - **`err.isOperational`** — Our custom flag. If `true`, we tell the user a specific helpful message. If `false` (unexpected bug), we give a generic "Internal server error" to avoid leaking code details.
+
 ```js
-// Centralized error handler (MUST have 4 params)
+// ── THE ERROR HANDLER (MUST be the LAST app.use() call) ────────────────────
+// ⚠️ The 4 parameters are mandatory — if you write only 3, Express treats it as a regular handler
 function errorHandler(err, req, res, next) {
-    // Log all errors
+    // Always log the full error for internal debugging (this goes to your logs, not the user)
     console.error({
-        message: err.message,
-        stack: err.stack,
-        statusCode: err.statusCode,
-        path: req.path,
+        message: err.message, // Human-readable error text
+        stack: err.stack, // Call stack showing where the error originated
+        statusCode: err.statusCode, // Our custom status (or undefined for raw Errors)
+        path: req.path, // Which route triggered the error
     });
 
-    // Operational errors: send meaningful response
     if (err.isOperational) {
+        // isOperational = true: This is an expected error we designed for (like 404, 400)
+        // Safe to send the actual message to the user
         return res.status(err.statusCode).json({
-            error: err.message,
+            error: err.message, // e.g., 'User not found' or 'Email is required'
         });
     }
 
-    // Programmer errors: generic response, alert team
-    res.status(500).json({ error: "Internal server error" });
+    // isOperational = false (or missing): Unexpected bug, database crash, null pointer, etc.
+    // NEVER send internal error details to users (security risk + confusing to users)
+    res.status(500).json({ error: "Internal server error" }); // Generic message
+    // Alert your team (PagerDuty, Slack, etc.) about this unexpected error
 }
 
-// Usage
+// ── USAGE IN ROUTES: Always pass errors to next() in async handlers ───────────
 app.get("/users/:id", async (req, res, next) => {
     try {
-        const user = await getUser(req.params.id);
+        const user = await getUser(req.params.id); // getUser throws NotFoundError if missing
         res.json(user);
     } catch (err) {
-        next(err); // Pass to error middleware
+        next(err); // ← Hands the error to our errorHandler middleware above
+        // Without this next(err), Express would hang or show a default error page
     }
 });
 
-app.use(errorHandler); // Must be last middleware
+app.use(errorHandler); // ← MUST be LAST — catches errors from ALL routes registered above it
 ```
 
 ### Global Error Handlers
 
+> 📖 **What this example demonstrates:** Two safety nets for errors that escape all your `try/catch` blocks. These are your **last resort** handlers — by the time these fire, something has gone very wrong. The correct response is to log everything and gracefully shut down.
+>
+> 🔑 **Key terms:**
+>
+> - **`unhandledRejection`** — Fires when a Promise is rejected but nobody called `.catch()` or used `try/catch` on it. Example: `someAsyncFn()` without `await` or `.catch()`.
+> - **`uncaughtException`** — Fires when a regular `throw` escapes all `try/catch` blocks. After this fires, Node's state is **undefined** — you should always exit.
+> - **`process.exit(1)`** — Immediately terminates the process. Exit code `1` means failure (non-zero = error). Exit code `0` means clean exit.
+> - **`warning` event** — Fires for non-fatal notices like memory leaks (`MaxListenersExceededWarning`) or deprecated API usage. Does NOT crash the process.
+
 ```js
-// Catch unhandled promise rejections
+// ── SAFETY NET 1: Unhandled Promise rejections ──────────────────────────
+// Example that triggers this:
+//   async function boom() { throw new Error('oops'); }
+//   boom(); // ← no await, no .catch() — triggers unhandledRejection
 process.on("unhandledRejection", (reason, promise) => {
+    // 'reason' = the error or value that the promise rejected with
+    // 'promise' = the actual Promise object that was rejected
     console.error("Unhandled Rejection:", reason);
-    // In production: log, alert, then shutdown gracefully
-    // process.exit(1); // Node 15+ crashes by default
+    // In production: log to your error tracker (Sentry, Datadog) before exiting
+    // process.exit(1); // Node 15+ crashes automatically — uncomment for Node <15
 });
 
-// Catch uncaught exceptions
+// ── SAFETY NET 2: Uncaught exceptions (synchronous throws) ────────────────
+// Example that triggers this:
+//   setTimeout(() => { throw new Error('surprise'); }, 0);
+//   ← throw inside a timer callback with no try/catch around it
 process.on("uncaughtException", (err) => {
     console.error("Uncaught Exception:", err);
-    // MUST exit — process state is unreliable after uncaught exception
-    process.exit(1);
+    // CRITICAL: ALWAYS exit after this. The process state may be corrupted.
+    // An open database connection might be half-committed. Memory might be inconsistent.
+    // PM2, systemd, or Kubernetes will restart the process automatically.
+    process.exit(1); // '1' = abnormal exit (tells the OS something went wrong)
 });
 
-// Catch warnings (e.g., MaxListenersExceeded)
+// ── MONITORING WARNINGS (non-fatal) ────────────────────────────────
 process.on("warning", (warning) => {
+    // warning.name = type of warning (e.g., 'MaxListenersExceededWarning')
+    // warning.message = human-readable description
+    // Does NOT crash the process — just a heads-up that something might be wrong
     console.warn("Warning:", warning.name, warning.message);
+    // Common warnings to watch for:
+    // 'MaxListenersExceededWarning' → memory leak in EventEmitter
+    // 'ExperimentalWarning' → using a Node.js feature that's not stable yet
+    // 'DeprecationWarning' → using an API that will be removed in a future version
 });
 ```
 
@@ -1454,26 +2007,38 @@ A: **No.** After an uncaught exception, Node's state is unreliable (corrupted me
 ```js
 process.on("uncaughtException", (err) => {
     logger.fatal(err, "Uncaught exception — shutting down");
-    server.close(() => process.exit(1));
-    // Force kill if graceful shutdown hangs
-    setTimeout(() => process.exit(1), 10000);
+    // Step 1: Tell the HTTP server to stop accepting NEW connections
+    // But finish any in-progress requests (graceful shutdown)
+    server.close(() => process.exit(1)); // Callback fires when server drains
+    // Step 2: Safety timeout — if server.close() gets stuck (e.g., long-running request),
+    // force kill after 10 seconds to avoid hanging forever
+    setTimeout(() => process.exit(1), 10000); // 10,000 ms = 10 seconds
 });
 ```
 
 **Q2: How do you handle errors in `Promise.all()` without failing the entire batch?**
 
-A: Use `Promise.allSettled()` or wrap individual promises:
+> 📖 **What this example demonstrates:** When you have a batch operation on multiple URLs, you need all results even if some fail. Two approaches: `allSettled` gives you structured results, or you wrap each individual promise in `.catch()` to turn failures into special objects you can identify later.
 
 ```js
-// Option 1: allSettled
+// ── OPTION 1: Promise.allSettled ────────────────────────────────────────────
+// allSettled NEVER rejects itself — it always gives you an array of outcome objects
 const results = await Promise.allSettled(urls.map(fetch));
-const successes = results.filter((r) => r.status === "fulfilled");
-const failures = results.filter((r) => r.status === "rejected");
+// Filter results by outcome:
+const successes = results.filter((r) => r.status === "fulfilled"); // { status, value }
+const failures = results.filter((r) => r.status === "rejected"); // { status, reason }
+// Use case: Send emails to 100 users, some bounce — record results for all, not just successes
 
-// Option 2: Wrap with error catch
+// ── OPTION 2: Wrap each with .catch() to normalize failures ──────────────────
+// Instead of a rejected promise, each failure becomes a plain object { error, url }
+// So Promise.all() always sees fulfilled promises (never rejects)
 const safeResults = await Promise.all(
-    urls.map((url) => fetch(url).catch((err) => ({ error: err.message, url }))),
+    urls.map(
+        (url) => fetch(url).catch((err) => ({ error: err.message, url })), // Turn rejection into value
+    ),
 );
+// Now safeResults contains either a Response object (success) or { error, url } (failure)
+// Easy to spot failures: if (result.error) { ... }
 ```
 
 **Q3: What's the difference between `throw` in async vs sync functions?**
@@ -1484,33 +2049,42 @@ A:
 - **Async `throw`:** Rejects the returned promise — caught by `.catch()` or `try/catch` with `await`
 
 ```js
-// Sync: Caught by try/catch
+// ── Synchronous throw: caught by regular try/catch ──────────────────────────
 function syncFn() {
-    throw new Error("sync");
+    throw new Error("sync"); // Thrown immediately, synchronously
 }
 try {
-    syncFn();
+    syncFn(); // Execution stops here if throw happens
 } catch (e) {
-    /* caught */
+    /* caught immediately */
+    // Execution jumps here
 }
 
-// Async: Returns rejected promise
+// ── Async throw: becomes a rejected Promise ─────────────────────────────
 async function asyncFn() {
-    throw new Error("async");
+    throw new Error("async"); // In an async function, throw = reject the returned Promise
 }
+// asyncFn() returns a Promise that is now rejected with Error('async')
 asyncFn().catch((e) => {
-    /* caught */
+    /* caught via .catch() */
 });
+// Alternatively with `await`:
+// try { await asyncFn(); } catch(e) { /* caught */ }
 
-// ⚠️ GOTCHA: throw inside callback is NOT caught by async try/catch
+// ── THE INFAMOUS GOTCHA: setTimeout callback ───────────────────────────
 async function gotcha() {
     try {
+        // The try/catch only protects code that runs SYNCHRONOUSLY inside it.
+        // setTimeout schedules a callback for LATER (after the try block has already exited).
+        // When the callback runs, the try/catch is long gone — the error escapes!
         setTimeout(() => {
-            throw new Error("oops");
-        }, 0); // NOT caught!
+            throw new Error("oops"); // ← This becomes an unhandledException — crashes the process!
+        }, 0);
     } catch (e) {
-        // Never reaches here
+        // This NEVER runs — the error is thrown AFTER the try block exits
+        console.log("caught"); // Never printed
     }
+    // ✅ Fix: put try/catch INSIDE the callback, or use setImmediate with a promise wrapper
 }
 ```
 
@@ -1590,74 +2164,94 @@ A: The warning prevents **memory leaks** from forgotten listener references. A s
 - Repeated attachment without deduplication
 - (Rarely) legitimately high listener count
 
+> 📖 **What this example demonstrates:** Every call to `.on()` stores a new function in memory. If you call it in a loop or a recurring operation without ever calling `.removeListener()`, the list grows forever. Node warns you at 10 because that's almost always a sign of a bug, not intentional code.
+>
+> 🔑 **Key terms:**
+>
+> - **`setInterval(fn, 100)`** — Calls `fn` every 100 milliseconds. After 1 second, `attachListeners` has been called 10 times, each time adding a new listener. After 1000 requests, 1000 listeners are piled up.
+> - **`listenerCount(event)`** — Returns how many listeners are registered for a specific event name. Use this to audit leaks.
+> - **`listeners(event)`** — Returns the array of actual function references. Useful to see exactly what's registered.
+
 ```js
-// ❌ Memory leak: Listeners pile up
 const { EventEmitter } = require("events");
 const emitter = new EventEmitter();
 
+// ❌ MEMORY LEAK: This function keeps adding a NEW listener every time it's called
 function attachListeners() {
+    // Each call to .on() stores a new anonymous function reference in memory
+    // These are NEVER removed — they pile up indefinitely
     emitter.on("data", () => {
-        console.log("Processing data");
+        console.log("Processing data"); // After 100 calls: 100 functions stored, only 1 needed!
     });
 }
 
-// Called repeatedly, listeners accumulate
+// Called every 100ms → after 1 second = 10 listeners → Node prints a warning
 setInterval(attachListeners, 100);
-// After 1 second: 10 listeners, warning appears
+// Node warning: "MaxListenersExceededWarning: Possible EventEmitter memory leak detected.
+//               11 data listeners added."
 
-// ✅ Fix: Remove listeners on cleanup
+// ✅ FIX: Store handler as a property so it can be removed
 class DataProcessor {
     constructor(emitter) {
         this.emitter = emitter;
+        // Store handler AS A CLASS PROPERTY — same function reference used to attach AND remove
         this.handler = () => console.log("Processing");
     }
 
     attach() {
-        this.emitter.on("data", this.handler);
+        this.emitter.on("data", this.handler); // Attach: always the same function
     }
 
     detach() {
+        // RemoveListener needs the EXACT same function reference that was passed to .on()
+        // That's why anonymous arrow functions inside .on() can NEVER be removed — no reference!
         this.emitter.removeListener("data", this.handler);
     }
 }
 
-// Debug: Check listener count
-console.log(emitter.listenerCount("data")); // Get count for specific event
-console.log(emitter.listeners("data")); // Get actual functions
+// Debug tools to inspect listeners:
+console.log(emitter.listenerCount("data")); // How many listeners for 'data' event? (e.g., 15)
+console.log(emitter.listeners("data")); // Array of actual functions stored for 'data'
 ```
 
 **Q2: Your Express app creates a new EventEmitter inside each request handler. Is this a memory leak?**
 
 A: Not if the emitter is garbage-collected after the request. But if you attach persistent listeners, they leak:
 
+> 📖 **What this example demonstrates:** A very common mistake in Express apps. Every HTTP request triggers a new `.on()` call on a global emitter. Since the `globalEmitter` lives for the lifetime of the app (not just the request), listeners accumulate. After 1000 requests, 1000 callbacks are registered — each response runs all 1000.
+
 ```js
-// ❌ LEAK: Listener survives request
 const express = require("express");
 const app = express();
 const { EventEmitter } = require("events");
-const globalEmitter = new EventEmitter();
+const globalEmitter = new EventEmitter(); // This object lives for the entire app lifetime
 
+// ❌ LEAK: Each incoming HTTP request adds a new 'update' listener to globalEmitter
+// After request 1: 1 listener
+// After request 1000: 1000 listeners — each 'update' event triggers ALL 1000 callbacks!
 app.get("/api/data", (req, res) => {
     globalEmitter.on("update", () => {
-        // Attached once per request, never removed
-        res.json({ data: "updated" });
+        // .on() adds to the globalEmitter PERMANENTLY
+        res.json({ data: "updated" }); // Worse: if response already sent, this throws an error!
     });
 });
 
-// After 1000 requests: 1000 listeners on globalEmitter
-
-// ✅ FIX: Cleanup on request end
+// ✅ FIX 1: Save the handler reference and remove it when the response finishes
 app.get("/api/data", (req, res) => {
-    const handler = () => res.json({ data: "updated" });
-    globalEmitter.on("update", handler);
+    const handler = () => res.json({ data: "updated" }); // Named handler we can reference
+    globalEmitter.on("update", handler); // Attach
 
+    // 'finish' fires when the HTTP response has been sent to the client
+    // At that point, we no longer need this handler — remove it!
     res.on("finish", () => {
-        globalEmitter.removeListener("update", handler);
+        globalEmitter.removeListener("update", handler); // Clean up — prevents the leak
     });
 });
 
-// ✅ BETTER: Use once()
+// ✅ FIX 2: Use .once() — automatically removes itself after firing exactly once
 app.get("/api/data", (req, res) => {
+    // once() is perfect here: each request only needs to respond once.
+    // After the callback fires, Node automatically removes it. No manual cleanup needed.
     globalEmitter.once("update", () => {
         res.json({ data: "updated" });
     });
@@ -1671,19 +2265,23 @@ A:
 - **`on()`:** Listener runs every time event fires (persistent).
 - **`once()`:** Listener runs exactly once, then auto-removes.
 
+> 📖 **What this example demonstrates:** The concrete difference between `.on()` (keep listening forever) and `.once()` (listen exactly once then stop). The rule of thumb: if an event should trigger repeated actions, use `.on()`. If it's a one-time setup/handshake, use `.once()`.
+
 ```js
 const { EventEmitter } = require("events");
 const emitter = new EventEmitter();
 
-// on(): Persistent
+// ── .on(): Persistent listener ─────────────────────────────────────────────
 emitter.on("click", () => console.log("Clicked"));
-emitter.emit("click"); // "Clicked"
-emitter.emit("click"); // "Clicked" (still listening)
+// Listener is stored permanently until you call .removeListener()
+emitter.emit("click"); // Prints: "Clicked"
+emitter.emit("click"); // Prints: "Clicked" again — the listener is STILL there
 
-// once(): One-time
+// ── .once(): Self-removing listener ──────────────────────────────────────
 emitter.once("first-connect", () => console.log("Connected"));
-emitter.emit("first-connect"); // "Connected"
-emitter.emit("first-connect"); // (no output, listener removed)
+// Listener is stored, but wrapped internally: after it fires once, it removes itself
+emitter.emit("first-connect"); // Prints: "Connected" — listener fires and then unregisters
+emitter.emit("first-connect"); // Prints nothing — the listener is gone, nothing to call
 ```
 
 **Use `once()` for:**
@@ -1701,51 +2299,60 @@ emitter.emit("first-connect"); // (no output, listener removed)
 
 A:
 
+> 📖 **What this example demonstrates:** A PubSub wrapper around EventEmitter that returns an **unsubscribe function** from every `subscribe()` call. This is the modern React/Redux-style pattern — the caller is responsible for cleanup, and cleanup is as easy as calling one function.
+>
+> 🔑 **Key terms:**
+>
+> - **Return an unsubscribe function** — Instead of making the caller remember the event name AND handler to pass to `.removeListener()`, you bundle both in a closure and return a single `() => {}` function. Call it to clean up.
+> - **Closure** — A function that "remembers" the variables from its surrounding scope. The `() => emitter.removeListener(topic, handler)` function remembers both `topic` and `handler` even after `subscribe()` returns.
+
 ```js
 class PubSub {
     constructor() {
         this.emitter = new EventEmitter();
-        this.emitter.setMaxListeners(100); // Increase if legitimately needed
+        this.emitter.setMaxListeners(100); // We intentionally support many subscribers; increase limit
     }
 
+    // Returns an UNSUBSCRIBE function — caller stores it and calls it to stop listening
     subscribe(topic, handler) {
-        this.emitter.on(topic, handler);
+        this.emitter.on(topic, handler); // Standard subscription
 
-        // Return unsubscribe function (cleanup interface)
+        // Return a cleanup function (closure) that remembers 'topic' and 'handler'
         return () => {
-            this.emitter.removeListener(topic, handler);
+            this.emitter.removeListener(topic, handler); // Call this to unsubscribe
         };
     }
 
     subscribeOnce(topic, handler) {
-        this.emitter.once(topic, handler);
+        this.emitter.once(topic, handler); // Auto-removes after first fire
         return () => {
-            this.emitter.removeListener(topic, handler);
+            this.emitter.removeListener(topic, handler); // Manual cancel before it fires
         };
     }
 
     publish(topic, data) {
-        this.emitter.emit(topic, data);
+        this.emitter.emit(topic, data); // Trigger all handlers for this topic
     }
 
-    // Debug: Get listener count
     getListenerCount(topic) {
-        return this.emitter.listenerCount(topic);
+        return this.emitter.listenerCount(topic); // Debug: check for leaks
     }
 }
 
-// Usage with cleanup
+// Usage: subscribe and store the returned unsubscribe function
 const pubsub = new PubSub();
 
 const unsubscribe = pubsub.subscribe("user:login", (user) => {
     console.log(`${user.name} logged in`);
 });
 
-// Cleanup when done
-unsubscribe();
+pubsub.publish("user:login", { name: "Alice" }); // Prints: Alice logged in
 
-// Verify cleanup
-console.log(pubsub.getListenerCount("user:login")); // 0
+unsubscribe(); // Clean up — handler removed, no more memory held
+
+pubsub.publish("user:login", { name: "Bob" }); // Prints nothing — unsubscribed!
+
+console.log(pubsub.getListenerCount("user:login")); // 0 — confirmed clean
 ```
 
 **Q5: You have 50+ EventEmitters in your app. How do you track listener leaks?**
@@ -1791,17 +2398,19 @@ setInterval(() => {
 - **Prefer named handlers for removal:** Arrow functions in `.on()` can't be removed (no reference).
 
     ```js
-    // ❌ Can't remove (anonymous)
+    // ❌ Can't remove: anonymous arrow function, no way to reference it later
     emitter.on("event", () => {
         /* do something */
-    });
+    }); // Node stores this function, but YOU have no variable pointing to it
+    // emitter.removeListener("event", ???) ← what would you pass here?
 
-    // ✅ Can be removed (named)
+    // ✅ Can be removed: named variable holds the function reference
     const handler = () => {
         /* do something */
     };
-    emitter.on("event", handler);
-    emitter.removeListener("event", handler);
+    emitter.on("event", handler); // Attach using the variable
+    emitter.removeListener("event", handler); // Detach using the SAME variable
+    // node compares function references: handler === handler → true → removes it
     ```
 
 - **Use `.once()` for one-off events:** Auto-cleanup prevents leaks.
@@ -1910,56 +2519,73 @@ graph LR
 
 When a slow consumer can't keep up with a fast producer, the producer should reduce output (or buffer in memory, risking OOM).
 
-```js
-// ❌ NO BACKPRESSURE: Memory leak!
-const fs = require("fs");
-const readStream = fs.createReadStream("huge-file.txt");
-const writeStream = fs.createWriteStream("output.txt");
+> 📖 **What this example demonstrates:** Three approaches to copying a file. The first ignores backpressure (data piles up in memory). The second implements it manually by checking `write()`'s return value. The third uses `.pipe()` which does all this automatically.
+>
+> 🔑 **Key terms:**
+>
+> - **`write()` return value** — `writable.write(chunk)` returns `true` if the internal buffer has room, or `false` if the buffer is full and you should stop sending. Most developers ignore this return value — that causes the memory leak.
+> - **`pause()` / `resume()`** — Methods on a Readable stream. `pause()` tells the stream to stop reading from the source. `resume()` tells it to start again. Together, they let you manually control the data flow rate.
+> - **`drain` event** — Fired by a Writable stream when its internal buffer has emptied and it's ready to accept more data. This is the signal to `resume()` the reader.
+> - **`OOM` (Out Of Memory)** — When your process runs out of RAM. Node crashes with `FATAL ERROR: CALL_AND_RETRY_LAST Allocation failed - JavaScript heap out of memory`.
 
+```js
+const fs = require("fs");
+const readStream = fs.createReadStream("huge-file.txt"); // Reads file in chunks
+const writeStream = fs.createWriteStream("output.txt"); // Writes chunks to disk
+
+// ❌ NO BACKPRESSURE: Memory accumulates until crash
 readStream.on("data", (chunk) => {
-    writeStream.write(chunk); // Ignores write() return value
-    // If write() returns false, we're buffering too much!
+    // write() returns false when the write buffer is full
+    // We're ignoring that return value! Node keeps reading from disk at full speed
+    // But the write buffer is filling up and can't drain fast enough
+    // Result: write buffer grows and grows — for a 1GB file this means ~1GB in RAM
+    writeStream.write(chunk);
 });
 
-// ✅ WITH BACKPRESSURE: Intelligent pumping
+// ✅ MANUAL BACKPRESSURE: Pause when buffer is full, resume when it drains
 readStream.on("data", (chunk) => {
-    const canContinue = writeStream.write(chunk);
+    const canContinue = writeStream.write(chunk); // returns true = OK, false = buffer full
     if (!canContinue) {
-        readStream.pause(); // Stop reading until drain event
+        readStream.pause(); // Tell the reader: STOP sending data, write is overwhelmed
+        // At this point, readStream stops reading from disk — memory usage stays low
     }
 });
 
 writeStream.on("drain", () => {
-    readStream.resume(); // Resume reading
+    // 'drain' fires when writeStream's buffer has fully emptied to disk
+    readStream.resume(); // OK to start reading again — write buffer has room
 });
 
-// ✅ BEST: Use .pipe() (handles backpressure automatically)
+// ✅ BEST: Use .pipe() — implements the exact manual backpressure pattern above automatically
 readStream.pipe(writeStream);
+// .pipe() internally wires up all the pause/resume/drain logic — clean and reliable
 ```
 
 **Performance example: Without vs with backpressure**
 
+> 📖 **What this example demonstrates:** Functionally, `badStream` and `goodStream` produce identical output files. The difference is invisible to users — but `badStream` might crash the server while `goodStream` uses a constant ~64KB of RAM.
+
 ```js
-// Measure memory without backpressure handling
 const fs = require("fs");
 
-// BAD: Leaks memory for large files
+// ❌ BAD: Read events fire as fast as disk can deliver; write buffer grows endlessly
 function badStream() {
-    const read = fs.createReadStream("1gb-file.txt");
+    const read = fs.createReadStream("1gb-file.txt"); // Reads chunks as fast as possible
     const write = fs.createWriteStream("output.txt");
 
     read.on("data", (chunk) => {
-        write.write(chunk);
-        // No pause() = buffer grows → OOM
+        write.write(chunk); // Dump chunk into write buffer immediately, no checking
+        // After 100ms: write buffer might hold 50MB of unwritten data
+        // After 500ms: write buffer might hold 200MB — approaching OOM territory
     });
 }
 
-// GOOD: Manages memory efficiently
+// ✅ GOOD: read.pipe(write) handles the pause/resume/drain cycle automatically
 function goodStream() {
     const read = fs.createReadStream("1gb-file.txt");
     const write = fs.createWriteStream("output.txt");
-    read.pipe(write);
-    // Backpressure managed automatically
+    read.pipe(write); // One line replaces all the manual backpressure code above
+    // Memory usage: ~64KB at all times (one chunk in transit), regardless of file size
 }
 ```
 
@@ -2111,22 +2737,27 @@ pipeline(
 
 A: **Backpressure** signals that the consumer is slower than the producer. Ignoring it floods memory:
 
+> 📖 **What this example demonstrates:** `write()` returns `false` to signal backpressure. When that happens, pause the reader. Only resume when the `drain` event fires. Without this, a 1GB file could consume 500MB+ of RAM.
+
 ```js
 // Without backpressure: Memory usage ~500MB+ for 1GB file
-const read = fs.createReadStream("1gb.txt", { highWaterMark: 64 * 1024 }); // 64KB chunks
+const read = fs.createReadStream("1gb.txt", { highWaterMark: 64 * 1024 }); // Read in 64KB chunks
 const write = fs.createWriteStream("out.txt");
 
+// ❌ Ignoring write()'s return value — keeps reading even when write buffer is full
 read.on("data", (chunk) => {
-    write.write(chunk); // Ignores return value
+    write.write(chunk); // Return value ignored → buffer accumulates in memory
 });
 
-// With backpressure: Memory usage stays ~64KB (one chunk)
+// ✅ With backpressure: Memory stays at ~64KB (one chunk) at all times
 read.on("data", (chunk) => {
     if (!write.write(chunk)) {
-        read.pause();
+        // write() returns false = buffer full, stop reading!
+        read.pause(); // Pause disk reading until write buffer drains
     }
 });
 
+// When the write buffer empties to disk, 'drain' event fires → resume reading
 write.on("drain", () => read.resume());
 ```
 
@@ -2137,49 +2768,67 @@ A:
 - **Transform:** One-way transformation (read → transform → write). Example: compression, parsing.
 - **Duplex:** Two-way communication (can read AND write, independently). Example: TCP socket, WebSocket.
 
+> 📖 **What this example demonstrates:** The core difference between Transform (one-directional data processing) and Duplex (two independent communication channels). A network socket is Duplex: you read incoming data from the browser AND write response data back, but what you READ is not a transformation of what you WRITE — they are independent.
+>
+> 🔑 **Key terms:**
+>
+> - **Duplex** — Like a walkie-talkie: you can both talk (write) and listen (read) on the same channel, but what you hear isn’t derived from what you say.
+> - **Transform** — Like a text-to-speech converter: whatever text you put in comes out as speech. Output IS derived from input.
+
 ```js
-// Transform example: Text transform (one-way)
+// ── Transform: one-way data processing ────────────────────────────────────────
+// Input: 'hello' Buffer → Output: 'HELLO' Buffer
+// Whatever you READ is derived FROM what comes in. Completely one-directional.
 const upperTransform = new Transform({
     transform(chunk, enc, cb) {
-        cb(null, chunk.toString().toUpperCase());
+        cb(null, chunk.toString().toUpperCase()); // Modify input and pass it along
     },
 });
 
-// Duplex example: Simple echo server (two-way)
+// ── Duplex: two independent channels ─────────────────────────────────────
 const { Duplex } = require("stream");
 const echoServer = new Duplex({
-    read() {},
+    // read() = the READABLE side: provides data OUT (what the other end will receive)
+    read() {}, // Actual data pushed via this.push() inside write()
+    // write() = the WRITABLE side: receives data IN from the other end
     write(chunk, enc, cb) {
-        this.push(chunk); // Echo back
-        cb();
+        this.push(chunk); // Echo: push received data back out on the readable side
+        cb(); // Signal: done processing this chunk, ready for next
     },
 });
+// A real TCP socket works the same: you write() to send data to client, read() to receive from client
+// The READ and WRITE channels are completely independent — that's what makes it Duplex
 ```
 
 **Q3: Your transform stream is buffering data before calling callback. When is this a problem?**
 
 A: If the transform is slow but you don't signal backpressure in the upstream, input will buffer:
 
+> 📖 **What this example demonstrates:** The `callback` in a Transform's `transform()` is your signal to the stream system: "I'm done, send me the next chunk". If you delay calling it (e.g., waiting 1 second for a database write), input chunks queue up in memory. The fix is to also check whether the output side can accept more data.
+
 ```js
-// ❌ SLOW TRANSFORM: Callback delayed, buffers input
+// ❌ SLOW TRANSFORM: Delays callback by 1 second per chunk
+// If file has 1000 chunks, last chunk waits 1000 seconds! Meanwhile, input buffers all chunks.
 const slowTransform = new Transform({
     transform(chunk, enc, cb) {
         setTimeout(() => {
-            cb(null, chunk); // Delayed 1 second
-        }, 1000); // Slow operation!
+            cb(null, chunk); // Callback fires 1 second later — input waits and buffers!
+        }, 1000);
     },
 });
 
-// Effects:
-// - Input stream buffers data → memory grows
-// - Output stream can't process fast enough
-// - Eventually hits highWaterMark and throws backpressure
+// Effects if you pipe a fast reader into this:
+// - Input stream tries to send chunks as fast as disk allows
+// - slowTransform's internal buffer fills up (each chunk waits 1s)
+// - Buffer grows until highWaterMark (16KB default) → read stream pauses
+// - Memory stays bounded, BUT throughput is limited to 1 chunk per second
 
-// Solution: Accept backpressure from output
+// ✅ Better: Also respect downstream backpressure
 const slowTransform2 = new Transform({
     transform(chunk, enc, cb) {
         setTimeout(() => {
-            const canContinue = this.push(chunk);
+            const canContinue = this.push(chunk); // Push to output side
+            // If canContinue is false, downstream (the writable) is also overwhelmed
             cb(); // Always call callback, but result signals backpressure
         }, 1000);
     },
@@ -2401,11 +3050,11 @@ When the slowest stage hits its limit, the pause signal travels **backwards** th
 
 ```mermaid
 graph LR
-    A["File Reader\n1 GB/s\nFAST"] -->|"64KB chunks"| B["JSON Parser\n500 MB/s"]
-    B -->|"objects"| C["DB Writer\n10 MB/s\nSLOW!"]
+    A["File Reader<br/>1 GB/s<br/>FAST"] -->|"64KB chunks"| B["JSON Parser<br/>500 MB/s"]
+    B -->|"objects"| C["DB Writer<br/>10 MB/s<br/>SLOW!"]
 
-    C -.->|"Buffer full!\nwrite() returns false"| B
-    B -.->|"Pause propagates\nupstream pauses too"| A
+    C -.->|"Buffer full!<br/>write() returns false"| B
+    B -.->|"Pause propagates<br/>upstream pauses too"| A
 
     C -->|"drain event"| B
     B -->|"resume"| A
@@ -2647,28 +3296,37 @@ graph TB
 
 **Memory usage: Read entire file vs streaming**
 
+> 📖 **What this example demonstrates:** Compares all three ways to read a file. Only streams are safe for large files — they process the file in ~64KB chunks at a time, so a 1GB file still only uses 64KB of RAM regardless of file size.
+>
+> 🔑 **Key terms:**
+>
+> - **readFileSync** — Synchronous = blocking. The entire event loop freezes until the OS finishes reading the file. All other HTTP requests wait.
+> - **readFile (callback)** — Async, but still loads the ENTIRE file into a JavaScript Buffer in RAM before calling your callback.
+> - **createReadStream** — Reads in chunks (default 64KB per chunk). Only one chunk is in memory at a time. Perfect for large files.
+> - **highWaterMark** — The internal buffer size for streams. Default 64KB — the stream reads the next chunk only after you've consumed the current one.
+
 ```js
 // ❌ BAD: Loads 1GB into memory
 const fs = require("fs");
-const data = fs.readFileSync("1gb-file.txt"); // Blocks, uses 1GB RAM
+const data = fs.readFileSync("1gb-file.txt"); // Blocks event loop, uses 1GB RAM
 console.log(data.toString());
 
-// ❌ ALSO BAD: Async callback, still loads 1GB
+// ❌ ALSO BAD: Async callback, still loads 1GB into a single Buffer
 fs.readFile("1gb-file.txt", (err, data) => {
-    console.log(data.toString()); // Uses 1GB RAM
+    console.log(data.toString()); // Entire file in RAM before you can read any of it
 });
 
-// ✅ GOOD: Streams use ~64KB (one chunk)
+// ✅ GOOD: Streams use ~64KB (one chunk at a time — constant memory)
 fs.createReadStream("1gb-file.txt").on("data", (chunk) => {
-    console.log(chunk.toString()); // Process chunk-by-chunk
+    console.log(chunk.toString()); // Process chunk-by-chunk, old chunk is garbage-collected
 });
 
-// ✅ PIPE: Automatic backpressure
-fs.createReadStream("1gb-file.txt").pipe(process.stdout); // Streaming with backpressure
+// ✅ PIPE: Automatic backpressure — reads next chunk only when stdout is ready
+fs.createReadStream("1gb-file.txt").pipe(process.stdout);
 
-// ✅ FOR-AWAIT: Modern, readable
+// ✅ FOR-AWAIT: Modern async iteration (same as stream events, cleaner syntax)
 for await (const chunk of fs.createReadStream("1gb-file.txt")) {
-    console.log(chunk.toString());
+    console.log(chunk.toString()); // Each iteration yields one 64KB chunk
 }
 ```
 
@@ -2704,27 +3362,40 @@ sequenceDiagram
     Note over App: Process file change
 ```
 
+> 📖 **What this example demonstrates:** Shows three ways to watch files for changes. `fs.watch` is fastest but fires multiple events per save (editors do write→rename→delete behind the scenes). `fs.watchFile` polls with stat() every interval — reliable but slow. `chokidar` wraps both with cross-platform reliability.
+>
+> 🔑 **Key terms:**
+>
+> - **inotify** — Linux kernel's file-change notification system. Near-zero CPU, near-zero latency (~1ms). `fs.watch` uses this on Linux.
+> - **FSEvents** — macOS's equivalent of inotify. Also event-driven (not polling).
+> - **Polling** — The OS or library repeatedly calls `stat()` ("has this file changed?") on a timer. Works everywhere, but uses CPU and has latency = poll interval.
+> - **chokidar** — npm package that wraps fs.watch/FSEvents with proper debouncing and cross-platform fixes. Use in production.
+
 ```js
 // Platform differences: fs.watch is unreliable on some systems
 // Use fs.watchFile as fallback or external library (chokidar)
 
 const fs = require("fs");
 
-// fs.watch: Inotify on Linux, FSEvents on macOS (faster)
+// fs.watch: Uses kernel-level notifications (inotify/FSEvents — fast, low CPU)
+// BUT: Can fire 2-5 events per single save (editor writes temp file, renames, deletes)
 fs.watch("file.txt", (eventType, filename) => {
     console.log(`Event: ${eventType} on ${filename}`);
+    // 'change' = file content changed; 'rename' = file was renamed or deleted
 });
 
-// fs.watchFile: Polling (works everywhere, slower)
+// fs.watchFile: Polling approach (calls stat() on a timer — works everywhere, uses more CPU)
 fs.watchFile("file.txt", (curr, prev) => {
     if (curr.mtime !== prev.mtime) {
+        // mtime = modification timestamp
         console.log("File modified");
     }
 });
 
-// Best practice: Use chokidar (cross-platform)
+// Best practice: Use chokidar (cross-platform, de-duplicates events, handles edge cases)
 const chokidar = require("chokidar");
 chokidar.watch("file.txt").on("change", () => console.log("Changed"));
+// chokidar internally debounces rapid events so your handler fires exactly once per save
 ```
 
 ### Concurrent File Writing Strategies
@@ -2889,22 +3560,32 @@ findLargeFiles(".", 1024 * 1024); // Find all files > 1MB
 
 A: **Never in production HTTP servers.** Blocks the entire event loop, freezing all other requests.
 
+> 📖 **What this example demonstrates:** Node.js is single-threaded: one blocking call freezes EVERYONE. `readFileSync` tells the OS to read the file and doesn't return until it's done — during that time, no other code runs. In a server handling 100 concurrent users, all 100 users freeze.
+>
+> 🔑 **Key terms:**
+>
+> - **Blocking** — A function that doesn't return until the OS completes the operation. The JavaScript thread is stuck waiting. All timers, callbacks, and other requests are paused.
+> - **Non-blocking / async** — The operation starts, Node registers a callback, and immediately continues processing other requests. When the OS is done, the callback is queued on the event loop.
+
 ```js
 // ❌ CATASTROPHIC: Blocks all requests
 const express = require("express");
 const app = express();
 
 app.get("/config", (req, res) => {
-    const config = fs.readFileSync("config.json"); // BLOCKS event loop for everyone!
+    const config = fs.readFileSync("config.json"); // BLOCKS event loop — freezes for everyone!
+    // While this reads, ALL other HTTP requests are paused, even unrelated routes
     res.json(JSON.parse(config));
 });
 
 // Effects:
-// - All pending HTTP requests hang
-// - ~100ms block = 100ms lag for all concurrent users
+// - All pending HTTP requests hang while one request reads the file
+// - ~100ms block causes 100ms latency spike for all concurrent users
 
-// ✅ CORRECT: Use promise or callback
+// ✅ CORRECT: Use promise-based async (non-blocking)
 app.get("/config", async (req, res) => {
+    // readFile asks the OS to read, then Node continues processing OTHER requests
+    // When OS is done, this callback resumes — other users were served in the meantime
     const config = await fs.promises.readFile("config.json", "utf8");
     res.json(JSON.parse(config));
 });
@@ -2927,6 +3608,8 @@ A:
 | `createReadStream` | ~64KB (highWaterMark) | Streaming | Large files, pipes |
 | `for await` + stream | ~64KB | Streaming | Modern, readable |
 
+> 📖 **What this example demonstrates:** How to decide which file-read method to use based on file size. The 10MB threshold is a practical rule of thumb — below it, loading the whole file into memory is fine; above it, use streams to avoid RAM exhaustion when multiple requests arrive simultaneously.
+
 ```js
 // Example: 100MB file
 // readFile: Loads 100MB into memory
@@ -2935,17 +3618,17 @@ A:
 const fs = require("fs");
 
 async function loadLargeFile() {
-    // If file < 10MB: readFile is fine
+    // If file < 10MB: readFile is fine (simple, returns full string)
     if (fileSize < 10 * 1024 * 1024) {
-        return await fs.promises.readFile("file.json", "utf8");
+        return await fs.promises.readFile("file.json", "utf8"); // Entire file in RAM (safe at this size)
     }
 
-    // If file > 10MB: Use streams
-    const chunks = [];
+    // If file > 10MB: Use streams (reads one 64KB chunk at a time)
+    const chunks = []; // Collect all chunks
     for await (const chunk of fs.createReadStream("file.json")) {
-        chunks.push(chunk);
+        chunks.push(chunk); // Each chunk is a Buffer (binary data)
     }
-    return Buffer.concat(chunks).toString("utf8");
+    return Buffer.concat(chunks).toString("utf8"); // Join all chunks into one string at the end
 }
 ```
 
@@ -2953,38 +3636,45 @@ async function loadLargeFile() {
 
 A: **Use streams with backpressure:**
 
+> 📖 **What this example demonstrates:** In Express/Node HTTP, `req` (the incoming request body) IS a Readable stream and `res` (the response) IS a Writable stream. So `req.pipe(writeStream)` means: "take bytes from the incoming upload and write them directly to disk". The entire 5GB file flows through just 64KB of RAM at a time — never buffered.
+>
+> 🔑 **Key terms:**
+>
+> - **`req.pipe(writeStream)`** — Connects two streams: bytes arriving from the client flow directly to the file on disk. No intermediate buffering.
+> - **413** — HTTP status code meaning "Payload Too Large". Telling the client: "your upload is bigger than we allow".
+> - **`req.pause()`** — Tells the TCP socket to stop reading data (applies backpressure to the client). Used here to stop receiving data when size limit is hit.
+
 ```js
 const express = require("express");
 const fs = require("fs");
 const app = express();
 
 app.post("/upload", (req, res) => {
-    // req is a Readable stream (body)
-    // res is a Writable stream
-
+    // req is a Readable stream (upload bytes arrive over the network, chunk by chunk)
+    // writeStream is a Writable stream (accepts bytes and writes them to disk)
     const uploadPath = `./uploads/${Date.now()}.mp4`;
-    const writeStream = fs.createWriteStream(uploadPath);
+    const writeStream = fs.createWriteStream(uploadPath); // Opens file on disk
 
-    // Pipe with error handling
+    // pipe() connects them: upload bytes flow to disk without buffering the entire file
     req.pipe(writeStream)
         .on("close", () => {
-            res.json({ success: true, file: uploadPath });
+            res.json({ success: true, file: uploadPath }); // Upload complete
         })
         .on("error", (err) => {
-            fs.unlink(uploadPath, () => {}); // Clean up
+            fs.unlink(uploadPath, () => {}); // Delete partial file on error
             res.status(500).json({ error: err.message });
         });
 
-    // Optional: limit file size
+    // Optional: enforce file size limit (e.g., 5GB max)
     let uploadedSize = 0;
-    const MAX_SIZE = 5 * 1024 * 1024 * 1024; // 5GB
+    const MAX_SIZE = 5 * 1024 * 1024 * 1024; // 5GB in bytes
 
     req.on("data", (chunk) => {
-        uploadedSize += chunk.length;
+        uploadedSize += chunk.length; // Track cumulative bytes received
         if (uploadedSize > MAX_SIZE) {
-            req.pause();
-            writeStream.destroy();
-            res.status(413).json({ error: "File too large" });
+            req.pause(); // Stop reading (backpressure to client)
+            writeStream.destroy(); // Close and delete partial file
+            res.status(413).json({ error: "File too large" }); // 413 = Payload Too Large
         }
     });
 });
@@ -3261,6 +3951,14 @@ Node.js was **designed for building network servers**. The built-in `http` modul
 
 #### Basic Streaming Response
 
+> 📖 **What this example demonstrates:** The core HTTP streaming pattern in Node. `res` (the response object) is a Writable stream. `stream.pipe(res)` connects the file's Readable stream to the response — bytes flow from disk directly to the client's browser without ever being fully in RAM.
+>
+> 🔑 **Key terms:**
+>
+> - **`req.url`** — The path part of the URL (e.g., `/large-file` in `http://localhost:3000/large-file`).
+> - **`stream.pipe(res)`** — Tells Node: "read chunks from the file and write them as HTTP response body". Handles backpressure automatically.
+> - **`stream.on('error')`** — Files can fail to open (not found, permission denied). Without this handler, the error would crash your server.
+
 ```js
 const http = require("http");
 const fs = require("fs");
@@ -3268,10 +3966,12 @@ const fs = require("fs");
 http.createServer((req, res) => {
     if (req.url === "/large-file") {
         // Stream file without loading into memory
+        // createReadStream reads the file in 64KB chunks
         const stream = fs.createReadStream("large.txt");
-        stream.pipe(res);
+        stream.pipe(res); // Pipe file bytes directly to the HTTP response
 
         stream.on("error", (err) => {
+            // Error handling: file not found, permission denied, etc.
             res.writeHead(500);
             res.end("Stream error");
         });
@@ -3284,14 +3984,18 @@ http.createServer((req, res) => {
 
 #### Request Body Streaming (File Upload)
 
+> 📖 **What this example demonstrates:** In a raw Node HTTP server, `req` (the incoming request body) is a Readable stream. `req.pipe(writeStream)` means the upload data flows directly from the client to disk — no body parser, no buffering. This is exactly how frameworks like `multer` work under the hood.
+
 ```js
 const http = require("http");
 const fs = require("fs");
 
 http.createServer((req, res) => {
     if (req.method === "POST" && req.url === "/upload") {
-        const writeStream = fs.createWriteStream("uploaded.dat");
+        const writeStream = fs.createWriteStream("uploaded.dat"); // Open file for writing
 
+        // pipe() streams request body bytes directly to disk
+        // 'close' event fires when all bytes are written and file is closed
         req.pipe(writeStream)
             .on("close", () => {
                 res.writeHead(200);
@@ -3313,35 +4017,51 @@ A:
 
 **Approach 1: Buffer entire file (❌ BAD)**
 
+> 📖 **What this example demonstrates:** `readFileSync` loads the ENTIRE 500MB into a JavaScript Buffer. With 10 concurrent downloads, that's 5GB of RAM. Plus it blocks the event loop while reading — no other requests can be served during the read.
+
 ```js
 // Loads 500MB into memory — will crash on 10 concurrent downloads!
+// Also BLOCKS the event loop during the read (no requests served until it completes)
 http.createServer((req, res) => {
-    const data = fs.readFileSync("large-file.bin");
-    res.end(data);
+    const data = fs.readFileSync("large-file.bin"); // Entire 500MB in RAM as one Buffer
+    res.end(data); // Sends all 500MB at once
 }).listen(3000);
 ```
 
 **Approach 2: Async read (❌ STILL BAD)**
 
+> 📖 **What this example demonstrates:** `readFile` is async so it doesn't block, but it STILL loads the entire file into a single Buffer before calling your callback. With 10 concurrent requests, 10 × 500MB = 5GB of RAM simultaneously.
+
 ```js
-// Slightly better, but still loads entire file
+// Slightly better: non-blocking, but still loads entire file
+// 10 concurrent requests = 10 × 500MB = 5GB peak RAM usage
 fs.readFile("large-file.bin", (err, data) => {
-    res.end(data);
+    res.end(data); // Still buffers the whole 500MB before sending
 });
 ```
 
 **Approach 3: Stream (✅ GOOD)**
 
+> 📖 **What this example demonstrates:** `createReadStream` reads the file in 64KB chunks and pipes them to the response. Regardless of file size (500MB or 500GB), only 64KB is in RAM at any moment. 1000 concurrent downloads still only use 64KB × 1000 = 64MB.
+>
+> 🔑 **Key terms:**
+>
+> - **`Content-Disposition: attachment`** — HTTP header that tells the browser to download the file rather than display it.
+> - **`application/octet-stream`** — Generic binary content-type. Browser won't try to render it.
+> - **`pipe(res)`** — Automatically manages backpressure: reads the next chunk only when the HTTP response (the client) can accept more data.
+
 ```js
 // Uses ~64KB memory regardless of file size
+// 1000 concurrent downloads = 64KB × 1000 = 64MB total (vs 500GB with readFile!)
 http.createServer((req, res) => {
-    res.setHeader("Content-Type", "application/octet-stream");
+    res.setHeader("Content-Type", "application/octet-stream"); // Tell browser: download this
     res.setHeader(
         "Content-Disposition",
-        'attachment; filename="large-file.bin"',
+        'attachment; filename="large-file.bin"', // Suggest a filename for the download dialog
     );
 
-    fs.createReadStream("large-file.bin").pipe(res);
+    fs.createReadStream("large-file.bin").pipe(res); // Pipe chunks directly to client
+    // pipe() handles backpressure: waits for slow clients instead of buffering
 }).listen(3000);
 ```
 
@@ -3354,38 +4074,48 @@ http.createServer((req, res) => {
 
 A: Range requests allow clients to resume downloads and seek in videos:
 
+> 📖 **What this example demonstrates:** Video players need to "seek" to any position in a file. They do this by sending an HTTP `Range` header like `bytes=500000-999999` ("give me bytes 500K to 1M"). Your server responds with HTTP 206 (Partial Content) and streams only those bytes. Without range support, video seeking downloads from the beginning every time.
+>
+> 🔑 **Key terms:**
+>
+> - **HTTP 206 Partial Content** — Status code meaning "here's part of the file you requested". Enables video seeking and download resumption.
+> - **`Range: bytes=0-1023`** — HTTP request header asking for the first 1024 bytes.
+> - **`Content-Range`** — Response header telling the client which bytes are included and the total file size.
+> - **`createReadStream({ start, end })`** — fs feature that reads ONLY a slice of a file, not the whole thing.
+
 ```js
 const http = require("http");
 const fs = require("fs");
 
 http.createServer((req, res) => {
     if (req.url === "/video.mp4") {
-        const stat = fs.statSync("video.mp4");
-        const fileSize = stat.size;
-        const range = req.headers.range;
+        const stat = fs.statSync("video.mp4"); // Get file metadata (size, etc.)
+        const fileSize = stat.size; // Total file size in bytes
+        const range = req.headers.range; // e.g. "bytes=0-1023" from the video player
 
         if (range) {
-            // Parse Range header: "bytes=0-1023"
+            // Parse Range header: "bytes=0-1023" → start=0, end=1023
             const parts = range.replace(/bytes=/, "").split("-");
-            const start = parseInt(parts[0], 10);
-            const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+            const start = parseInt(parts[0], 10); // Start byte (inclusive)
+            const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1; // End byte (inclusive)
 
             if (start >= fileSize || end >= fileSize) {
-                res.writeHead(416);
+                res.writeHead(416); // 416 = Range Not Satisfiable (requested bytes don't exist)
                 res.end("Requested range out of bounds");
                 return;
             }
 
-            // Send 206 Partial Content
+            // Send 206 Partial Content (not 200 OK — sending just a slice)
             res.writeHead(206, {
-                "Content-Range": `bytes ${start}-${end}/${fileSize}`,
-                "Content-Length": end - start + 1,
+                "Content-Range": `bytes ${start}-${end}/${fileSize}`, // Which bytes + total size
+                "Content-Length": end - start + 1, // How many bytes in this response
                 "Content-Type": "video/mp4",
             });
 
+            // Read ONLY the requested byte range from disk (very efficient!)
             fs.createReadStream("video.mp4", { start, end }).pipe(res);
         } else {
-            // Send full file
+            // No range header: send full file (first play or non-seekable player)
             res.writeHead(200, {
                 "Content-Length": fileSize,
                 "Content-Type": "video/mp4",
@@ -3549,66 +4279,86 @@ Node.js runs your code on a single thread, which is great for I/O but terrible f
 
 ### exec vs spawn Examples
 
+> 📖 **What this example demonstrates:** The fundamental difference between `exec` and `spawn`. `exec` is convenient for short commands but buffers ALL output in RAM first. `spawn` streams output, so it works safely even if the output is hundreds of MB. It also shows how to add a safety limit on output size.
+>
+> 🔑 **Key terms:**
+>
+> - **`exec`** — Runs a command through the shell (`/bin/sh -c "ls"`). Returns stdout and stderr as strings AFTER the command finishes. Max buffer ~1MB by default.
+> - **`spawn`** — Runs a command directly (no shell). stdout/stderr are streams you can listen to as chunks arrive.
+> - **`ls.kill()`** — Sends SIGTERM to the child process, terminating it. Used here as a safety valve if output exceeds 100MB.
+
 ```js
 const { exec, spawn } = require("child_process");
 
-// ❌ exec: Buffers entire output (bad for large outputs)
+// ❌ exec: Buffers entire output in RAM (bad for large outputs)
+// Default max buffer is 200KB; exceeding it throws an error
 exec("ls -la /large-directory", (err, stdout, stderr) => {
-    // Entire output in memory!
+    // stdout and stderr are full strings — entire output is in RAM
     console.log(stdout);
 });
 
-// ✅ spawn: Streams output (good for large outputs)
-const ls = spawn("ls", ["-la", "/large-directory"]);
+// ✅ spawn: Streams output (good for large outputs or long-running commands)
+const ls = spawn("ls", ["-la", "/large-directory"]); // Args as array (safer than string)
 ls.stdout.on("data", (chunk) => {
-    console.log("Output chunk:", chunk.toString());
+    console.log("Output chunk:", chunk.toString()); // Each chunk arrives as it's produced
 });
 ls.stderr.on("data", (chunk) => {
-    console.error("Error chunk:", chunk.toString());
+    console.error("Error chunk:", chunk.toString()); // stderr is a separate stream
 });
 ls.on("close", (code) => {
-    console.log("Exited with code", code);
+    console.log("Exited with code", code); // 0 = success, non-zero = error
 });
 
-// Handle output limits
+// Safety: Stop a runaway process if output exceeds a limit
 let outputSize = 0;
 ls.stdout.on("data", (chunk) => {
     outputSize += chunk.length;
     if (outputSize > 100 * 1024 * 1024) {
         // 100MB limit
-        ls.kill(); // Terminate if too much output
+        ls.kill(); // Send SIGTERM — tells the process to stop gracefully
     }
 });
 ```
 
 ### IPC Patterns (fork)
 
+> 📖 **What this example demonstrates:** `fork` creates a NEW Node.js process (a full separate copy of Node) and sets up an IPC (Inter-Process Communication) channel between parent and child. The parent sends a task message, the child does the CPU-heavy work in its own thread, then replies. Your main server is never blocked.
+>
+> 🔑 **Key terms:**
+>
+> - **IPC (Inter-Process Communication)** — A mechanism for two separate OS processes to exchange messages. Node's `fork` automatically creates a pipe-based IPC channel.
+> - **`worker.send(msg)`** — Parent sends a JavaScript object to the child process (serialized as JSON through the pipe).
+> - **`process.on('message')`** — Inside the child: listen for messages from the parent.
+> - **`process.send(msg)`** — Inside the child: send a reply back to the parent.
+> - **Fork overhead** — Each `fork` starts a NEW Node.js process with its own V8 engine, ~100-200MB of RAM. Don't fork hundreds of processes; use a pool.
+
 ```js
 // parent.js
 const { fork } = require("child_process");
-const worker = fork("worker.js");
+const worker = fork("worker.js"); // Start a new Node.js process (uses ~100-200MB RAM)
 
-// Send message to child
-worker.send({ type: "compute", n: 1e8 });
+// Send a task to the child via IPC channel (serialized as JSON)
+worker.send({ type: "compute", n: 1e8 }); // 1e8 = 100,000,000
 
-// Receive message from child
+// Receive the result when child calls process.send()
 worker.on("message", (result) => {
-    console.log("Result from worker:", result);
+    console.log("Result from worker:", result); // { result: 4999999950000000 }
 });
 
-// Handle worker exit
+// Clean up when the child process terminates
 worker.on("close", (code) => {
-    console.log("Worker exited with code", code);
+    console.log("Worker exited with code", code); // 0 = normal exit
 });
 
 // -----
 
-// worker.js
+// worker.js (runs in its own separate Node.js process)
 process.on("message", (msg) => {
     if (msg.type === "compute") {
+        // This CPU-heavy loop runs in the child process — parent's event loop is NOT blocked!
         let sum = 0;
         for (let i = 0; i < msg.n; i++) sum += i;
-        process.send({ result: sum });
+        process.send({ result: sum }); // Send result back to parent
     }
 });
 ```
@@ -3662,29 +4412,38 @@ worker.on("message", (processed) => {
 
 A: **Shell injection.** User input in `exec` command can execute arbitrary code:
 
+> 📖 **What this example demonstrates:** `exec` passes the command to the shell (`/bin/sh`), which interprets special characters like `;`, `&&`, `|`, `$(...)`. If user input contains these characters, the shell executes attacker-controlled commands. This is the Node.js equivalent of SQL injection, but for the OS.
+>
+> 🔑 **Key terms:**
+>
+> - **Shell injection** — Attacker inserts shell metacharacters (`;`, `&&`, `|`) into user input. The shell interprets them and runs extra commands.
+> - **`execFile`** — Does NOT use a shell. Arguments are passed as an array directly to the OS. No shell metacharacters are interpreted. Always prefer over `exec` when arguments include user input.
+> - **`spawn` with array args** — Same as execFile — args are OS-level, not shell-interpreted.
+
 ```js
-// ❌ VULNERABLE: User input in command
+// ❌ VULNERABLE: User input in shell command
 const { exec } = require("child_process");
-const userId = req.query.id; // User-controlled
+const userId = req.query.id; // User-controlled input from URL
 
 exec(`cat /tmp/user_${userId}.txt`, (err, stdout) => {
     console.log(stdout);
 });
 
-// Attack: Malicious input
-// /tmp/user_; rm -rf / .txt
-// Full command: cat /tmp/user_; rm -rf / .txt (DISASTER!)
+// Attack: malicious input sets userId to:  ; rm -rf /
+// Resulting full command:  cat /tmp/user_; rm -rf / .txt
+// Shell sees: (1) cat /tmp/user_  (2) rm -rf /  <-- DELETES EVERYTHING!
 
-// ✅ SAFE: Use execFile (no shell)
+// ✅ SAFE: Use execFile (no shell — semicolons & special chars are literal)
 const { execFile } = require("child_process");
 execFile("cat", [`/tmp/user_${userId}.txt`], (err, stdout) => {
-    // Arguments passed as array, no shell interpretation
+    // Arguments passed as array directly to OS — shell is never involved
+    // userId could be "; rm -rf /" and it would just fail to find the file
     console.log(stdout);
 });
 
-// ✅ ALSO SAFE: Input validation + escaping
+// ✅ ALSO SAFE: Input validation + escaping (if you must use exec)
 const shell = require("shellwords");
-const escaped = shell.escape(userId);
+const escaped = shell.escape(userId); // Escapes all shell metacharacters
 exec(`cat /tmp/user_${escaped}.txt`, ...);
 ```
 
@@ -3734,6 +4493,14 @@ class ChildProcessManager {
 
 A:
 
+> 📖 **What this example demonstrates:** Wrapping a child process in a Promise with a built-in timeout. Without a timeout, a hung process consumes a slot forever. The pattern collects stdout/stderr as Buffers, then resolves/rejects when the process exits or when the timer fires.
+>
+> 🔑 **Key terms:**
+>
+> - **`child.kill('SIGTERM')`** — Sends a termination signal to the child process. SIGTERM is polite ("please shut down"); the child can handle it. SIGKILL is forceful ("die now").
+> - **`child.on('close', code)`** — Fires when the process AND its stdio streams have closed. `code` is the exit code (0 = success, non-zero = error).
+> - **`child.on('error')`** — Fires if the process could NOT be started at all (e.g., command not found).
+
 ```js
 const { spawn } = require("child_process");
 
@@ -3741,9 +4508,10 @@ function spawnWithTimeout(cmd, args, timeoutMs = 30000) {
     const child = spawn(cmd, args);
     let timedOut = false;
 
+    // Set a timer: if process doesn't finish in time, kill it
     const timeout = setTimeout(() => {
-        timedOut = true;
-        child.kill("SIGTERM");
+        timedOut = true; // Remember it was a timeout (not a natural exit)
+        child.kill("SIGTERM"); // Ask process to shut down (graceful)
     }, timeoutMs);
 
     return new Promise((resolve, reject) => {
@@ -3752,29 +4520,28 @@ function spawnWithTimeout(cmd, args, timeoutMs = 30000) {
 
         child.stdout.on("data", (chunk) => {
             stdout += chunk;
-        });
-
+        }); // Collect all output
         child.stderr.on("data", (chunk) => {
             stderr += chunk;
-        });
+        }); // Collect error output
 
         child.on("close", (code) => {
-            clearTimeout(timeout);
+            clearTimeout(timeout); // Cancel timer (process exited naturally)
 
             if (timedOut) {
                 reject(new Error(`Process timed out after ${timeoutMs}ms`));
             } else if (code !== 0) {
                 reject(
                     new Error(`Process exited with code ${code}: ${stderr}`),
-                );
+                ); // Non-zero = failure
             } else {
-                resolve(stdout);
+                resolve(stdout); // Success: return collected output
             }
         });
 
         child.on("error", (err) => {
             clearTimeout(timeout);
-            reject(new Error(`Failed to spawn process: ${err.message}`));
+            reject(new Error(`Failed to spawn process: ${err.message}`)); // e.g., command not found
         });
     });
 }
@@ -3938,70 +4705,92 @@ graph TB
 
 ### Worker Basics
 
+> 📖 **What this example demonstrates:** The simplest Worker Thread pattern. The main file creates a worker (a separate thread with its own V8 engine), passes initial data via `workerData`, and receives the result via `postMessage`. The heavy computation loop runs in the worker thread — the main thread's event loop keeps responding to HTTP requests while the worker is busy.
+>
+> 🔑 **Key terms:**
+>
+> - **`workerData`** — A plain JavaScript object you can pass to the worker when creating it. It's cloned (deep-copied) — changes in the worker don't affect the original.
+> - **`parentPort`** — The communication channel between worker and parent. Think of it as a pipe: `.postMessage()` sends, `.on('message')` receives.
+> - **`worker.on('exit', code)`** — The thread finished. Code 0 = success; non-zero = the thread threw an uncaught error.
+> - **V8 isolate** — Each worker gets its own JavaScript engine instance. Variables don't leak between threads; they're completely isolated.
+
 ```js
 // main.js
 const { Worker } = require("worker_threads");
 
 const worker = new Worker("./worker.js", {
-    workerData: { n: 1e8 }, // Pass initial data
+    workerData: { n: 1e8 }, // Initial data passed to worker (deep-cloned, not shared)
 });
 
 worker.on("message", (result) => {
-    console.log("Worker result:", result);
+    console.log("Worker result:", result); // Receives { sum: 4999999950000000 }
 });
 
 worker.on("error", (err) => {
-    console.error("Worker error:", err);
+    console.error("Worker error:", err); // Worker threw an uncaught exception
 });
 
 worker.on("exit", (code) => {
-    console.log("Worker exited with code", code);
+    console.log("Worker exited with code", code); // 0 = normal, 1 = uncaught error
 });
 
 // -----
 
-// worker.js
+// worker.js (this file runs in its own thread)
 const { parentPort, workerData } = require("worker_threads");
 
+// This loop runs in a SEPARATE thread — the main thread is NOT blocked!
 let sum = 0;
 for (let i = 0; i < workerData.n; i++) {
-    sum += i;
+    sum += i; // 100 million iterations — takes ~1-2 seconds
 }
 
-parentPort.postMessage({ sum });
+parentPort.postMessage({ sum }); // Send result back to main thread
+// Worker thread terminates after this (no more code to run)
 ```
 
 ### Shared Memory & Atomics
+
+> 📖 **What this example demonstrates:** `SharedArrayBuffer` lets two threads read/write the SAME block of memory without copying. The parent uses `Atomics.wait()` to block and sleep until the worker puts a value in the buffer and calls `Atomics.notify()`. This is faster than message passing for tight loops because there's no serialization overhead.
+>
+> 🔑 **Key terms:**
+>
+> - **`SharedArrayBuffer`** — A raw block of binary memory shared between threads. Unlike `workerData`, no copying happens — both threads literally see the same bytes.
+> - **`Int32Array(sharedBuffer)`** — A typed view over the shared buffer. Treats each 4 bytes as a signed 32-bit integer.
+> - **`Atomics.wait(array, index, expected)`** — Blocks the current thread until `array[index] !== expected`. Like a "wait until the value changes".
+> - **`Atomics.notify(array, index)`** — Wakes up any thread waiting on `array[index]`.
+> - **Caution:** `Atomics.wait` BLOCKS the thread. Never call it on the main thread — it would freeze your server.
 
 ```js
 // main.js: Shared buffer communication
 const { Worker } = require("worker_threads");
 
-const sharedBuffer = new SharedArrayBuffer(4); // 4 bytes
-const sharedArray = new Int32Array(sharedBuffer);
-sharedArray[0] = 0; // Initial value
+const sharedBuffer = new SharedArrayBuffer(4); // 4 bytes of shared memory (holds one Int32)
+const sharedArray = new Int32Array(sharedBuffer); // Typed view: treats those 4 bytes as an integer
+sharedArray[0] = 0; // Initial value = 0 ("not ready yet")
 
 const worker = new Worker("./worker.js", {
-    workerData: { sharedBuffer },
+    workerData: { sharedBuffer }, // Pass the SAME buffer to worker (zero-copy shared memory)
 });
 
-// Wait for worker to signal (blocking)
+// Block this thread until sharedArray[0] changes from 0
+// This is like saying: "sleep until the worker puts a result in slot 0"
 console.log("Waiting for worker...");
-Atomics.wait(sharedArray, 0, 0); // Block until value changes from 0
-console.log("Worker signaled! Value:", sharedArray[0]);
+Atomics.wait(sharedArray, 0, 0); // (array, index, current value to wait on)
+console.log("Worker signaled! Value:", sharedArray[0]); // Reads the result (42)
 
 // -----
 
-// worker.js: Modify shared buffer and signal
+// worker.js: Modify shared buffer and signal parent
 const { workerData } = require("worker_threads");
-const sharedArray = new Int32Array(workerData.sharedBuffer);
+const sharedArray = new Int32Array(workerData.sharedBuffer); // Same memory as parent!
 
 // Do computation
 const result = 42;
 
-// Store result and signal parent
-sharedArray[0] = result;
-Atomics.notify(sharedArray, 0); // Wake parent thread
+// Store result directly into shared memory (NO message passing, NO serialization)
+sharedArray[0] = result; // Write result to shared slot 0
+Atomics.notify(sharedArray, 0); // Wake parent — it was sleeping in Atomics.wait()
 ```
 
 ### Senior-Level Q&A
@@ -4059,6 +4848,14 @@ if (cluster.isMaster) {
 
 A: **Race condition:** Multiple threads modify shared state simultaneously, causing data corruption.
 
+> 📖 **What this example demonstrates:** The classic "lost update" race condition. `sharedInt[0]++` looks like ONE operation but is actually THREE steps: (1) Read value from memory, (2) Increment in CPU register, (3) Write back to memory. If two threads both read the same value (say, 5) before either writes back, both write 6 — and you lose one increment. With 10M increments across 10 threads, you expect 10M but get ~5M.
+>
+> 🔑 **Key terms:**
+>
+> - **Race condition** — A bug that only manifests when two operations overlap in time. Hard to reproduce, depends on CPU scheduling.
+> - **Read-modify-write** — Three-step operation (read → compute → write). Not atomic — another thread can sneak in between steps.
+> - **`Atomics.add()`** — Performs read-modify-write as a SINGLE uninterruptible hardware instruction. No other thread can interleave.
+
 ```js
 // ❌ RACE CONDITION: Many threads increment shared counter
 // Expected: 10,000,000 (10 threads × 1,000,000 each)
@@ -4081,7 +4878,7 @@ for (let i = 0; i < 10; i++) {
 Promise.all(workers.map((w) => new Promise((r) => w.on("exit", r)))).then(
     () => {
         console.log("Final count:", sharedInt[0]);
-        console.log("Expected: 10,000,000");
+        console.log("Expected: 10,000,000"); // Will see ~5M due to race condition
     },
 );
 
@@ -4092,7 +4889,9 @@ const { workerData } = require("worker_threads");
 const sharedInt = new Int32Array(workerData.shared);
 
 for (let i = 0; i < 1000000; i++) {
-    sharedInt[0]++; // RACE CONDITION: Read-modify-write is not atomic!
+    sharedInt[0]++; // RACE CONDITION: Thread A reads 5, Thread B reads 5, both write 6 — lost one!
+    // sharedInt[0]++ expands to: temp = sharedInt[0]; temp++; sharedInt[0] = temp;
+    // Another thread can interrupt between any of those three steps!
 }
 ```
 
@@ -4104,7 +4903,8 @@ const { workerData } = require("worker_threads");
 const sharedInt = new Int32Array(workerData.shared);
 
 for (let i = 0; i < 1000000; i++) {
-    Atomics.add(sharedInt, 0, 1); // Atomic increment
+    Atomics.add(sharedInt, 0, 1); // Read + increment + write as ONE indivisible hardware instruction
+    // No thread can interrupt this — CPU guarantees atomicity
 }
 ```
 
@@ -4296,29 +5096,42 @@ The cluster module lets you run **multiple copies of your Node.js server** on th
 
 ### Basic Cluster Example
 
+> 📖 **What this example demonstrates:** The complete cluster pattern. The master checks `cluster.isMaster` and forks N workers (one per CPU core). Each worker runs the same file but takes the `else` branch and starts an HTTP server. The OS shares the same port across all workers — each incoming connection goes to one worker via round-robin.
+>
+> 🔑 **Key terms:**
+>
+> - **`cluster.isMaster`** — True in the original process (the one you ran with `node`). False in forked copies.
+> - **`cluster.fork()`** — Spawns a new copy of the current script as a child process. It's a full OS process with ~100-200MB RAM.
+> - **`cluster.on('exit', ...)`** — Fires when a worker crashes. Calling `cluster.fork()` here auto-restarts crashed workers.
+> - **Round-robin** — Incoming connections are assigned to workers in rotation: worker 1, worker 2, ... worker N, worker 1, ... Each gets roughly equal load.
+
 ```js
 const cluster = require("cluster");
 const http = require("http");
 const os = require("os");
 
 if (cluster.isMaster) {
-    // Master process
-    const numWorkers = os.cpus().length;
+    // This branch runs in the MASTER process (the one you launched)
+    const numWorkers = os.cpus().length; // e.g., 8 on an 8-core machine
 
+    // Fork one worker per CPU core (each is a full Node.js process)
     for (let i = 0; i < numWorkers; i++) {
-        cluster.fork();
+        cluster.fork(); // Spawns the same script but it takes the else branch below
     }
 
+    // Auto-restart workers if they crash
     cluster.on("exit", (worker, code, signal) => {
         console.log(`Worker ${worker.process.pid} died`);
-        cluster.fork(); // Restart on crash
+        cluster.fork(); // Replace the dead worker immediately
     });
 } else {
-    // Worker process
+    // This branch runs in each WORKER process
+    // All workers listen on the same port 3000 (OS shares the socket)
     http.createServer((req, res) => {
         res.writeHead(200);
-        res.end(`Hello from worker ${process.pid}`);
+        res.end(`Hello from worker ${process.pid}`); // Shows which worker handled the request
     }).listen(3000);
+    // The OS distributes incoming connections across all workers (round-robin)
 }
 ```
 
@@ -4595,15 +5408,26 @@ IPC (Inter-Process Communication) is how separate processes or threads talk to e
 
 ### Message Passing Patterns
 
+> 📖 **What these examples demonstrate:** Two IPC communication patterns: Request-Reply (parent asks, worker answers — like a function call across processes) and Publish-Subscribe (parent broadcasts to all workers, workers report back independently). These are the building blocks for all multi-process Node.js communication.
+>
+> 🔑 **Key terms:**
+>
+> - **IPC (Inter-Process Communication)** — Communication between separate OS processes. Node implements this with Unix domain sockets or Windows named pipes — essentially a fast local pipe.
+> - **`process.send(msg)`** — Serializes a JavaScript object to JSON and sends it through the IPC pipe to the parent.
+> - **`worker.on('message', cb)`** — Parent listens for messages from a specific worker.
+> - **Broadcast** — Send the same message to ALL workers at once (e.g., config update, cache flush).
+
 ```js
 // Pattern 1: Request-Reply (simple RPC)
 // parent.js
 const { fork } = require("child_process");
 const worker = fork("worker.js");
 
+// Send a task (serialized to JSON, sent through IPC pipe)
 worker.send({ method: "compute", args: [10, 20] });
+// Receive the reply when worker calls process.send()
 worker.on("message", (result) => {
-    console.log("Result:", result);
+    console.log("Result:", result); // { result: 30 }
 });
 
 // -----
@@ -4612,7 +5436,7 @@ worker.on("message", (result) => {
 process.on("message", (msg) => {
     if (msg.method === "compute") {
         const [a, b] = msg.args;
-        process.send({ result: a + b });
+        process.send({ result: a + b }); // Send reply back through IPC pipe
     }
 });
 
@@ -4620,14 +5444,14 @@ process.on("message", (msg) => {
 // parent.js
 const workers = [fork("worker.js"), fork("worker.js")];
 
-// Broadcast message to all workers
+// Broadcast message to ALL workers at once (e.g., config has changed)
 workers.forEach(w => w.send({ type: "config-update", data: {...} }));
 
-// Receive updates from any worker
+// Receive updates from ANY worker (each worker can independently report status)
 workers.forEach(w => {
     w.on("message", (msg) => {
         if (msg.type === "status-update") {
-            console.log("Worker status:", msg.data);
+            console.log("Worker status:", msg.data); // { cpu: 25, mem: 512 }
         }
     });
 });
@@ -4637,10 +5461,10 @@ workers.forEach(w => {
 // worker.js
 process.on("message", (msg) => {
     if (msg.type === "config-update") {
-        // Update local config
+        // Update local config in this worker process
     }
 
-    // Notify parent asynchronously
+    // Periodically report status to parent (unsolicited push)
     setInterval(() => {
         process.send({ type: "status-update", data: { cpu: 25, mem: 512 } });
     }, 5000);
@@ -5428,14 +6252,24 @@ graph TB
     style DB fill:#66bb6a,color:#fff
 ```
 
+> 📖 **What this example demonstrates:** Setting up a PostgreSQL connection pool. `max: 20` means the app keeps 20 persistent connections to the database. Instead of opening a new connection per request (which takes 50-100ms), requests borrow an existing connection (takes ~0ms) and return it when done.
+>
+> 🔑 **Key terms:**
+>
+> - **`pg.Pool`** — PostgreSQL connection pool from the `pg` (node-postgres) package. Manages a set of reusable DB connections.
+> - **`max`** — Maximum connections in the pool. If all 20 are busy, the 21st request waits up to `connectionTimeoutMillis` ms.
+> - **`idleTimeoutMillis`** — If a connection sits unused for 30 seconds, close it (saves DB resources).
+> - **`connectionTimeoutMillis`** — How long a request waits for a free connection before throwing an error. Prevents infinite queuing.
+> - **Parameterized query (`$1`)** — The `$1` placeholder is replaced by the actual value AFTER the query is sent to the DB. The DB never sees user data as SQL — prevents SQL injection.
+
 ```js
 const pg = require("pg");
 
-// Create pool
+// Create pool: 20 persistent connections to PostgreSQL
 const pool = new pg.Pool({
-    max: 20, // Max connections
-    idleTimeoutMillis: 30000, // Close idle after 30s
-    connectionTimeoutMillis: 2000, // Timeout waiting for connection
+    max: 20, // Max simultaneous connections (size your pool to your DB's limit / number of servers)
+    idleTimeoutMillis: 30000, // Close idle connections after 30 seconds (free DB resources)
+    connectionTimeoutMillis: 2000, // If no connection available in 2s, throw an error
     host: "localhost",
     port: 5432,
     database: "myapp",
@@ -5443,20 +6277,21 @@ const pool = new pg.Pool({
     password: "password",
 });
 
-// Use connection from pool
-pool.query("SELECT * FROM users WHERE id = $1", [userId])
+// Use connection from pool (borrowed automatically, returned when done)
+pool.query("SELECT * FROM users WHERE id = $1", [userId]) // $1 = parameterized (prevents SQL injection)
     .then((result) => console.log(result))
     .catch((err) => console.error(err));
+// Pool automatically returns the connection after the query completes
 
-// Handle pool errors
+// Handle pool errors (e.g., DB server went down)
 pool.on("error", (err) => {
     console.error("Unexpected error on idle client", err);
     // Alert monitoring
 });
 
-// Graceful shutdown
+// Graceful shutdown: close all connections cleanly
 server.on("close", async () => {
-    await pool.end();
+    await pool.end(); // Wait for active queries then close all connections
 });
 ```
 
@@ -5545,45 +6380,55 @@ flowchart TD
     style Stale fill:#ffee58,color:#000
 ```
 
+> 📖 **What this example demonstrates:** Four key Redis caching patterns. Cache-aside (lazy loading) is the most common — check cache first, then DB. Write-through keeps cache consistent. Explicit deletion ensures no stale data on delete. Pub/sub enables cross-server event broadcasting.
+>
+> 🔑 **Key terms:**
+>
+> - **`setEx`** — SET with EXpiry. Stores value for N seconds then automatically deletes it. Prevents the cache growing forever.
+> - **TTL (Time To Live)** — 3600 = 1 hour. After 1 hour, the key is automatically deleted from Redis; the next request will re-fetch from DB.
+> - **Cache miss** — Key not found in Redis (either never cached, or TTL expired). Forces a DB query.
+> - **Pub/Sub** — Publish/Subscribe. One server publishes a message to a channel, ALL servers subscribed to that channel receive it. Enables real-time cross-server notifications.
+
 ```js
 const redis = require("redis");
 const client = redis.createClient();
 
 // Pattern 1: Cache-Aside (Lazy Loading)
+// Check cache first. If missing, load from DB and cache for next time.
 async function getUserWithCache(id) {
-    const cached = await client.get(`user:${id}`);
-    if (cached) return JSON.parse(cached);
+    const cached = await client.get(`user:${id}`); // Try cache first (~1ms)
+    if (cached) return JSON.parse(cached); // Cache HIT: return immediately
 
-    const user = await db.getUserById(id);
-    await client.setEx(`user:${id}`, 3600, JSON.stringify(user)); // 1 hour TTL
+    const user = await db.getUserById(id); // Cache MISS: query DB (~50ms)
+    await client.setEx(`user:${id}`, 3600, JSON.stringify(user)); // Cache for 1 hour
     return user;
 }
 
-// Pattern 2: Write-Through (Update DB, then cache)
+// Pattern 2: Write-Through (Update DB, then IMMEDIATELY update cache)
 async function updateUser(id, data) {
-    await db.updateUser(id, data);
-    await client.setEx(`user:${id}`, 3600, JSON.stringify(data));
+    await db.updateUser(id, data); // Write to DB first
+    await client.setEx(`user:${id}`, 3600, JSON.stringify(data)); // Then update cache
+    // Next read will get fresh data from cache, not stale old version
 }
 
-// Pattern 3: Cache Invalidation
+// Pattern 3: Cache Invalidation (Delete on write to force cache refresh)
 async function deleteUser(id) {
     await db.deleteUser(id);
-    await client.del(`user:${id}`); // Explicit invalidation
+    await client.del(`user:${id}`); // Remove from cache immediately
+    // Next GET will be a cache miss and correctly get 'not found' from DB
 }
 
 // Pattern 4: Publish-Subscribe (Cross-server messaging)
+// Server A publishes a notification → ALL servers (including Server B, C, D) receive it
 app.post("/notify", (req, res) => {
     client.publish(
         "notifications",
-        JSON.stringify({
-            userId: req.body.userId,
-            message: req.body.message,
-        }),
+        JSON.stringify({ userId: req.body.userId, message: req.body.message }),
     );
     res.json({ sent: true });
 });
 
-client.subscribe("notifications");
+client.subscribe("notifications"); // Listen for messages on this channel
 client.on("message", (channel, message) => {
     const { userId, message: msg } = JSON.parse(message);
     // Notify user via WebSocket, email, etc.
@@ -5833,15 +6678,27 @@ sequenceDiagram
 
 **Detect leaks: Watch heap size over time**
 
+> 📖 **What this example demonstrates:** `v8.getHeapStatistics()` returns JavaScript heap memory stats. By logging heap usage every 10 seconds, you can spot a memory leak: if `heapUsed` grows monotonically (never drops after GC), you have a leak.
+>
+> 🔑 **Key terms:**
+>
+> - **V8 heap** — The memory region where JavaScript objects live. V8's garbage collector automatically frees unreachable objects.
+> - **`total_heap_size`** — Total bytes currently allocated for the heap (including free space).
+> - **`heap_size_limit`** — Maximum the heap can grow before V8 throws `JavaScript heap out of memory`. Default ~1.5GB (64-bit). Override with `--max-old-space-size=4096`.
+> - **Leak indicator** — If `heapUsed` grows every 10 seconds and never decreases, something is holding references that prevent garbage collection.
+
 ```js
 const v8 = require("v8");
 
+// Log heap every 10 seconds — watch for monotonic growth
 setInterval(() => {
     const heapStats = v8.getHeapStatistics();
     console.log({
         heapUsed: Math.round(heapStats.total_heap_size / 1024 / 1024) + "MB",
         heapLimit: Math.round(heapStats.heap_size_limit / 1024 / 1024) + "MB",
     });
+    // Healthy: heapUsed fluctuates (GC reclaims memory regularly)
+    // Leak: heapUsed grows 1-2MB every interval and never comes down
 }, 10000);
 
 // If heapUsed grows unbounded → leak!
@@ -5849,34 +6706,42 @@ setInterval(() => {
 
 **Common memory leaks:**
 
+> 📖 **What this example demonstrates:** The two most common Node.js memory leaks. Leak 1: repeatedly adding event listeners without removing them (each listener holds a closure reference). Leak 2: storing data in global variables or unbounded Maps without eviction. Both are fixed by either removing old references or using an LRU cache (which has a maximum size).
+>
+> 🔑 **Key terms:**
+>
+> - **LRU cache (Least Recently Used)** — A cache with a maximum size. When full, it evicts the item that was used least recently. `lru-cache` is a popular npm package.
+> - **`emitter.removeListener(event, fn)`** — Removes a specific listener. Without this, each added listener is held in memory permanently.
+> - **Closure reference** — A listener function closes over variables in its scope. If the listener isn't removed, those variables can't be garbage collected.
+
 ```js
 // ❌ Leak 1: Forgotten listener
 setInterval(() => {
     const listener = () => {
         /* ... */
     };
-    emitter.on("data", listener); // Never removed!
+    emitter.on("data", listener); // Added every 100ms, NEVER removed — heap grows fast!
 }, 100);
 
-// Fix: Store and remove
+// ✅ Fix: Store reference and remove the old one before adding a new one
 let listener;
 setInterval(() => {
-    if (listener) emitter.removeListener("data", listener);
+    if (listener) emitter.removeListener("data", listener); // Remove old listener first
     listener = () => {
         /* ... */
-    };
+    }; // Create new (replaces old)
     emitter.on("data", listener);
 }, 100);
 
 // ❌ Leak 2: Global variable growth
 global.cache = {}; // Unbounded growth
 app.get("/api/data", (req, res) => {
-    global.cache[req.query.key] = heavyData(); // Keep growing
+    global.cache[req.query.key] = heavyData(); // Keeps growing — never evicted!
 });
 
-// Fix: Use LRU cache with size limit
+// ✅ Fix: Use LRU cache with size limit (evicts oldest when full)
 const LRU = require("lru-cache");
-const cache = new LRU({ max: 1000 });
+const cache = new LRU({ max: 1000 }); // Maximum 1000 entries, then evict least recently used
 ```
 
 ### Profiling CPU Bottlenecks
@@ -6056,45 +6921,59 @@ stateDiagram-v2
     ForceKill --> [*]: process.exit(1)
 ```
 
+> 📖 **What this example demonstrates:** A complete graceful shutdown implementation. When the OS sends `SIGTERM` (e.g., `pm2 restart` or Kubernetes pod termination), the server:
+>
+> 1. Sets a flag to reject new requests with 503
+> 2. Calls `server.close()` to stop accepting new connections
+> 3. Waits for all in-flight requests to complete
+> 4. Falls back to force-kill after 30 seconds
+>
+> 🔑 **Key terms:**
+>
+> - **SIGTERM** — "Signal: Terminate" — sent by OS to request graceful shutdown. The process can handle it and clean up. Different from SIGKILL ("die immediately, no cleanup").
+> - **`server.close(cb)`** — Stops accepting NEW connections immediately. Existing connections remain open until they finish. Calls `cb` when the last connection closes.
+> - **503 Service Unavailable** — HTTP status meaning "this server is temporarily down". The load balancer will route future requests to other healthy servers.
+
 ```js
 const http = require("http");
 
 let isShuttingDown = false;
-const activeConnections = new Set();
+const activeConnections = new Set(); // Track all active socket connections
 
 const server = http.createServer(async (req, res) => {
     if (isShuttingDown) {
+        // Reject new requests gracefully (load balancer will route elsewhere)
         res.writeHead(503);
         res.end("Server shutting down");
         return;
     }
 
-    activeConnections.add(req.socket);
+    activeConnections.add(req.socket); // Track this connection
 
     try {
-        // Handle request
-        res.end("OK");
+        res.end("OK"); // Handle normally
     } finally {
-        activeConnections.delete(req.socket);
+        activeConnections.delete(req.socket); // Un-track when done
     }
 });
 
-// Graceful shutdown on SIGTERM
+// Graceful shutdown on SIGTERM (process manager signal)
 process.on("SIGTERM", async () => {
     console.log("SIGTERM received, starting graceful shutdown");
-    isShuttingDown = true;
+    isShuttingDown = true; // Step 1: reject any new /health and requests
 
     server.close(async () => {
+        // Called when all pending connections finish naturally
         console.log("Server closed");
-        // Cleanup: close DB connections, etc.
-        process.exit(0);
+        // Cleanup: close DB connections, flush logs, etc.
+        process.exit(0); // Exit cleanly (PM2/K8s will start new instance)
     });
 
-    // Force kill after 30 seconds
+    // Force kill after 30 seconds (don't wait forever for a stuck request)
     setTimeout(() => {
         console.error("Graceful shutdown timeout, force killing");
-        activeConnections.forEach((socket) => socket.destroy());
-        process.exit(1);
+        activeConnections.forEach((socket) => socket.destroy()); // Forcibly disconnect all
+        process.exit(1); // Exit with error code (PM2 will restart)
     }, 30000);
 });
 
@@ -6159,52 +7038,57 @@ graph TB
 | **SQL Injection**       | String concatenation in queries | Data breach, deletion               | Code review, SQLi testing    | Low-Medium |
 | **CORS Bypass**         | Wildcard origin + credentials   | Session hijacking, CSRF             | Browser security audit       | Low        |
 
+> 📖 **What this example demonstrates:** Five common Node.js security vulnerabilities and their fixes. Each one takes user-supplied input and either misuses it directly (dangerous) or validates/sanitizes it first (safe). These are real bugs found in production Node.js applications.
+
 ```js
 // 1. ❌ Prototype Pollution
+// An attacker sends JSON with a __proto__ key to modify Object.prototype
 const obj = {};
 const maliciousInput = JSON.parse(`{"__proto__": {"isAdmin": true}}`);
 Object.assign(obj, maliciousInput);
-console.log({}.isAdmin); // true — VULNERABILITY!
+console.log({}.isAdmin); // true — VULNERABILITY! All plain objects now have isAdmin=true!
 
-// Fix: Use null prototype or validator
-const safeObj = Object.create(null);
-Object.assign(safeObj, maliciousInput); // No prototype chain
+// ✅ Fix: Use null prototype or validator
+const safeObj = Object.create(null); // No __proto__ chain — can't pollute Object.prototype
+Object.assign(safeObj, maliciousInput); // Safe: safeObj has no prototype to pollute
 
 // 2. ❌ Regular Expression DoS (ReDoS)
+// Nested quantifiers like (a+)+ cause exponential backtracking for non-matching input
 const regex = /(a+)+b/;
-regex.test("aaaaaaaaaaaaaaaaaaaaaaaac"); // Catastrophic backtracking!
+regex.test("aaaaaaaaaaaaaaaaaaaaaaaac"); // Catastrophic! Hangs CPU for seconds+
 
-// Fix: Avoid nested quantifiers, use stricter patterns
-const safeRegex = /a+b/;
+// ✅ Fix: Avoid nested quantifiers, use simpler linear-time patterns
+const safeRegex = /a+b/; // Linear time — no backtracking
 
-// 3. ❌ Command Injection
+// 3. ❌ Command Injection (user input in shell command)
 const { exec } = require("child_process");
-const userId = req.query.id; // User input
+const userId = req.query.id; // User-controlled!
 exec(`echo "User: ${userId}"`, (err, stdout) => {
-    // Injection: userId = "; rm -rf /"
+    // Attack: userId = `"; rm -rf /` — the shell runs that extra command!
 });
 
-// Fix: Use execFile or escape
+// ✅ Fix: Use execFile (no shell — args never interpreted as shell commands)
 const { execFile } = require("child_process");
 execFile("echo", [`User: ${userId}`], (err, stdout) => {
-    // Safe: userId passed as argument, not shell command
+    // UserId is just a string argument, no shell metacharacter interpretation
 });
 
 // 4. ❌ SQL Injection
 const query = `SELECT * FROM users WHERE id = ${userId}`;
-db.query(query); // SQL injection!
+db.query(query); // Attack: userId = "1 OR 1=1" returns ALL users!
 
-// Fix: Parameterized queries
-const query = "SELECT * FROM users WHERE id = ?";
-db.query(query, [userId]);
+// ✅ Fix: Parameterized queries (DB driver handles escaping)
+const query2 = "SELECT * FROM users WHERE id = ?";
+db.query(query2, [userId]); // userId is data, NEVER interpreted as SQL
 
 // 5. ❌ CORS Misconfiguration
-app.use(cors({ origin: "*" })); // Accept all origins!
+app.use(cors({ origin: "*" })); // Accepts requests from ANY website!
+// With credentials, this allows any site to make authenticated requests on behalf of your users
 
-// Fix: Whitelist approved origins
+// ✅ Fix: Whitelist approved origins only
 app.use(
     cors({
-        origin: ["https://trusted.com", "https://app.com"],
+        origin: ["https://trusted.com", "https://app.com"], // Only these sites allowed
         credentials: true,
     }),
 );
@@ -6468,20 +7352,30 @@ graph LR
 
 ### Key APIs & Patterns
 
+> 📖 **What this example demonstrates:** Three separate HTTP security capabilities: HTTP/2 (modern protocol with multiplexing), HTTPS with TLS (encrypted transport), and Helmet + CORS (security headers). In production you'd typically use all three together, but they address different concerns.
+>
+> 🔑 **Key terms:**
+>
+> - **TLS certificate + key** — Two files: the certificate (public, sent to browser to prove identity) and the private key (secret, used to decrypt). In development, generate self-signed. In production, use Let's Encrypt.
+> - **`minVersion: 'TLSv1.2'`** — Rejects connections using old, vulnerable TLS 1.0/1.1 versions.
+> - **`helmet()`** — Automatically sets ~15 security HTTP headers in one middleware call (Content-Security-Policy, X-Frame-Options, HSTS, etc.).
+> - **`cors({ origin })`** — Only allows requests from the specified domain. Without CORS headers, browsers block all cross-origin requests by default.
+
 ```js
 // --- HTTP/2 Server ---
 const http2 = require("http2");
 const fs = require("fs");
 
 const server = http2.createSecureServer({
-    key: fs.readFileSync("server.key"),
-    cert: fs.readFileSync("server.crt"),
+    key: fs.readFileSync("server.key"), // TLS private key (keep secret!)
+    cert: fs.readFileSync("server.crt"), // TLS certificate (send to clients)
 });
 
 server.on("stream", (stream, headers) => {
-    const path = headers[":path"];
+    const path = headers[":path"]; // HTTP/2 uses pseudo-headers (prefixed with ':')
     stream.respond({ ":status": 200, "content-type": "text/html" });
     stream.end("<h1>Hello HTTP/2</h1>");
+    // Multiple streams can be active simultaneously on the same connection
 });
 
 server.listen(8443);
@@ -6495,14 +7389,13 @@ const fs = require("fs");
 const options = {
     key: fs.readFileSync("server.key"),
     cert: fs.readFileSync("server.crt"),
-    // Enforce TLS 1.2+ (reject old protocols)
-    minVersion: "TLSv1.2",
+    minVersion: "TLSv1.2", // Reject TLS 1.0/1.1 (old, vulnerable protocols)
 };
 
 https
     .createServer(options, (req, res) => {
         res.writeHead(200);
-        res.end("Secure!");
+        res.end("Secure!"); // Data encrypted in transit (cannot be intercepted)
     })
     .listen(443);
 ```
@@ -6514,10 +7407,11 @@ const helmet = require("helmet");
 const cors = require("cors");
 const app = express();
 
-app.use(helmet()); // Sets 15+ security headers
-app.use(cors({ origin: "https://myapp.com" })); // Whitelist origin
+app.use(helmet()); // One line sets ~15 security headers (CSP, X-Frame-Options, etc.)
+app.use(cors({ origin: "https://myapp.com" })); // Only allow requests from myapp.com
 
-// HSTS: force HTTPS for 1 year
+// HSTS: tell browsers to ALWAYS use HTTPS for this domain for 1 year
+// Even if user types http://, browser automatically upgrades to https://
 app.use(helmet.hsts({ maxAge: 31536000, includeSubDomains: true }));
 ```
 
@@ -6606,6 +7500,15 @@ sequenceDiagram
 
 ### Key APIs & Patterns
 
+> 📖 **What this example demonstrates:** A complete WebSocket server with heartbeat detection. The server accepts connections, echoes messages back, and pings every 30 seconds to detect dead connections (clients that disconnected without sending a close frame, e.g., due to network failure). Without heartbeats, dead connections accumulate and waste memory.
+>
+> 🔑 **Key terms:**
+>
+> - **WebSocket upgrade** — Connection starts as HTTP, then the client sends `Upgrade: websocket`. Server responds with `101 Switching Protocols`, and the connection becomes full-duplex.
+> - **Full-duplex** — Both sides can send and receive simultaneously (unlike HTTP where you send, wait, receive).
+> - **Heartbeat (ping/pong)** — Every 30s, server sends a `ping` frame. The client must respond with a `pong`. If no pong arrives, the connection is dead — terminate it.
+> - **`ws.readyState === 1`** — 1 = OPEN (WebSocket is connected and can send). Other states: 0=CONNECTING, 2=CLOSING, 3=CLOSED.
+
 ```js
 // --- ws (minimal WebSocket) ---
 const { WebSocketServer } = require("ws");
@@ -6617,58 +7520,62 @@ wss.on("connection", (ws, req) => {
     ws.on("message", (data) => {
         const msg = data.toString();
         console.log("Received:", msg);
-        // Echo back
-        ws.send(`Echo: ${msg}`);
+        ws.send(`Echo: ${msg}`); // Send back to this specific client
     });
 
     ws.on("close", () => console.log("Client disconnected"));
 
-    // Heartbeat to detect dead connections
+    // Heartbeat: track whether this connection is still alive
     ws.isAlive = true;
     ws.on("pong", () => {
-        ws.isAlive = true;
+        ws.isAlive = true; // Client responded — still alive!
     });
 });
 
-// Heartbeat interval — terminate dead connections
+// Heartbeat interval: every 30s, check all connections
 const interval = setInterval(() => {
     wss.clients.forEach((ws) => {
-        if (!ws.isAlive) return ws.terminate();
-        ws.isAlive = false;
-        ws.ping();
+        if (!ws.isAlive) return ws.terminate(); // No pong in 30s — dead connection, kill it
+        ws.isAlive = false; // Assume dead until we get a pong
+        ws.ping(); // Send ping — client must respond with pong
     });
 }, 30000);
 
-wss.on("close", () => clearInterval(interval));
+wss.on("close", () => clearInterval(interval)); // Stop heartbeat when server stops
 ```
 
 ```js
 // --- Broadcasting to all clients ---
+// Use case: chat message, live score update, notification
 function broadcast(data) {
     const msg = JSON.stringify(data);
     wss.clients.forEach((client) => {
         if (client.readyState === 1) {
-            // OPEN
+            // 1 = OPEN (only send to connected clients)
             client.send(msg);
         }
     });
 }
 ```
 
+> 📖 **What this example demonstrates:** Scaling WebSockets across multiple Node.js instances using Redis Pub/Sub. Without this, a message from User A (on Server 1) would never reach User B (on Server 2). Redis acts as the broadcast backbone: any server can publish, all servers subscribe and forward to their local clients.
+
 ```js
 // --- Scaling with Redis pub/sub ---
 const Redis = require("ioredis");
-const pub = new Redis();
-const sub = new Redis();
+const pub = new Redis(); // Separate client for publishing
+const sub = new Redis(); // Separate client for subscribing (can't do both on same client)
 
-sub.subscribe("chat");
+sub.subscribe("chat"); // This server listens for messages on the 'chat' channel
 sub.on("message", (channel, message) => {
-    broadcast(JSON.parse(message)); // Forward to all local WS clients
+    broadcast(JSON.parse(message)); // Forward to all WebSocket clients on THIS server
 });
 
 wss.on("connection", (ws) => {
     ws.on("message", (data) => {
-        pub.publish("chat", data.toString()); // Publish to all instances
+        // When a client sends a message, publish it to Redis
+        // ALL servers subscribed to 'chat' will receive it and forward to their clients
+        pub.publish("chat", data.toString());
     });
 });
 ```
@@ -6910,47 +7817,53 @@ graph TB
 
 ### KafkaJS Setup — Producer & Consumer
 
+> 📖 **What this example demonstrates:** The core KafkaJS setup: creating a client, then a producer and consumer. The producer `send()` call puts messages onto a Kafka topic. The consumer's `run()` loop continuously reads new messages as they arrive. Everything is async — your app stays responsive while waiting for messages.
+>
+> 🔑 **Key terms:**
+>
+> - **`clientId`** — A human-readable name for your app in Kafka logs and metrics. Helps identify traffic sources.
+> - **`brokers`** — Kafka cluster addresses. Always specify multiple for fault tolerance (if one broker is down, others take over).
+> - **`key`** (partition key) — A string that determines which partition the message goes to. Same key → same partition → messages for that key are always in order. No key → round-robin across partitions.
+> - **`idempotent: true`** — The producer assigns sequence numbers. If a message is retried (network error), Kafka deduplicates it. You get exactly-once producer semantics.
+> - **`groupId`** — Consumer group identifier. All consumers with the same `groupId` share the load (each partition assigned to one consumer). Different `groupId` = independent consumption.
+
 ```js
 const { Kafka, Partitioners, logLevel } = require("kafkajs");
 
 // 1. CREATE KAFKA CLIENT
 const kafka = new Kafka({
-    clientId: "my-app",
-    brokers: ["broker1:9092", "broker2:9092", "broker3:9092"],
-    // Retry settings for broker connection
+    clientId: "my-app", // Human-readable name for logs
+    brokers: ["broker1:9092", "broker2:9092", "broker3:9092"], // Connect to multiple brokers for HA
     retry: {
-        initialRetryTime: 300, // ms
-        retries: 10,
+        initialRetryTime: 300, // ms before first retry
+        retries: 10, // Retry up to 10 times on transient errors
     },
-    logLevel: logLevel.WARN,
+    logLevel: logLevel.WARN, // Only log warnings and errors (not every consumed message)
 });
 
 // 2. PRODUCER — Sending Messages
 const producer = kafka.producer({
-    // Use DefaultPartitioner (key-based) or RoundRobin
-    createPartitioner: Partitioners.DefaultPartitioner,
-    // Idempotent producer prevents duplicate messages on retry
-    idempotent: true,
-    // Transaction support for exactly-once semantics
-    transactionalId: "my-transactional-id", // optional
+    createPartitioner: Partitioners.DefaultPartitioner, // Key-based routing (key → partition)
+    idempotent: true, // Prevent duplicates on retry (safe to use)
+    transactionalId: "my-transactional-id", // Enables atomic multi-topic writes (optional)
 });
 
 async function startProducer() {
-    await producer.connect();
+    await producer.connect(); // Establish connection to Kafka brokers
 
     // Send a single message
     await producer.send({
         topic: "orders",
         messages: [
             {
-                key: "user-123", // Partition key — same key → same partition → ordering
-                value: JSON.stringify({ orderId: "ORD-001", amount: 99.99 }),
-                headers: { source: "api-server" },
+                key: "user-123", // Same key → same partition → all user-123 events are ordered!
+                value: JSON.stringify({ orderId: "ORD-001", amount: 99.99 }), // Serialized to bytes
+                headers: { source: "api-server" }, // Optional metadata (logged, searchable)
             },
         ],
     });
 
-    // Send a batch of messages (higher throughput)
+    // Send a batch of messages (higher throughput — fewer network round trips)
     await producer.sendBatch({
         topicMessages: [
             {
@@ -6989,19 +7902,26 @@ async function startProducer() {
 
 // 3. CONSUMER — Reading Messages
 const consumer = kafka.consumer({
-    groupId: "order-service", // Consumer group
-    // Session timeout: if consumer doesn't heartbeat within this, rebalance triggers
-    sessionTimeout: 30000, // 30s (default)
-    // Heartbeat interval: how often consumer sends heartbeat to broker
-    heartbeatInterval: 3000, // 3s (default)
-    // Max time between poll() calls before consumer is considered dead
-    maxWaitTimeInMs: 5000,
+    groupId: "order-service", // All instances with same groupId share the partitions
+    sessionTimeout: 30000, // 30s: if no heartbeat, Kafka assumes consumer died → rebalance
+    heartbeatInterval: 3000, // Every 3s: "I'm alive" signal to Kafka broker
+    maxWaitTimeInMs: 5000, // Long poll: wait up to 5s for new messages (saves CPU)
 });
 ```
 
 ### Consumer: `eachMessage` vs `eachBatch`
 
 This is a critical performance choice. `eachMessage` is simpler; `eachBatch` gives you much higher throughput.
+
+> 📖 **What these examples demonstrate:** Two ways to consume Kafka messages. `eachMessage` calls your handler once per message — simple but slow (one DB write per message). `eachBatch` gives you all messages arrived so far as an array — you can do bulk inserts, dramatically reducing round trips to the database.
+>
+> 🔑 **Key terms:**
+>
+> - **`heartbeat()`** — Long-running processing must periodically call this to tell Kafka: "I'm still alive, don't trigger a rebalance". Call it every few seconds inside a slow loop.
+> - **`isRunning()`** — Returns false when the consumer is shutting down. Check this in long loops to exit cleanly.
+> - **`isStale()`** — Returns true if a rebalance happened while you were processing. The batch belongs to a partition you no longer own. Stop processing and skip commit.
+> - **`resolveOffset(offset)`** — Marks this specific message's offset as processed (ready to commit). Like checking off items on a to-do list.
+> - **`commitOffsetsIfNecessary()`** — Sends the committed offsets to Kafka. "I've processed up to this message; if I restart, start from the next one."
 
 ```js
 // ─── OPTION A: eachMessage (Simple, Lower Throughput) ───
@@ -7010,19 +7930,19 @@ This is a critical performance choice. `eachMessage` is simpler; `eachBatch` giv
 
 async function runConsumerSimple() {
     await consumer.connect();
-    await consumer.subscribe({ topic: "orders", fromBeginning: false });
+    await consumer.subscribe({ topic: "orders", fromBeginning: false }); // Only new messages
 
     await consumer.run({
-        // Called once per message
+        // Called once per message (one DB write per message — can be slow)
         eachMessage: async ({ topic, partition, message, heartbeat }) => {
-            const order = JSON.parse(message.value.toString());
+            const order = JSON.parse(message.value.toString()); // Deserialize bytes to object
             console.log(
                 `Processing order ${order.orderId} from partition ${partition}`,
             );
 
-            await processOrder(order);
+            await processOrder(order); // Your business logic
 
-            // Call heartbeat() for long-running processing to prevent rebalance
+            // Call heartbeat() if processing takes > 3s to prevent Kafka rebalance
             await heartbeat();
         },
     });
@@ -7054,21 +7974,18 @@ async function runConsumerBatch() {
             );
 
             for (const message of messages) {
-                // Check if consumer is still running (graceful shutdown)
-                if (!isRunning() || isStale()) break;
+                // Check if consumer is still running (e.g., SIGTERM received)
+                if (!isRunning() || isStale()) break; // Stop processing if shutting down or rebalanced
 
                 const order = JSON.parse(message.value.toString());
                 await processOrder(order);
 
-                // Mark this offset as processed
-                resolveOffset(message.offset);
+                resolveOffset(message.offset); // Mark this message as processed
 
-                // Send heartbeat every few messages to prevent session timeout
-                await heartbeat();
+                await heartbeat(); // Let Kafka know we're still alive (do this every few messages)
             }
 
-            // Commit offsets for the batch
-            await commitOffsetsIfNecessary();
+            await commitOffsetsIfNecessary(); // Commit all resolved offsets at once (one network call)
         },
     });
 }
@@ -7592,6 +8509,15 @@ flowchart LR
 
 ### Key Patterns
 
+> 📖 **What this example demonstrates:** Three levels of testing in Node.js. Built-in `node:test` for pure unit tests (no dependencies). Jest for unit tests with mocking (replace the real DB with a fake). Supertest for integration tests (make real HTTP calls to your Express app without starting a real server).
+>
+> 🔑 **Key terms:**
+>
+> - **`jest.mock('./db')`** — Replaces the entire `./db` module with auto-generated mock functions. Any function in `db` becomes a Jest spy that returns `undefined` by default.
+> - **`mockResolvedValue(val)`** — Sets what the mock function returns when awaited. Simulates a DB returning a user.
+> - **`rejects.toThrow(msg)`** — Asserts that the promise rejects with an error containing `msg`. Tests error paths.
+> - **`supertest(app)`** — Creates an HTTP test client for your Express app. Doesn't need `app.listen()` — it binds an ephemeral port internally. No server cleanup needed.
+
 ```js
 // --- Node.js built-in test runner (node:test) ---
 const { describe, it } = require("node:test");
@@ -7599,7 +8525,7 @@ const assert = require("node:assert");
 
 describe("Math utils", () => {
     it("should add two numbers", () => {
-        assert.strictEqual(1 + 2, 3);
+        assert.strictEqual(1 + 2, 3); // strictEqual: checks value AND type (=== not ==)
     });
 
     it("should handle negative numbers", () => {
@@ -7622,37 +8548,38 @@ async function getUser(id) {
 module.exports = { getUser };
 
 // userService.test.js
-jest.mock("./db");
+jest.mock("./db"); // Replace entire ./db module with mocks (all functions become jest fns)
 const db = require("./db");
 const { getUser } = require("./userService");
 
 test("returns user when found", async () => {
-    db.findById.mockResolvedValue({ id: 1, name: "Alice" });
+    db.findById.mockResolvedValue({ id: 1, name: "Alice" }); // Mock DB: "return this user"
     const user = await getUser(1);
-    expect(user.name).toBe("Alice");
+    expect(user.name).toBe("Alice"); // Asserts without ever touching a real database!
 });
 
 test("throws when user not found", async () => {
-    db.findById.mockResolvedValue(null);
-    await expect(getUser(999)).rejects.toThrow("User not found");
+    db.findById.mockResolvedValue(null); // Mock DB: "user doesn't exist"
+    await expect(getUser(999)).rejects.toThrow("User not found"); // Test the error path
 });
 ```
 
 ```js
 // --- Integration test (supertest + Express) ---
+// Tests the entire HTTP layer: routing, middleware, request parsing, response formatting
 const request = require("supertest");
-const app = require("./app");
+const app = require("./app"); // Your Express app (must NOT call app.listen!)
 
 describe("GET /api/users", () => {
     it("returns 200 and array of users", async () => {
-        const res = await request(app).get("/api/users");
+        const res = await request(app).get("/api/users"); // Makes real HTTP request internally
         expect(res.status).toBe(200);
-        expect(Array.isArray(res.body)).toBe(true);
+        expect(Array.isArray(res.body)).toBe(true); // Response body is auto-parsed JSON
     });
 
     it("returns 404 for unknown user", async () => {
         const res = await request(app).get("/api/users/99999");
-        expect(res.status).toBe(404);
+        expect(res.status).toBe(404); // Verifies error handling works
     });
 });
 ```
@@ -7754,49 +8681,66 @@ flowchart TB
 
 ### Key Patterns
 
+> 📖 **What this example demonstrates:** Three performance measurement tools. The event loop delay monitor tracks how long Node's event loop is backed up (healthy: < 20ms). Performance marks let you time specific operations precisely. autocannon is a CLI load tester that simulates real traffic and shows you throughput and latency distribution.
+>
+> 🔑 **Key terms:**
+>
+> - **`monitorEventLoopDelay`** — Samples the gap between when a timer was supposed to fire and when it actually fired. High lag = something blocking the event loop (CPU work, sync I/O).
+> - **p50/p99 percentile** — p50 = 50% of requests are faster than this (the median). p99 = 99% are faster. p99 reveals your worst-case experience. Always optimize p99.
+> - **`performance.mark/measure`** — Same API as browser Performance API. Mark start/end points, then measure the duration between them.
+> - **`-c 100`** in autocannon — 100 concurrent HTTP connections hammering your server simultaneously. Simulates real load.
+
 ```js
 // --- Measure event loop lag ---
 const { monitorEventLoopDelay } = require("perf_hooks");
-const h = monitorEventLoopDelay({ resolution: 10 });
+const h = monitorEventLoopDelay({ resolution: 10 }); // Sample every 10ms
 h.enable();
 
 setInterval(() => {
+    // percentile(50) = median lag; percentile(99) = worst 1% lag
+    // / 1e6 converts nanoseconds to milliseconds
     console.log(
         `Event loop lag — p50: ${(h.percentile(50) / 1e6).toFixed(2)}ms, p99: ${(h.percentile(99) / 1e6).toFixed(2)}ms`,
     );
-    h.reset();
+    h.reset(); // Reset histogram for next interval
 }, 5000);
+// Healthy: p50 < 5ms, p99 < 20ms
+// Red flag: p99 > 100ms = something blocking the event loop
 ```
 
 ```js
 // --- Custom performance marks ---
 const { performance, PerformanceObserver } = require("perf_hooks");
 
+// Observer receives measurement results asynchronously
 const obs = new PerformanceObserver((list) => {
     list.getEntries().forEach((e) => {
         console.log(`${e.name}: ${e.duration.toFixed(2)}ms`);
     });
 });
-obs.observe({ entryTypes: ["measure"] });
+obs.observe({ entryTypes: ["measure"] }); // Listen for 'measure' entries
 
-performance.mark("db-start");
-await db.query("SELECT * FROM users");
-performance.mark("db-end");
-performance.measure("DB Query", "db-start", "db-end");
+performance.mark("db-start"); // Timestamp: before query
+await db.query("SELECT * FROM users"); // The operation you want to time
+performance.mark("db-end"); // Timestamp: after query
+performance.measure("DB Query", "db-start", "db-end"); // Calculate duration
+// Observer logs: "DB Query: 12.45ms"
 ```
 
 ```bash
 # --- Load test with autocannon ---
 npx autocannon -c 100 -d 10 http://localhost:3000/api/users
-# -c 100 = 100 concurrent connections
-# -d 10  = 10 seconds duration
-# Output: req/sec, latency percentiles, throughput
+# -c 100 = 100 concurrent connections (simulates 100 simultaneous users)
+# -d 10  = run for 10 seconds
+# Output: req/sec, latency percentiles (p50, p97.5, p99), throughput (MB/s)
 ```
 
 ```bash
 # --- Flamegraph with clinic ---
 npx clinic flame -- node server.js
-# Opens flamegraph in browser after load test
+# Runs your server with V8 profiling
+# After load testing, press Ctrl+C
+# Opens flamegraph in browser: wide bars = functions consuming most CPU time
 ```
 
 ### Senior-Level Q&A
@@ -7869,27 +8813,36 @@ flowchart TB
 
 ### Key Patterns
 
+> 📖 **What this example demonstrates:** Three core REST API design patterns. Cursor-based pagination is more efficient than offset for large tables. Rate limiting protects against abuse. Idempotency keys prevent duplicate charges when payment requests are retried.
+>
+> 🔑 **Key terms:**
+>
+> - **Cursor-based pagination** — Instead of `OFFSET 1000`, use `WHERE id > lastId`. Much faster for PostgreSQL: offset scans skip rows, cursor jumps directly to the index.
+> - **`Math.min(parseInt(limit), 100)`** — Input validation and capping. Prevents a client from requesting 10,000 rows in one call.
+> - **`windowMs: 15 * 60 * 1000`** — 15 minutes in milliseconds. Rate limiting window: max 100 requests per IP per 15 minutes.
+> - **Idempotency key** — A UUID the client generates per request. If the same key is sent twice, the server returns the SAME response instead of charging again. Essential for payment retries.
+
 ```js
 // --- REST best practices ---
-// Resource naming: plural nouns
-// GET    /api/v1/users        → list
-// GET    /api/v1/users/:id    → get one
-// POST   /api/v1/users        → create
-// PUT    /api/v1/users/:id    → full update
-// PATCH  /api/v1/users/:id    → partial update
+// Resource naming: plural nouns, predictable hierarchy
+// GET    /api/v1/users        → list all users
+// GET    /api/v1/users/:id    → get one user
+// POST   /api/v1/users        → create user
+// PUT    /api/v1/users/:id    → full update (replace)
+// PATCH  /api/v1/users/:id    → partial update (only changed fields)
 // DELETE /api/v1/users/:id    → delete
 
 // Pagination (cursor-based, better than offset for large datasets)
 app.get("/api/v1/users", async (req, res) => {
     const { cursor, limit = 20 } = req.query;
-    const safeLimit = Math.min(parseInt(limit) || 20, 100);
+    const safeLimit = Math.min(parseInt(limit) || 20, 100); // Cap at 100 (prevent abuse)
     const users = await db.query(
         "SELECT * FROM users WHERE id > $1 ORDER BY id LIMIT $2",
-        [cursor || 0, safeLimit],
+        [cursor || 0, safeLimit], // Cursor = last seen ID; fetch the next page from there
     );
     res.json({
         data: users,
-        nextCursor: users.length ? users[users.length - 1].id : null,
+        nextCursor: users.length ? users[users.length - 1].id : null, // Null = no more pages
     });
 });
 ```
@@ -7899,36 +8852,36 @@ app.get("/api/v1/users", async (req, res) => {
 const rateLimit = require("express-rate-limit");
 
 const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100, // 100 requests per window
-    standardHeaders: true,
+    windowMs: 15 * 60 * 1000, // 15-minute window
+    max: 100, // Max 100 requests per IP in that window
+    standardHeaders: true, // Include rate limit info in response headers (X-RateLimit-*)
     message: { error: "Too many requests, try again later" },
 });
 
-app.use("/api/", limiter);
+app.use("/api/", limiter); // Apply to all API routes
 ```
 
 ```js
 // --- Idempotency for payments ---
 app.post("/api/v1/charges", async (req, res) => {
-    const idempotencyKey = req.headers["idempotency-key"];
+    const idempotencyKey = req.headers["idempotency-key"]; // Client-generated UUID
     if (!idempotencyKey)
         return res
             .status(400)
             .json({ error: "Idempotency-Key header required" });
 
-    // Check if already processed
+    // Check if this request was already processed (don't charge twice!)
     const existing = await db.query(
         "SELECT * FROM charges WHERE idempotency_key = $1",
         [idempotencyKey],
     );
-    if (existing.rows.length) return res.json(existing.rows[0]);
+    if (existing.rows.length) return res.json(existing.rows[0]); // Return same result
 
-    // Process new charge
+    // First time seeing this key — process the payment
     const charge = await processPayment(req.body);
     await db.query(
         "INSERT INTO charges (idempotency_key, data) VALUES ($1, $2)",
-        [idempotencyKey, charge],
+        [idempotencyKey, charge], // Store so future retries return this same result
     );
     res.status(201).json(charge);
 });
@@ -8020,24 +8973,37 @@ flowchart TB
 
 ### Key Patterns
 
+> 📖 **What this Dockerfile demonstrates:** Multi-stage build — the `builder` stage installs dependencies and compiles, then the `production` stage copies only the final artifacts. The image runs as a non-root user (`appuser`) for security. A built-in HEALTHCHECK tells Docker/Kubernetes whether the container is healthy.
+>
+> 🔑 **Key terms:**
+>
+> - **`node:20-alpine`** — Alpine Linux variant (~60MB) instead of Debian (~900MB). Dramatically smaller images.
+> - **`npm ci`** — "Clean Install" — strictly follows `package-lock.json`. Faster and more reproducible than `npm install` (fails if lock file is inconsistent).
+> - **`--only=production`** — Skip `devDependencies` (Jest, TypeScript, etc.) in the final image. Reduces size and attack surface.
+> - **Multi-stage** — The `builder` stage has compiler tools. The final stage has only what's needed at runtime. Final image ~5-10x smaller.
+> - **`HEALTHCHECK`** — Docker pings this command every 30s. If it fails 3 times, Docker marks the container unhealthy. Load balancer stops routing traffic to it.
+
 ```dockerfile
 # --- Optimized Dockerfile for Node.js ---
-FROM node:20-alpine AS builder
+FROM node:20-alpine AS builder          # Stage 1: install deps (Alpine = small Linux)
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci --only=production
-COPY . .
+RUN npm ci --only=production           # Install only production deps (no Jest, TypeScript, etc.)
+COPY . .                               # Copy source code AFTER npm install (better Docker layer caching)
 
-FROM node:20-alpine
+FROM node:20-alpine                    # Stage 2: production image (starts fresh, no build tools)
 WORKDIR /app
-# Don't run as root
+# Security: never run as root (if app is compromised, attacker has limited permissions)
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
-COPY --from=builder /app .
-USER appuser
-EXPOSE 3000
+COPY --from=builder /app .            # Copy only the built artifacts from Stage 1
+USER appuser                          # Switch to non-root user
+EXPOSE 3000                           # Documentation: this container listens on port 3000
+# Health check: Docker/K8s runs this every 30s; exit 1 = unhealthy
 HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://localhost:3000/health || exit 1
-CMD ["node", "server.js"]
+CMD ["node", "server.js"]             # Start the app
 ```
+
+> 📖 **What this example demonstrates:** Combined graceful shutdown + health check endpoints. The `/health` endpoint tells the load balancer the service is up. The `/ready` endpoint checks all dependencies (DB, Redis) before accepting traffic. `gracefulShutdown` ensures no requests are dropped during deployment.
 
 ```js
 // --- Graceful shutdown ---
@@ -8046,38 +9012,39 @@ const server = app.listen(3000);
 async function gracefulShutdown(signal) {
     console.log(`${signal} received. Shutting down gracefully...`);
 
-    // Stop accepting new connections
     server.close(() => {
+        // Stop accepting new connections; existing finish naturally
         console.log("HTTP server closed");
     });
 
-    // Close DB connections, flush logs
-    await db.end();
-    await logger.flush();
+    await db.end(); // Close all database connections cleanly (finish pending queries)
+    await logger.flush(); // Flush buffered logs to disk/network
 
-    // Force exit after timeout
     setTimeout(() => {
-        console.error("Forced shutdown");
+        console.error("Forced shutdown"); // Stuck? Kill after 10s
         process.exit(1);
     }, 10000);
 }
 
-process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
-process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM")); // K8s/PM2 sends this
+process.on("SIGINT", () => gracefulShutdown("SIGINT")); // Ctrl+C during development
 ```
 
 ```js
 // --- Health check endpoints ---
+// /health = liveness: "is the process alive?" - K8s restarts if this fails
 app.get("/health", (req, res) => {
-    res.status(200).json({ status: "ok", uptime: process.uptime() });
+    res.status(200).json({ status: "ok", uptime: process.uptime() }); // uptime in seconds
 });
 
+// /ready = readiness: "is the app ready to serve traffic?" - K8s stops routing if this fails
 app.get("/ready", async (req, res) => {
     try {
-        await db.query("SELECT 1"); // DB alive?
-        await redis.ping(); // Cache alive?
+        await db.query("SELECT 1"); // Verify DB connection (throws if DB is down)
+        await redis.ping(); // Verify Redis connection (throws if Redis is down)
         res.status(200).json({ status: "ready" });
     } catch (err) {
+        // Return 503 (Service Unavailable) — load balancer stops sending traffic until ready
         res.status(503).json({ status: "not ready", error: err.message });
     }
 });
@@ -8085,12 +9052,12 @@ app.get("/ready", async (req, res) => {
 
 ```bash
 # --- PM2 commands ---
-pm2 start server.js -i max       # Cluster mode (all CPUs)
-pm2 reload server                # Zero-downtime restart
-pm2 logs                         # View logs
-pm2 monit                        # Live monitoring dashboard
+pm2 start server.js -i max       # Cluster mode: fork one worker per CPU core
+pm2 reload server                # Zero-downtime restart: replace workers one by one
+pm2 logs                         # View logs (all workers combined)
+pm2 monit                        # Live monitoring dashboard (CPU, RAM per worker)
 pm2 save                         # Save current process list
-pm2 startup                      # Auto-start on server reboot
+pm2 startup                      # Generate and configure auto-start on server reboot
 ```
 
 ### Senior-Level Q&A
@@ -8172,53 +9139,63 @@ flowchart TB
 
 ### Security Checklist
 
+> 📖 **What this example demonstrates:** Seven layered security practices. Each one prevents a specific attack. Together they address the OWASP Node.js Top 10. Input validation stops garbage data before it reaches the DB. Parameterized queries stop SQL injection. bcrypt makes stolen passwords useless. JWT with short expiry limits damage from token theft.
+>
+> 🔑 **Key terms:**
+>
+> - **Zod** — A TypeScript schema validation library. `.safeParse()` returns `{ success, data, error }` instead of throwing — great for request validation.
+> - **bcrypt salt rounds** — The `12` in `bcrypt.hash(password, 12)` is the cost factor. Higher = more CPU per hash = harder to brute force. 12 rounds ≈ 250ms per hash on modern CPU.
+> - **`jwt.sign({ expiresIn: '15m' })`** — Token expires in 15 minutes. Stolen token becomes useless after 15 min. Use refresh tokens for longer sessions.
+> - **`app.disable('x-powered-by')`** — Removes the `X-Powered-By: Express` header that tells attackers what framework you use.
+
 ```js
 // 1. Input validation (Zod example)
 const { z } = require("zod");
 const UserSchema = z.object({
-    email: z.string().email(),
-    password: z.string().min(8).max(128),
-    age: z.number().int().min(13).max(150).optional(),
+    email: z.string().email(), // Must be a valid email format
+    password: z.string().min(8).max(128), // 8-128 chars (max prevents bcrypt DoS)
+    age: z.number().int().min(13).max(150).optional(), // Optional, bounded
 });
 
 app.post("/register", (req, res) => {
-    const result = UserSchema.safeParse(req.body);
+    const result = UserSchema.safeParse(req.body); // Validate without throwing
     if (!result.success)
-        return res.status(400).json({ errors: result.error.issues });
-    // Proceed with validated data
+        return res.status(400).json({ errors: result.error.issues }); // Return what's wrong
+    // Use result.data which is type-safe and validated
 });
 
 // 2. SQL injection prevention (parameterized queries)
-// ❌ BAD: String concatenation
+// ❌ BAD: String concatenation — attacker can inject SQL
 // db.query(`SELECT * FROM users WHERE id = ${req.params.id}`);
-// ✅ GOOD: Parameterized
+// ✅ GOOD: Parameterized — DB treats the value as data, NEVER as SQL
 const user = await db.query("SELECT * FROM users WHERE id = $1", [
     req.params.id,
 ]);
 
 // 3. Password hashing (bcrypt)
 const bcrypt = require("bcrypt");
-const hash = await bcrypt.hash(password, 12); // 12 salt rounds
-const match = await bcrypt.compare(inputPassword, storedHash);
+const hash = await bcrypt.hash(password, 12); // 12 rounds ≈ 250ms — resistant to brute force
+const match = await bcrypt.compare(inputPassword, storedHash); // Returns true/false
 
 // 4. JWT with short expiry
 const jwt = require("jsonwebtoken");
 const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, {
-    expiresIn: "15m",
+    expiresIn: "15m", // Token valid for 15 minutes only
+    // Combined with refresh tokens: short access token + long refresh token
 });
 
 // 5. Helmet (security headers)
-app.use(helmet());
-app.disable("x-powered-by");
+app.use(helmet()); // Sets: CSP, HSTS, X-Frame-Options, X-Content-Type-Options, etc.
+app.disable("x-powered-by"); // Remove "X-Powered-By: Express" to avoid fingerprinting
 
 // 6. Dependency scanning
-// npm audit              (built-in)
-// npx snyk test          (deeper scan)
-// npm audit fix --force  (auto-fix, careful with breaking changes)
+// npm audit              (built-in, free)
+// npx snyk test          (deeper, can check reachability)
+// npm audit fix --force  (auto-fix, careful — may break APIs)
 
 // 7. Environment variables (never hardcode secrets)
-// ❌ const secret = 'my-secret-key';
-// ✅ const secret = process.env.JWT_SECRET;
+// ❌ const secret = 'my-secret-key'; // Exposed in source control!
+// ✅ const secret = process.env.JWT_SECRET; // From environment or secret manager
 ```
 
 ### Senior-Level Q&A
@@ -8313,18 +9290,28 @@ flowchart LR
 
 ### Key Patterns
 
+> 📖 **What this example demonstrates:** Structured logging with request correlation. Instead of `console.log('user fetched')`, each log line is a JSON object with `requestId`, method, path, and any other context. This makes it searchable in Loki/ELK: find all logs for a specific request ID across all servers.
+>
+> 🔑 **Key terms:**
+>
+> - **`pino`** — The fastest Node.js logging library. Outputs JSON lines. Very low overhead (~3x faster than Winston).
+> - **`logger.child({ requestId })`** — Creates a new logger that includes the `requestId` field in every log line automatically. You don't have to pass it manually each time.
+> - **Correlation ID / Request ID** — A unique UUID per request. Passed as `X-Request-ID` header. All logs and traces for that request share this ID. Makes debugging distributed systems possible.
+> - **`process.LOG_LEVEL || 'info'`** — Control log verbosity via environment variable. `info` in production, `debug` locally.
+
 ```js
 // --- Structured logging with pino ---
 const pino = require("pino");
 const logger = pino({
-    level: process.env.LOG_LEVEL || "info",
-    // JSON output for machine parsing
+    level: process.env.LOG_LEVEL || "info", // 'debug' locally, 'info'/'warn' in production
+    // JSON output: each line is parseable JSON for log management tools (Loki, ELK, Datadog)
 });
 
 // Add request context (correlation ID)
 app.use((req, res, next) => {
+    // Create a child logger with request-specific context attached to every log line
     req.log = logger.child({
-        requestId: req.headers["x-request-id"] || crypto.randomUUID(),
+        requestId: req.headers["x-request-id"] || crypto.randomUUID(), // Use provided or generate
         method: req.method,
         path: req.url,
     });
@@ -8332,43 +9319,62 @@ app.use((req, res, next) => {
 });
 
 app.get("/api/users", async (req, res) => {
-    req.log.info("Fetching users"); // Includes requestId automatically
+    req.log.info("Fetching users"); // Outputs: {"requestId":"abc","method":"GET",...,"msg":"Fetching users"}
     const users = await db.query("SELECT * FROM users");
-    req.log.info({ count: users.length }, "Users fetched");
+    req.log.info({ count: users.length }, "Users fetched"); // Add structured data to the log line
     res.json(users);
 });
 ```
+
+> 📖 **What this example demonstrates:** Exposing Prometheus metrics from a Node.js app. A Histogram records the duration of HTTP requests, labeled by method/route/status. Prometheus scrapes `/metrics` every 15s, and Grafana visualizes it as dashboards and alerts.
+>
+> 🔑 **Key terms:**
+>
+> - **Histogram** — Records distribution of values (e.g., request durations) in buckets. `buckets: [0.01, 0.05, 0.1, 0.5, 1, 5]` means: how many requests took <10ms, <50ms, <100ms, etc.
+> - **`labels`** — Dimensions for filtering. In Grafana you can query: "show p99 latency for method=GET route=/api/users".
+> - **Prometheus scrape** — Prometheus regularly calls `/metrics` endpoint and records the current metrics values. Your app doesn't push; Prometheus pulls.
+> - **`collectDefaultMetrics()`** — Auto-collects Node.js runtime metrics: event loop lag, heap usage, GC duration, active handles, etc.
 
 ```js
 // --- Prometheus metrics (prom-client) ---
 const client = require("prom-client");
 const collectDefaultMetrics = client.collectDefaultMetrics;
-collectDefaultMetrics(); // CPU, memory, event loop lag
+collectDefaultMetrics(); // Auto-collect: CPU, heap, event loop lag, GC, HTTP connections
 
 const httpRequestDuration = new client.Histogram({
     name: "http_request_duration_seconds",
     help: "Duration of HTTP requests in seconds",
-    labelNames: ["method", "route", "status"],
-    buckets: [0.01, 0.05, 0.1, 0.5, 1, 5],
+    labelNames: ["method", "route", "status"], // Dimensions for filtering in Grafana
+    buckets: [0.01, 0.05, 0.1, 0.5, 1, 5], // Bucket boundaries in seconds
 });
 
 app.use((req, res, next) => {
-    const end = httpRequestDuration.startTimer();
+    const end = httpRequestDuration.startTimer(); // Start timer for this request
     res.on("finish", () =>
         end({
             method: req.method,
-            route: req.route?.path || req.url,
+            route: req.route?.path || req.url, // Use route pattern (/users/:id not /users/123)
             status: res.statusCode,
         }),
     );
     next();
 });
 
+// Prometheus scrapes this endpoint every 15s
 app.get("/metrics", async (req, res) => {
-    res.set("Content-Type", client.register.contentType);
-    res.end(await client.register.metrics());
+    res.set("Content-Type", client.register.contentType); // Special content type prometheus expects
+    res.end(await client.register.metrics()); // All registered metrics as text
 });
 ```
+
+> 📖 **What this example demonstrates:** Auto-instrumentation with OpenTelemetry. By loading `tracing.js` before your app starts, OTel automatically instruments Express routes, pg queries, Redis calls, HTTP outgoing requests, and more — with zero code changes to your business logic.
+>
+> 🔑 **Key terms:**
+>
+> - **Trace** — The complete journey of one request through your system. Consists of spans.
+> - **Span** — One operation within a trace ("DB query took 15ms", "Redis lookup 2ms", "total request 20ms").
+> - **OTLP (OpenTelemetry Protocol)** — Standard protocol for sending telemetry data to backends (Jaeger, Tempo, Datadog).
+> - **`-r ./tracing.js`** — Node.js `require` flag: load this module before anything else. OTel must be initialized before your imports.
 
 ```js
 // --- OpenTelemetry auto-instrumentation ---
@@ -8383,15 +9389,17 @@ const {
 
 const sdk = new NodeSDK({
     traceExporter: new OTLPTraceExporter({
-        url: "http://localhost:4318/v1/traces",
+        url: "http://localhost:4318/v1/traces", // Send spans to local Jaeger/Tempo collector
     }),
-    instrumentations: [getNodeAutoInstrumentations()],
+    instrumentations: [getNodeAutoInstrumentations()], // Auto-instrument everything
 });
 
 sdk.start();
+// Auto-instruments: HTTP (req/res), Express (routes), pg (queries), redis (commands), fs, dns
 
 // Start app: node -r ./tracing.js server.js
-// Auto-instruments: HTTP, Express, pg, redis, fs, dns
+// Traces are automatically created for every incoming request
+// Grafana Tempo shows: GET /api/users -> SELECT * FROM users (12ms) -> Redis GET (1ms)
 ```
 
 ### Senior-Level Q&A
