@@ -160,8 +160,7 @@ console.log(require.resolve("express"));
 let count = 0; // This variable lives for the lifetime of the process
 
 module.exports = {
-    // ++count: increments THEN returns, so first call gives 1
-    increment: () => ++count,
+    increment: () => ++count, // ++count: increments THEN returns, so first call gives 1
     getCount: () => count, // Returns current value without changing it
 };
 
