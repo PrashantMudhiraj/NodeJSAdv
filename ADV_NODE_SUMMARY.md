@@ -142,7 +142,7 @@ graph TD
 
 // 🛠️ Debugging tip: See exactly which file gets loaded:
 console.log(require.resolve("express"));
-// Might print: C:\Users\you\project\node_modules\express\index.js
+// Might print: C:\Users\you\project<br/>ode_modules\express\index.js
 // This is the ACTUAL file Node will load when you write require('express')
 ```
 
@@ -368,6 +368,14 @@ Synchronous code  →  process.nextTick  →  Promise.then  →  setTimeout(0)  
 
 How your JavaScript code flows through V8, libuv, OS, and back as callbacks.
 
+> **How to read this diagram:** Follow the arrows left to right.
+>
+> - Your **JavaScript code** runs on the **Call Stack** synchronously — one statement at a time.
+> - The **Event Loop** (center) cycles through 5 phases in order: Timers → Pending → Poll → Check → Close. Arrows inside show the cycle.
+> - **Microtask Queues** (pink = `nextTick`, orange = `Promise`) drain _completely_ between every phase before the loop advances to the next one.
+> - **Thread Pool** (light blue) — 4 background threads handle blocking work (fs, crypto, zlib, dns.lookup). Finished callbacks land in the Poll phase queue.
+> - **OS Async I/O** (pale blue) — network sockets (TCP, HTTP) are handled by the OS natively with no pool thread consumed.
+
 ```mermaid
 graph LR
     subgraph APP ["Your Application"]
@@ -406,18 +414,25 @@ graph LR
     TP -->|"done → callback"| T4
     OA -->|"done → callback"| T4
 
-    style NTQ fill:#c62828,color:#fff
-    style PMQ fill:#e65100,color:#fff
-    style T4 fill:#1b5e20,color:#fff
-    style TP fill:#1565c0,color:#fff
-    style OA fill:#0d47a1,color:#fff
+    style NTQ fill:#ffcdd2,color:#c62828
+    style PMQ fill:#ffe0b2,color:#bf360c
+    style T4 fill:#c8e6c9,color:#1b5e20
+    style TP fill:#bbdefb,color:#0d47a1
+    style OA fill:#e3f2fd,color:#01579b
 ```
 
 ---
 
 ### Diagram 2: Event Loop — Complete Tick (Phase Cycle)
 
-One full iteration. **Red** = microtask drain (must fully empty before next phase). **Green** = Poll phase where Node waits for I/O.
+One full iteration. **Pink** = microtask drain (must fully empty before the loop advances). **Light green** = Poll phase where Node waits for I/O.
+
+> **How to read this diagram:** Read top to bottom — this is ONE complete tick (iteration) of the event loop.
+>
+> - **Pink nodes** = microtask drain checkpoints. They appear between _every_ phase. The `nextTick` queue must fully empty first, then the Promise queue — before the loop is allowed to move on.
+> - **Light green subgraph (③ POLL)** = the heart of the event loop. Node spends most of its idle time here.
+> - **BLOCK node** (medium green) = Node is sleeping — CPU usage is 0. The OS wakes the process when an I/O event arrives or the nearest timer expires.
+> - After Close callbacks, the loop restarts at the top. This cycle runs for the entire lifetime of the process.
 
 ```mermaid
 graph TD
@@ -469,54 +484,102 @@ graph TD
     CLOSE --> MT5("🔴 Drain Microtasks")
     MT5 --> START
 
-    style MT1 fill:#c62828,color:#fff
-    style MT2 fill:#c62828,color:#fff
-    style MT_IO fill:#c62828,color:#fff
-    style MT4 fill:#c62828,color:#fff
-    style MT5 fill:#c62828,color:#fff
-    style PH4 fill:#1a3a1a,color:#fff
-    style WAITIO fill:#2e7d32,color:#fff
+    style MT1 fill:#ffcdd2,color:#c62828
+    style MT2 fill:#ffcdd2,color:#c62828
+    style MT_IO fill:#ffcdd2,color:#c62828
+    style MT4 fill:#ffcdd2,color:#c62828
+    style MT5 fill:#ffcdd2,color:#c62828
+    style PH4 fill:#e8f5e9,color:#1b5e20
+    style WAITIO fill:#a5d6a7,color:#1b5e20
 ```
 
 ---
 
 ### Diagram 3: Microtask Queue — Priority & Drain Logic
 
-`process.nextTick` always runs **before** Promises. If a Promise callback schedules a new `nextTick`, that `nextTick` gets priority and the loop restarts from the top. This recursive cycle can starve the event loop.
+Between every event loop phase, Node completely drains two queues in strict order: **`process.nextTick` first** (highest priority), then **Promises**. Only when both are empty does the next phase start.
+
+**Simple mental model — think of it like a priority inbox:**
+
+> You have two inboxes on your desk. Inbox A (nextTick) is always processed before Inbox B (Promise). You empty Inbox A completely, then process Inbox B. But here's the twist: items from Inbox B can drop new items into Inbox A — so after Inbox B empties you must check Inbox A again before you're truly done.
+
+**The 3-step rule (memorise this):**
+
+1. Run **all** `nextTick` callbacks (if a callback adds more, run those too — repeat until empty)
+2. Run **all** Promise callbacks (if a callback adds more, run those too — repeat until empty)
+3. **Re-check** `nextTick` — a Promise callback may have sneaked new items in. If yes, go back to step 1.
+
+> **How to read this diagram:** Read top to bottom. Each numbered step is a phase. Arrows looping back show "keep going until empty". The "re-check" arrow at the bottom is the only tricky part — it loops back to Step 1 if Promises accidentally queued new `nextTick` callbacks.
 
 ```mermaid
 graph TD
-    ENTER(["Phase N finishes<br/>Begin microtask drain"])
+    START(["⬇ Phase N just finished<br/>― microtask drain begins ―"])
 
-    subgraph NT_LOOP ["process.nextTick Queue — Priority 1 HIGHEST"]
-        NT_CHECK{"nextTick<br/>queue empty?"}
-        NT_RUN["Run next nextTick callback<br/>May add more nextTick or Promises"]
-        NT_CHECK -->|"Not empty"| NT_RUN --> NT_CHECK
-    end
+    S1_LABEL["① nextTick Queue  —  Priority 1  HIGHEST"]
+    NT_Q{"nextTick queue<br/>empty?"}
+    NT_RUN["▶ Run one nextTick callback<br/>It may add more nextTick items<br/>or new Promise callbacks"]
 
-    subgraph PM_LOOP ["Promise Microtask Queue — Priority 2"]
-        PM_CHECK{"Promise queue<br/>empty?"}
-        PM_RUN["Run next Promise.then callback<br/>May add more nextTick or Promises"]
-        PM_CHECK -->|"Not empty"| PM_RUN --> PM_CHECK
-    end
+    S2_LABEL["② Promise Queue  —  Priority 2"]
+    PM_Q{"Promise queue<br/>empty?"}
+    PM_RUN["▶ Run one Promise.then callback<br/>It may add more Promise items<br/>or new nextTick callbacks"]
 
-    subgraph RECHECK ["Re-check: new nextTick added during Promise drain?"]
-        RC{"nextTick<br/>queue empty?"}
-    end
+    S3_LABEL["③ Re-check nextTick<br/>(a Promise callback may have added new items)"]
+    RC_Q{"nextTick queue<br/>clear?"}
 
-    ENTER --> NT_CHECK
-    NT_CHECK -->|"Empty ✓"| PM_CHECK
-    PM_CHECK -->|"Empty ✓"| RC
-    RC -->|"Not empty — loop back up!"| NT_CHECK
-    RC -->|"Empty — all clear ✓"| DONE(["Proceed to Phase N+1"])
+    DONE(["✅ Both queues empty<br/>― proceed to Phase N+1 ―"])
+    STARVE["⚠️ STARVATION RISK<br/>If nextTick keeps adding<br/>more nextTick callbacks,<br/>the loop never exits Step ①<br/>and Phase N+1 never starts"]
 
-    NT_CHECK -. "⚠️ Infinite nextTick recursion<br/>starves I/O — never reaches Promise queue<br/>or Phase N+1" .-> PM_CHECK
+    START --> S1_LABEL
+    S1_LABEL --> NT_Q
+    NT_Q -->|"Not empty — run it"| NT_RUN
+    NT_RUN --> NT_Q
+    NT_Q -->|"Empty ✓ — move on"| S2_LABEL
+    S2_LABEL --> PM_Q
+    PM_Q -->|"Not empty — run it"| PM_RUN
+    PM_RUN --> PM_Q
+    PM_Q -->|"Empty ✓ — check again"| S3_LABEL
+    S3_LABEL --> RC_Q
+    RC_Q -->|"New items added!<br/>Loop back to Step ①"| S1_LABEL
+    RC_Q -->|"Still empty ✓<br/>truly done"| DONE
+    NT_Q --- STARVE
 
-    style NT_CHECK fill:#b71c1c,color:#fff
-    style NT_RUN fill:#b71c1c,color:#fff
-    style PM_CHECK fill:#e65100,color:#fff
-    style PM_RUN fill:#e65100,color:#fff
-    style DONE fill:#1b5e20,color:#fff
+    style S1_LABEL fill:#ffcdd2,color:#c62828
+    style NT_Q fill:#ffcdd2,color:#c62828
+    style NT_RUN fill:#ffcdd2,color:#c62828
+    style S2_LABEL fill:#ffe0b2,color:#bf360c
+    style PM_Q fill:#ffe0b2,color:#bf360c
+    style PM_RUN fill:#ffe0b2,color:#bf360c
+    style S3_LABEL fill:#fff9c4,color:#f57f17
+    style RC_Q fill:#fff9c4,color:#f57f17
+    style DONE fill:#c8e6c9,color:#1b5e20
+    style STARVE fill:#fce4ec,color:#880e4f
+```
+
+**Concrete trace — what runs and in what order:**
+
+```js
+// Code:
+process.nextTick(() => console.log("A — nextTick 1"));
+Promise.resolve().then(() => {
+    console.log("B — Promise 1");
+    process.nextTick(() => console.log("C — nextTick added BY Promise")); // adds to nextTick!
+});
+process.nextTick(() => console.log("D — nextTick 2"));
+
+// Step ①: Drain nextTick queue
+//   → 'A — nextTick 1'   (was queued first)
+//   → 'D — nextTick 2'   (was queued second)
+//   → nextTick empty ✓
+//
+// Step ②: Drain Promise queue
+//   → 'B — Promise 1'    ← this also calls process.nextTick(C)!
+//   → Promise empty ✓
+//
+// Step ③: Re-check nextTick — found C! Loop back to Step ①
+//   → 'C — nextTick added BY Promise'
+//   → nextTick empty ✓, Promise empty ✓, re-check empty ✓  →  DONE
+//
+// Final output order:  A  →  D  →  B  →  C
 ```
 
 ---
@@ -524,6 +587,16 @@ graph TD
 ### Diagram 4: Poll Phase Deep Dive
 
 The Poll phase is the most important — it's where Node actually sleeps waiting for I/O. Its decision tree answers most "why doesn't my callback run?" questions.
+
+> **How to read this diagram:** This is the decision tree Node runs every time it enters the Poll phase.
+>
+> - **Top diamond** — Is there an I/O callback (fs.readFile, net.connect, etc.) ready in the queue?
+> - **Left path (blue nodes)** — Callbacks are ready: run them one at a time. After each, drain microtasks (pink). Exit left when the queue empties or a timer has expired.
+> - **Right path** — Queue is empty. Node must decide what to do next:
+>     - `setImmediate` registered? → Exit to Check phase immediately (skip sleeping).
+>     - Timers pending? → **Sleep** until the nearest timer deadline; OS wakes the process when I/O or the timer fires.
+>     - Nothing at all? → **Sleep indefinitely** — block until the OS reports any I/O event.
+> - **Green nodes** = sleeping states where Node consumes zero CPU. The OS scheduler handles the wakeup.
 
 ```mermaid
 graph TD
@@ -560,10 +633,10 @@ graph TD
     CB_READY -->|"Yes"| RUN_ONE
     CB_READY -->|"No"| HAS_IMM
 
-    style RUN_ONE fill:#1565c0,color:#fff
-    style DRAIN_A fill:#c62828,color:#fff
-    style SLEEP_T fill:#1b5e20,color:#fff
-    style SLEEP_INF fill:#1b5e20,color:#fff
+    style RUN_ONE fill:#bbdefb,color:#0d47a1
+    style DRAIN_A fill:#ffcdd2,color:#c62828
+    style SLEEP_T fill:#c8e6c9,color:#1b5e20
+    style SLEEP_INF fill:#c8e6c9,color:#1b5e20
 ```
 
 ---
@@ -582,6 +655,14 @@ console.log("6: sync end");
 // Output: 1 → 6 → 2 → 3 → 4 → 5
 ```
 
+> **How to read this diagram:** Each colored band is a distinct execution stage. Read top to bottom.
+>
+> - **Blue band** — Synchronous code runs on the call stack. Async calls are only _registered_ here — nothing executes yet. Produces output `1` then `6`.
+> - **Red band** — Microtask drain (runs before any event loop phase): `nextTick` fires first (output `2`), then the Promise callback (output `3`).
+> - **Purple band** — Timers phase: `setTimeout(0)` callback fires (output `4`).
+> - **Light green band** — Poll phase: no I/O pending; `setImmediate` is registered so Node exits Poll immediately without sleeping.
+> - **Darker green band** — Check phase: `setImmediate` callback fires (output `5`).
+
 ```mermaid
 sequenceDiagram
     participant S  as Call Stack
@@ -590,7 +671,7 @@ sequenceDiagram
     participant TQ as Timer Queue
     participant CQ as Check Queue
 
-    rect rgb(20, 50, 100)
+    rect rgb(213, 230, 255)
         Note over S,CQ: ── SYNCHRONOUS EXECUTION ──
         S->>S: console.log("1: sync start")  → OUTPUT: 1
         S->>NT: process.nextTick(cb)          → enqueued
@@ -601,7 +682,7 @@ sequenceDiagram
         Note over S: Call stack is now empty
     end
 
-    rect rgb(140, 20, 20)
+    rect rgb(255, 210, 210)
         Note over S,CQ: ── MICROTASK DRAIN (before any event loop phase) ──
         NT-->>S: nextTick callback fires       → OUTPUT: 2
         Note over NT: nextTick queue empty ✓
@@ -609,19 +690,19 @@ sequenceDiagram
         Note over PM: Promise queue empty ✓
     end
 
-    rect rgb(40, 30, 100)
+    rect rgb(220, 210, 255)
         Note over S,CQ: ── EVENT LOOP: TIMERS PHASE ──
         TQ-->>S: setTimeout(0) callback fires  → OUTPUT: 4
         Note over TQ: Timer queue empty ✓
     end
 
-    rect rgb(15, 55, 20)
+    rect rgb(210, 240, 210)
         Note over S,CQ: ── EVENT LOOP: POLL PHASE ──
         Note over S: No I/O pending
         Note over S: setImmediate registered → exit Poll immediately
     end
 
-    rect rgb(25, 80, 30)
+    rect rgb(195, 235, 197)
         Note over S,CQ: ── EVENT LOOP: CHECK PHASE ──
         CQ-->>S: setImmediate callback fires   → OUTPUT: 5
     end
@@ -632,6 +713,15 @@ sequenceDiagram
 ---
 
 ### Diagram 6: setTimeout(0) vs setImmediate — Why Order is Non-Deterministic
+
+When `setTimeout(fn, 0)` and `setImmediate(fn)` are registered in the **main module** (not inside an I/O callback), their execution order is unreliable — it depends on how long Node startup takes relative to the 1ms timer minimum.
+
+> **How to read this diagram:** Follow the branching paths from the startup decision diamond.
+>
+> - **Purple path** — Node startup took less than 1ms: the timer has not expired when the Timers phase runs, so the loop skips Timers → enters Poll → exits to Check → `setImmediate` fires first.
+> - **Blue path** — Node startup took more than 1ms: the timer is already expired when Timers runs → `setTimeout` fires first.
+> - **Orange box** = the non-deterministic zone — you cannot predict which path runs. This is why the order is unreliable in the main module.
+> - **Fix (bottom subgraph)** — Wrap both registrations inside an I/O callback (e.g., `fs.readFile`). You are already in the Poll phase when the callback runs, so after Poll ends, Check **always** comes next — `setImmediate` is **always** first, 100% deterministically.
 
 ```mermaid
 graph TD
@@ -657,15 +747,23 @@ graph TD
 
     INSIDE --> I3
 
-    style FAST fill:#6a1b9a,color:#fff
-    style SLOW fill:#1565c0,color:#fff
-    style I4 fill:#1b5e20,color:#fff
-    style ND fill:#e65100,color:#fff
+    style FAST fill:#e1bee7,color:#6a1b9a
+    style SLOW fill:#bbdefb,color:#0d47a1
+    style I4 fill:#c8e6c9,color:#1b5e20
+    style ND fill:#ffe0b2,color:#bf360c
 ```
 
 ---
 
 ### Diagram 7: Event Loop Starvation — Cause and Fix
+
+Starvation happens when one queue never stops growing, preventing the event loop from advancing to any other phase.
+
+> **How to read this diagram:** Compare the two subgraphs side by side.
+>
+> - **Red subgraph (Bad)** — `process.nextTick` calls itself recursively. Each callback schedules another before the microtask queue can empty. The event loop is stuck draining `nextTick` forever. `fs.readFile` callbacks and `setTimeout` callbacks highlighted in red are **permanently blocked**.
+> - **Green subgraph (Good)** — Work is split into fixed-size batches (e.g., 100 items at a time). After each batch, `setImmediate` schedules the next batch. This _yields_ back to the event loop between batches, letting I/O and timers run normally in the gaps.
+> - **Key rule**: Never use `process.nextTick` for iterative/recursive scheduling. Use `setImmediate` instead.
 
 ```mermaid
 graph TD
@@ -690,10 +788,10 @@ graph TD
         G1 --> G_IO --> G_TQ --> G2 --> G3 --> G1
     end
 
-    style STARVIO fill:#b71c1c,color:#fff
-    style STARVTQ fill:#b71c1c,color:#fff
-    style G_IO fill:#1b5e20,color:#fff
-    style G_TQ fill:#1b5e20,color:#fff
+    style STARVIO fill:#ffcdd2,color:#c62828
+    style STARVTQ fill:#ffcdd2,color:#c62828
+    style G_IO fill:#c8e6c9,color:#1b5e20
+    style G_TQ fill:#c8e6c9,color:#1b5e20
 ```
 
 ---
