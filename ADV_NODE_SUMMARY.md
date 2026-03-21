@@ -996,39 +996,49 @@ Node.js is famous for being "single-threaded," but that's only half the story. U
 graph TB
     EL["Event Loop<br/>(Main Thread)<br/>Your JavaScript runs here"]
 
-    subgraph ThreadPool ["libuv Thread Pool (default: 4 threads)"]
-        T1["Thread 1"]
-        T2["Thread 2"]
-        T3["Thread 3"]
-        T4["Thread 4"]
+    subgraph LIBUV ["libuv — shared C library (owns both sides below)"]
+        subgraph ThreadPool ["Thread Pool (default: 4 threads)<br/>for blocking OS calls"]
+            T1["Thread 1"]
+            T2["Thread 2"]
+            T3["Thread 3"]
+            T4["Thread 4"]
+            TQUEUE["Work Queue<br/>(pending tasks wait here<br/>when all threads are busy)"]
+        end
+
+        subgraph OSAsync ["OS Async Primitives<br/>(epoll / kqueue / IOCP — no pool needed)"]
+            Net["TCP/HTTP sockets"]
+            DNS2["dns.resolve()"]
+            Timers["setTimeout/setInterval"]
+        end
     end
 
-    subgraph OSAsync ["OS Async Primitives<br/>(no pool needed)"]
-        Net["TCP/HTTP sockets"]
-        DNS2["dns.resolve()"]
-        Timers["setTimeout/setInterval"]
-    end
+    FS["fs.readFile<br/>fs.writeFile"] --> TQUEUE
+    DNS["dns.lookup()"] --> TQUEUE
+    Crypto["crypto.pbkdf2<br/>crypto.randomBytes"] --> TQUEUE
+    Zlib["zlib.gzip<br/>zlib.deflate"] --> TQUEUE
 
-    FS["fs.readFile<br/>fs.writeFile"] --> T1
-    DNS["dns.lookup()"] --> T2
-    Crypto["crypto.pbkdf2<br/>crypto.randomBytes"] --> T3
-    Zlib["zlib.gzip<br/>zlib.deflate"] --> T4
+    TQUEUE --> T1
+    TQUEUE --> T2
+    TQUEUE --> T3
+    TQUEUE --> T4
 
     HTTP["http.get<br/>net.connect"] --> Net
     Resolve["dns.resolve4()"] --> DNS2
     Timer["setTimeout(cb)"] --> Timers
 
-    T1 --> EL
-    T2 --> EL
-    T3 --> EL
-    T4 --> EL
-    Net --> EL
-    DNS2 --> EL
-    Timers --> EL
+    T1 -->|"callback when done"| EL
+    T2 -->|"callback when done"| EL
+    T3 -->|"callback when done"| EL
+    T4 -->|"callback when done"| EL
+    Net -->|"callback when done"| EL
+    DNS2 -->|"callback when done"| EL
+    Timers -->|"callback when done"| EL
 
     style EL fill:#2196f3,color:#fff
+    style LIBUV fill:#fff3e0,color:#e65100
     style ThreadPool fill:#ffa726,color:#fff
     style OSAsync fill:#66bb6a,color:#fff
+    style TQUEUE fill:#ffe0b2,color:#bf360c
 ```
 
 ### Which APIs Use the Thread Pool?
@@ -4775,20 +4785,28 @@ graph TB
         end
 
         SAB["SharedArrayBuffer<br/>Shared Memory Region<br/>Access via Atomics"]
+
+        LIBUV["libuv (shared across ALL threads)<br/>Thread Pool · Timer Wheel · OS Async I/O<br/>Each thread has its own event loop<br/>but ALL share the same libuv instance"]
     end
 
     Main -->|"postMessage()<br/>(structured clone)"| W1
     Main -->|"postMessage()"| W2
     W1 -->|"parentPort.postMessage()"| Main
 
-    W1 -.->|"Direct memory access"| SAB
-    W2 -.->|"Direct memory access"| SAB
-    W3 -.->|"Direct memory access"| SAB
-    Main -.->|"Direct memory access"| SAB
+    W1 -.->|"Direct memory access<br/>(use Atomics!)"| SAB
+    W2 -.->|"Direct memory access<br/>(use Atomics!)"| SAB
+    W3 -.->|"Direct memory access<br/>(use Atomics!)"| SAB
+    Main -.->|"Direct memory access<br/>(use Atomics!)"| SAB
+
+    Main --- LIBUV
+    W1 --- LIBUV
+    W2 --- LIBUV
+    W3 --- LIBUV
 
     style Main fill:#2196f3,color:#fff
     style SAB fill:#ff9800,color:#fff
     style Workers fill:#66bb6a,color:#fff
+    style LIBUV fill:#fff3e0,color:#e65100
 ```
 
 ### Key APIs
