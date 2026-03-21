@@ -5473,7 +5473,9 @@ A:
 
 [↑ Back to Index](#table-of-contents)
 
---- Inter-thread / IPC Patterns
+---
+
+### 4.3 Inter-thread / IPC Patterns
 
 ### Concepts
 
