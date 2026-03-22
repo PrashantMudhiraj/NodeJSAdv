@@ -59,6 +59,26 @@ This document expands the workspace summary into practical, in-depth notes for e
 - 8.2 [Security Checklist & Hardening](#82-security-checklist--hardening) — OWASP, dependency scanning, CSP, input validation, secrets management
 - 8.3 [Observability: Tracing & APM](#83-observability-tracing--apm) — OpenTelemetry, distributed traces, correlation IDs, dashboards
 
+**Phase 9 — Scenario-Based Interview Questions**
+
+- S1 [Slow API — p99 latency 4s](#scenario-1-your-api-is-slow--p99-latency-is-4-seconds) — diagnose layer by layer, parallel calls, Redis cache
+- S2 [Slow Queue Consumer](#scenario-2-your-message-queue-consumer-is-slow--queue-backlog-is-growing) — concurrency, batch writes, horizontal scale
+- S3 [Memory Leak / OOM](#scenario-3-memory-usage-keeps-growing--suspected-memory-leak) — heapUsed monitoring, clinic.js, LRU cache, listener cleanup
+- S4 [Optimize for 50k req/s](#scenario-4-optimize-a-nodejs-api-handling-50000-requestssecond) — cluster, streaming, pooling, Worker Threads, queue offload
+- S5 [Circuit Breaker](#scenario-5-implement-a-circuit-breaker-for-an-external-api) — CLOSED → OPEN → HALF-OPEN state machine, implementation
+- S6 [WebSocket Drops](#scenario-6-your-websocket-server-drops-connections-under-load) — heartbeat ping/pong, LB timeout, Redis pub/sub cross-server
+- S7 [Duplicate Orders — Idempotency](#scenario-7-prevent-duplicate-order-processing--idempotency) — Idempotency-Key header, Redis SETEX, sequence diagram
+- S8 [OOM Killed](#scenario-8-your-nodejs-server-crashes-every-few-hours--oom-killed) — stream vs buffer, --max-old-space-size, PM2 max_memory_restart
+- S9 [Rate Limiter from Scratch](#scenario-9-design-an-api-rate-limiter-from-scratch) — sliding window, Redis sorted set, ZREMRANGEBYSCORE pipeline
+- S10 [Graceful Shutdown](#scenario-10-graceful-shutdown--zero-downtime-deploys) — SIGTERM, server.close, drain, forced timeout
+- S11 [Scale a Slow Endpoint](#scenario-11-a-slow-api-endpoint-is-bottlenecking-all-concurrent-requests--how-do-you-scale-it) — LB + cluster + p-limit + cache + async queue decision matrix
+- S12 [N+1 Query Problem](#scenario-12-your-graphql--rest-api-has-an-n1-query-problem) — batch fetch, DataLoader, WHERE IN, JOIN
+- S13 [JWT Auth + Token Refresh](#scenario-13-design-a-secure-jwt-authentication-flow-with-token-refresh) — access/refresh tokens, httpOnly cookie, Redis revocation
+- S14 [Cache Invalidation](#scenario-14-your-cache-is-serving-stale-data--cache-invalidation-strategy) — cache-aside, write-through, stampede protection, stale-while-revalidate
+- S15 [Large File Upload to S3](#scenario-15-stream-a-large-file-upload-directly-to-s3-without-buffering-in-memory) — pipe stream, multipart upload, never buffer
+- S16 [Correlation IDs / Request Tracing](#scenario-16-debug-a-request-that-fails-in-production-but-not-locally--correlation-ids) — AsyncLocalStorage, X-Request-ID, structured logs
+- S17 [Race Conditions in Node.js](#scenario-17-race-condition-in-nodejs--two-requests-read-then-write-the-same-record) — atomic SQL, SELECT FOR UPDATE, optimistic locking
+
 **Appendix**
 
 - A.1 [Quick Reference: Example Files](#a1-quick-reference-example-files) — workspace file index by topic
@@ -7955,11 +7975,2081 @@ app.use((req, res, next) => {
 > | HTTP/2 Multiplexing | Multiple requests over one TCP connection |
 > | HSTS | Forces HTTPS; prevents downgrade attacks |
 > | CORS | Server-side headers allowing cross-origin requests |
-> | Preflight (OPTIONS) | Browser check before non-simple cross-origin requests |
-> | helmet.js | One middleware for ~15 security headers |
-> | TLS/SSL | Encrypt in transit; use Let's Encrypt for free certs |
 
 [↑ Back to Index](#table-of-contents)
+
+---
+
+## Phase 9 — Scenario-Based Interview Questions
+
+These questions are asked in senior Node.js interviews. Each one is a real-world problem. The answer structure is always:
+**Diagnose → Root cause → Fix → Prevent**.
+
+---
+
+### Scenario 1: "Your API is slow — p99 latency is 4 seconds"
+
+**What the interviewer is testing:** Can you systematically diagnose a production performance problem without guessing?
+
+#### Diagnosis Flow
+
+```mermaid
+flowchart TD
+    SLOW["API p99 latency = 4s\nUsers complaining"] --> WHERE
+
+    WHERE{"Where is\nthe time spent?"}
+
+    WHERE -->|"Add timing logs\nor APM traces"| BREAKDOWN
+
+    BREAKDOWN["Measure each layer:\n① Network\n② Node.js handler\n③ DB query\n④ External API\n⑤ Cache"]
+
+    BREAKDOWN --> DB_SLOW{"DB query\n> 1s?"}
+    BREAKDOWN --> EXT_SLOW{"External API\ncall slow?"}
+    BREAKDOWN --> NODE_SLOW{"Node handler\nblocking event loop?"}
+    BREAKDOWN --> NOINDEX{"Missing\nindex?"}
+
+    DB_SLOW -->|"Yes"| FIX_DB["Add index\nOptimize query\nAdd Redis cache\nUse read replica"]
+    EXT_SLOW -->|"Yes"| FIX_EXT["Set timeout\nCircuit breaker\nCache external response\nAsync / queue it"]
+    NODE_SLOW -->|"Yes"| FIX_NODE["Move CPU work to\nWorker Thread\nBreak with setImmediate"]
+    NOINDEX -->|"Yes"| FIX_INDEX["EXPLAIN ANALYZE query\nAdd composite index"]
+
+    style SLOW fill:#ef5350,color:#fff
+    style FIX_DB fill:#66bb6a,color:#fff
+    style FIX_EXT fill:#66bb6a,color:#fff
+    style FIX_NODE fill:#66bb6a,color:#fff
+    style FIX_INDEX fill:#66bb6a,color:#fff
+```
+
+#### Step-by-step approach
+
+**Step 1 — Add timing to each layer**
+
+```js
+app.get("/orders/:id", async (req, res) => {
+    const t0 = Date.now();
+
+    const user = await db.getUser(req.userId);
+    console.log("db.getUser", Date.now() - t0, "ms");
+    const order = await db.getOrder(req.params.id);
+    console.log("db.getOrder", Date.now() - t0, "ms");
+    const tax = await taxApi.calculate(order);
+    console.log("taxApi", Date.now() - t0, "ms");
+
+    res.json({ order, tax });
+    console.log("total", Date.now() - t0, "ms");
+});
+// → pinpoints which call is slow in seconds
+```
+
+**Step 2 — Common root causes & fixes**
+
+| Root Cause                    | Symptom                             | Fix                               |
+| ----------------------------- | ----------------------------------- | --------------------------------- |
+| Missing DB index              | DB query > 500ms on large table     | `EXPLAIN ANALYZE` → add index     |
+| N+1 query                     | 100 small queries instead of 1      | JOIN or batch fetch               |
+| Blocking event loop           | All requests slow, not just one     | Move CPU work to Worker Thread    |
+| External API slow             | One downstream call causes timeout  | Circuit breaker + cache + timeout |
+| No connection pool            | New DB connection per request       | Use `pg-pool`, `mongoose` pooling |
+| Synchronous JSON.parse        | Large payload parsed on main thread | Stream + parse in Worker Thread   |
+| Cold start (Lambda/container) | First request slow                  | Keep-alive, pre-warm              |
+
+**Step 3 — Make independent calls parallel**
+
+```js
+// ❌ SLOW: 3 sequential DB calls = 300ms + 200ms + 150ms = 650ms
+const user = await db.getUser(id);
+const orders = await db.getOrders(id);
+const address = await db.getAddress(id);
+
+// ✅ FAST: all 3 parallel = max(300, 200, 150) = 300ms
+const [user, orders, address] = await Promise.all([
+    db.getUser(id),
+    db.getOrders(id),
+    db.getAddress(id),
+]);
+```
+
+**Step 4 — Add Redis caching**
+
+```js
+async function getUser(id) {
+    const cacheKey = `user:${id}`;
+    const cached = await redis.get(cacheKey);
+    if (cached) return JSON.parse(cached); // < 1ms
+
+    const user = await db.query("SELECT * FROM users WHERE id = $1", [id]); // ~200ms
+    await redis.setex(cacheKey, 300, JSON.stringify(user)); // cache 5 min
+    return user;
+}
+```
+
+**Interview One-Liner:** Measure first — add timing or APM. Find the bottleneck: DB (add index / cache), external API (timeout + circuit breaker), or CPU (Worker Thread).
+
+---
+
+### Scenario 2: "Your message queue consumer is slow — queue backlog is growing"
+
+**What the interviewer is testing:** Understanding of consumer scaling, backpressure, and queue architecture.
+
+#### Consumer Backlog Diagnosis
+
+```mermaid
+flowchart TD
+    BACKLOG["Queue backlog growing\nMessages piling up"] --> RATE
+
+    RATE{"Is consumer\nkeeping up?"}
+
+    RATE -->|"Consume rate < produce rate"| BOTTLENECK
+
+    BOTTLENECK{"Where is\nconsumer slow?"}
+
+    BOTTLENECK -->|"Each message takes too long"| MSGWORK["Each message does\nheavy CPU / IO work"]
+    BOTTLENECK -->|"Consumer is single-threaded"| NOCONC["Only 1 message\nprocessed at a time"]
+    BOTTLENECK -->|"DB write is slow"| DBWRITE["DB insert per message\nis bottleneck"]
+    BOTTLENECK -->|"External call per message"| EXTCALL["Calls 3rd party API\nper message"]
+
+    MSGWORK --> FIX1["Move work to\nWorker Thread Pool\nor child process"]
+    NOCONC --> FIX2["Increase concurrency:\nconsume N messages in parallel\nBullMQ concurrency option"]
+    DBWRITE --> FIX3["Batch writes:\nbuffer 100 messages\nflush every 500ms"]
+    EXTCALL --> FIX4["Cache external calls\nBatch API calls\nCircuit breaker"]
+
+    FIX2 --> SCALE["Still too slow?\nScale consumers horizontally:\nRun on multiple servers"]
+
+    style BACKLOG fill:#ef5350,color:#fff
+    style FIX1 fill:#66bb6a,color:#fff
+    style FIX2 fill:#66bb6a,color:#fff
+    style FIX3 fill:#66bb6a,color:#fff
+    style FIX4 fill:#66bb6a,color:#fff
+    style SCALE fill:#42a5f5,color:#fff
+```
+
+#### Fix 1 — Increase consumer concurrency (BullMQ)
+
+```js
+// ❌ Default: processes 1 job at a time = slow
+queue.process(async (job) => {
+    await sendEmail(job.data);
+});
+
+// ✅ Process 10 jobs concurrently (10x throughput for I/O-bound work)
+queue.process(10, async (job) => {
+    await sendEmail(job.data);
+});
+// Rule of thumb: concurrency = number of I/O operations you can run in parallel
+// For CPU-bound: concurrency = number of CPU cores
+```
+
+#### Fix 2 — Batch writes instead of one-by-one
+
+```js
+// ❌ SLOW: One DB insert per message = 1000 round-trips for 1000 messages
+consumer.on("message", async (msg) => {
+    await db.insert("events", msg);
+});
+
+// ✅ FAST: Buffer 500 messages → one bulk INSERT
+const buffer = [];
+consumer.on("message", (msg) => {
+    buffer.push(msg);
+    if (buffer.length >= 500) flush();
+});
+setInterval(flush, 500); // also flush every 500ms even if buffer not full
+
+async function flush() {
+    if (!buffer.length) return;
+    const batch = buffer.splice(0, buffer.length);
+    await db.bulkInsert("events", batch);
+    // 1 round-trip for 500 rows vs 500 round-trips
+}
+```
+
+#### Fix 3 — Scale horizontally
+
+```bash
+# Run 4 consumer processes in parallel (PM2)
+pm2 start consumer.js -i 4
+
+# Or with Docker
+docker-compose up --scale consumer=8
+```
+
+**Interview One-Liner:** Increase concurrency for I/O-bound work. Batch DB writes. Scale consumers horizontally. Use dead-letter queue for failed messages to avoid blocking the healthy ones.
+
+---
+
+### Scenario 3: "Memory usage keeps growing — suspected memory leak"
+
+**What the interviewer is testing:** How to detect a Node.js memory leak without crashing production.
+
+#### Memory Leak Diagnosis Flow
+
+```mermaid
+flowchart TD
+    LEAK["Memory grows\nnever drops\nprocess eventually OOM crashes"] --> CONFIRM
+
+    CONFIRM["Confirm it is a leak\nnot just expected growth:\nWatch via process.memoryUsage\nor clinic.js heap tool"]
+
+    CONFIRM --> TYPE{"What type\nof leak?"}
+
+    TYPE -->|"Heap grows"| HEAP["Heap leak:\nJS objects not GC'd"]
+    TYPE -->|"RSS grows, heap stable"| NATIVE["Native / Buffer leak:\nC++ or Buffer.slice held"]
+    TYPE -->|"Connections grow"| CONN["Connection leak:\nDB/Redis connections not released"]
+
+    HEAP --> CLUES["Common causes:\n• Global arrays/maps accumulating data\n• Event listeners not removed\n• Closure capturing large objects\n• Cache with no eviction policy"]
+
+    NATIVE --> CLUES2["Common causes:\n• Buffer.slice keeping parent alive\n• Native addon not releasing memory\n• Stream not destroyed on error"]
+
+    CONN --> CLUES3["Common causes:\n• await db.getConnection() without release\n• try/catch swallowing release call\n• Event emitter with many listeners"]
+
+    CLUES --> TOOLS["Tools:\nclinic.js heap\nnode --inspect + Chrome DevTools heap snapshot\nprocess.memoryUsage every 30s"]
+    CLUES2 --> TOOLS
+    CLUES3 --> TOOLS
+
+    style LEAK fill:#ef5350,color:#fff
+    style TOOLS fill:#42a5f5,color:#fff
+```
+
+#### Detecting the leak
+
+```js
+// Step 1: Log memory every 30s — look for constant upward trend
+setInterval(() => {
+    const m = process.memoryUsage();
+    console.log({
+        heapUsedMB: (m.heapUsed / 1024 / 1024).toFixed(1),
+        heapTotalMB: (m.heapTotal / 1024 / 1024).toFixed(1),
+        rssMB: (m.rss / 1024 / 1024).toFixed(1),
+        externalMB: (m.external / 1024 / 1024).toFixed(1), // Buffers live here
+    });
+}, 30_000);
+
+// Step 2: clinic.js heap (captures full heap snapshot)
+// npx clinic heap -- node server.js
+// Load test → open report → see which object type grows
+```
+
+#### Common leaks and fixes
+
+```js
+// ❌ LEAK 1: Global cache with no eviction
+const cache = {};
+app.get("/user/:id", async (req, res) => {
+    cache[req.params.id] = await db.getUser(req.params.id);
+    // cache grows forever — millions of keys after days of traffic
+});
+
+// ✅ FIX: Use LRU cache with max size
+const LRU = require("lru-cache");
+const cache = new LRU({ max: 10_000, ttl: 1000 * 60 * 5 }); // max 10k items, 5min TTL
+
+// ❌ LEAK 2: Event listener accumulates on every request
+app.get("/stream", (req, res) => {
+    emitter.on("data", (data) => res.write(data)); // listener added every request!
+    // listeners accumulate — 10k requests = 10k listeners on same emitter
+});
+
+// ✅ FIX: Remove listener when connection closes
+app.get("/stream", (req, res) => {
+    const handler = (data) => res.write(data);
+    emitter.on("data", handler);
+    req.on("close", () => emitter.off("data", handler)); // clean up on disconnect
+});
+
+// ❌ LEAK 3: Buffer.slice keeps parent alive
+function processChunk(bigBuffer) {
+    const header = bigBuffer.slice(0, 16); // 16-byte slice holds 10MB parent alive!
+    return header;
+}
+
+// ✅ FIX: Copy only what you need
+function processChunk(bigBuffer) {
+    return Buffer.from(bigBuffer.slice(0, 16)); // independent copy — parent can be GC'd
+}
+
+// ❌ LEAK 4: DB connection not released in error path
+async function getUser(id) {
+    const conn = await pool.getConnection();
+    const user = await conn.query("SELECT * FROM users WHERE id = ?", [id]);
+    conn.release(); // ← NOT called if query throws!
+    return user;
+}
+
+// ✅ FIX: Always release in finally
+async function getUser(id) {
+    const conn = await pool.getConnection();
+    try {
+        return await conn.query("SELECT * FROM users WHERE id = ?", [id]);
+    } finally {
+        conn.release(); // always runs — even if query throws
+    }
+}
+```
+
+**Interview One-Liner:** Monitor `process.memoryUsage().heapUsed` over time. Use `clinic.js heap` or Chrome DevTools heap snapshot to find which object type grows. Common causes: unbounded cache, event listeners not removed, Buffer.slice retaining parents, connections not released in finally blocks.
+
+---
+
+### Scenario 4: "Optimize a Node.js API handling 50,000 requests/second"
+
+**What the interviewer is testing:** Holistic performance thinking — not just code, but architecture.
+
+#### Optimization Layers
+
+```mermaid
+flowchart LR
+    REQ["50k req/s\nTarget"] --> L1
+
+    subgraph L1["Layer 1: Reverse Proxy / Edge"]
+        RP["nginx / Cloudflare\n• TLS termination\n• Static file serving\n• Rate limiting\n• Cache static responses"]
+    end
+
+    subgraph L2["Layer 2: Node.js App"]
+        APP["Cluster mode (N cores)\n• Async everywhere\n• Connection pooling\n• No blocking main thread\n• stream large responses"]
+    end
+
+    subgraph L3["Layer 3: Cache"]
+        CACHE["Redis\n• Cache DB reads\n• Session store\n• Rate limit counters\n• Pub/Sub for real-time"]
+    end
+
+    subgraph L4["Layer 4: Database"]
+        DB["PostgreSQL / MySQL\n• Indexes on hot queries\n• Read replicas\n• Connection pool (20-50)\n• Bulk insert for writes"]
+    end
+
+    subgraph L5["Layer 5: Async / Queue"]
+        Q["BullMQ / Kafka\n• Offload non-critical work\n• Email, push notif, analytics\n• Retry + DLQ"]
+    end
+
+    L1 --> L2 --> L3 --> L4
+    L2 --> L5
+
+    style L1 fill:#ff9800,color:#fff
+    style L2 fill:#42a5f5,color:#fff
+    style L3 fill:#ef5350,color:#fff
+    style L4 fill:#ab47bc,color:#fff
+    style L5 fill:#26a69a,color:#fff
+```
+
+#### Practical checklist
+
+```js
+// 1. Use cluster to use all CPU cores
+const cluster = require("cluster");
+const os = require("os");
+if (cluster.isMaster) {
+    os.cpus().forEach(() => cluster.fork());
+} else {
+    require("./server"); // each worker runs the HTTP server
+}
+
+// 2. Never block the event loop
+// ❌ BAD
+app.get("/report", (req, res) => {
+    const result = computeHeavyReport(); // blocks for 800ms — all requests stall
+    res.json(result);
+});
+// ✅ GOOD
+app.get("/report", async (req, res) => {
+    const result = await runInWorkerThread(computeHeavyReport); // or queue it
+    res.json(result);
+});
+
+// 3. Stream large responses — don't buffer
+app.get("/export", async (req, res) => {
+    res.setHeader("Content-Type", "application/json");
+    const cursor = db.queryStream("SELECT * FROM orders"); // DB cursor, not all at once
+    cursor.pipe(res); // stream rows directly to client
+});
+
+// 4. Connection pool — share connections across requests
+const pool = new Pool({ max: 20 }); // 20 DB connections shared across all requests
+
+// 5. Compression — reduce bytes sent
+const compression = require("compression");
+app.use(compression()); // gzip all responses > 1KB automatically
+
+// 6. Set timeouts — never wait forever
+const signal = AbortSignal.timeout(3000);
+const response = await fetch("https://api.partner.com/data", { signal });
+// Throws after 3s instead of hanging the request
+```
+
+**Performance checklist table**
+
+| Optimization                                       | Impact        | Effort   |
+| -------------------------------------------------- | ------------- | -------- |
+| Redis cache for hot DB reads                       | ⬆⬆⬆ Very high | Low      |
+| Cluster mode (use all cores)                       | ⬆⬆ High       | Very low |
+| Parallel `Promise.all` instead of sequential await | ⬆⬆ High       | Low      |
+| DB indexes on filter/sort columns                  | ⬆⬆⬆ Very high | Low      |
+| Stream large responses                             | ⬆⬆ High       | Medium   |
+| Offload CPU work to Worker Thread                  | ⬆⬆ High       | Medium   |
+| Connection pooling                                 | ⬆⬆ High       | Low      |
+| gzip compression                                   | ⬆ Medium      | Very low |
+| HTTP/2 multiplexing                                | ⬆ Medium      | Medium   |
+| Read replicas for DB                               | ⬆⬆ High       | High     |
+
+**Interview One-Liner:** Cache at every layer (CDN → Redis → DB). Use cluster for CPU cores. Stream large data. Pool connections. Move CPU work to Worker Threads. Offload background jobs to a queue.
+
+---
+
+### Scenario 5: "Implement a circuit breaker for an external API"
+
+**What the interviewer is testing:** Resilience patterns — how to stop cascading failures.
+
+#### Circuit Breaker State Machine
+
+```mermaid
+flowchart TD
+    CLOSED["🟢 CLOSED\nNormal operation\nRequests go through\nFailure counter tracked"]
+
+    OPEN["🔴 OPEN\nCircuit tripped!\nAll requests FAIL FAST\nNo calls to external API\nResetTimeout running"]
+
+    HALF["🟡 HALF-OPEN\nTest mode:\n1 probe request allowed\nIf success → CLOSED\nIf fail → back to OPEN"]
+
+    CLOSED -->|"Failures exceed threshold\ne.g. 5 failures in 10s"| OPEN
+    OPEN -->|"Reset timeout expires\ne.g. after 30s"| HALF
+    HALF -->|"Probe request succeeds"| CLOSED
+    HALF -->|"Probe request fails"| OPEN
+
+    style CLOSED fill:#66bb6a,color:#fff
+    style OPEN fill:#ef5350,color:#fff
+    style HALF fill:#ff9800,color:#fff
+```
+
+#### Implementation
+
+```js
+class CircuitBreaker {
+    constructor(
+        fn,
+        { threshold = 5, timeout = 30_000, resetAfter = 60_000 } = {},
+    ) {
+        this.fn = fn; // the function to protect (e.g. fetch call)
+        this.threshold = threshold; // failures before OPEN
+        this.timeout = timeout; // request timeout in ms
+        this.resetAfter = resetAfter; // how long to stay OPEN before trying half-open
+        this.failures = 0;
+        this.state = "CLOSED"; // CLOSED | OPEN | HALF_OPEN
+        this.nextAttempt = Date.now();
+    }
+
+    async call(...args) {
+        if (this.state === "OPEN") {
+            if (Date.now() < this.nextAttempt) {
+                throw new Error(
+                    "Circuit OPEN — failing fast, not calling external API",
+                );
+            }
+            this.state = "HALF_OPEN"; // timeout expired — let one probe through
+        }
+
+        try {
+            // Wrap the call with a timeout
+            const result = await Promise.race([
+                this.fn(...args),
+                new Promise((_, reject) =>
+                    setTimeout(
+                        () => reject(new Error("Timeout")),
+                        this.timeout,
+                    ),
+                ),
+            ]);
+
+            // Success — reset
+            this.failures = 0;
+            this.state = "CLOSED";
+            return result;
+        } catch (err) {
+            this.failures++;
+            if (this.failures >= this.threshold || this.state === "HALF_OPEN") {
+                this.state = "OPEN";
+                this.nextAttempt = Date.now() + this.resetAfter;
+                console.error(`Circuit OPENED after ${this.failures} failures`);
+            }
+            throw err;
+        }
+    }
+}
+
+// Usage
+const breaker = new CircuitBreaker(
+    (id) => fetch(`https://partner.api/user/${id}`).then((r) => r.json()),
+    { threshold: 5, timeout: 3000, resetAfter: 30_000 },
+);
+
+app.get("/user/:id", async (req, res, next) => {
+    try {
+        const user = await breaker.call(req.params.id);
+        res.json(user);
+    } catch (err) {
+        if (err.message.startsWith("Circuit OPEN")) {
+            return res
+                .status(503)
+                .json({ error: "Service temporarily unavailable" });
+        }
+        next(err);
+    }
+});
+```
+
+**Interview One-Liner:** Circuit breaker wraps external calls. After N failures it OPENS — all requests fail fast without hitting the dead service. After a reset timeout it goes HALF-OPEN and lets one probe through. Success → CLOSED. Failure → back to OPEN.
+
+---
+
+### Scenario 6: "Your WebSocket server drops connections under load"
+
+**What the interviewer is testing:** WebSocket scaling knowledge and connection management.
+
+#### WebSocket Drop Diagnosis
+
+```mermaid
+flowchart TD
+    DROP["WebSocket connections\ndropping under load"] --> WHY
+
+    WHY{"Root cause?"}
+
+    WHY -->|"Server memory exhausted"| MEM["Too many connections\nin memory on one server"]
+    WHY -->|"No heartbeat"| PING["Dead connections\nnot detected\naccumulating"]
+    WHY -->|"Load balancer timeout"| LB["LB closes idle\nWS connections\n(default 60s timeout)"]
+    WHY -->|"Single server"| SCALE["Can't scale WS\nacross servers\nwithout shared pub/sub"]
+
+    MEM --> FIX1["Horizontal scale:\nDistribute connections\nacross multiple servers"]
+    PING --> FIX2["Implement heartbeat:\nping every 30s\nclose dead sockets"]
+    LB --> FIX3["Set LB idle timeout\nto 3600s for WS routes\nor use sticky sessions"]
+    SCALE --> FIX4["Redis Pub/Sub:\nbroadcast to all servers\nwho forward to their clients"]
+
+    style DROP fill:#ef5350,color:#fff
+    style FIX1 fill:#66bb6a,color:#fff
+    style FIX2 fill:#66bb6a,color:#fff
+    style FIX3 fill:#66bb6a,color:#fff
+    style FIX4 fill:#66bb6a,color:#fff
+```
+
+#### Heartbeat — detect and clean dead connections
+
+```js
+const WebSocket = require("ws");
+const wss = new WebSocket.Server({ port: 8080 });
+
+wss.on("connection", (ws) => {
+    ws.isAlive = true;
+
+    ws.on("pong", () => {
+        ws.isAlive = true; // client responded — connection is alive
+    });
+});
+
+// Ping all clients every 30s — terminate those that don't respond
+const heartbeat = setInterval(() => {
+    wss.clients.forEach((ws) => {
+        if (!ws.isAlive) {
+            console.log("Terminating dead connection");
+            return ws.terminate();
+        }
+        ws.isAlive = false;
+        ws.ping(); // ping → client MUST pong back
+    });
+}, 30_000);
+
+wss.on("close", () => clearInterval(heartbeat));
+```
+
+#### Scale across servers with Redis Pub/Sub
+
+```js
+// Server 1 has User A's socket. Server 2 has User B's socket.
+// When User A sends a message — Server 1 publishes to Redis.
+// Server 2 subscribes — forwards to User B's socket.
+
+const redis = require("redis");
+const pub = redis.createClient();
+const sub = redis.createClient();
+
+sub.subscribe("chat:room:1");
+sub.on("message", (channel, msg) => {
+    // Forward to all clients connected to THIS server in this room
+    wss.clients.forEach((ws) => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+    });
+});
+
+wss.on("connection", (ws) => {
+    ws.on("message", (msg) => {
+        pub.publish("chat:room:1", msg); // broadcast to ALL servers
+    });
+});
+```
+
+**Interview One-Liner:** WebSocket drops are caused by dead connections (fix: heartbeat ping/pong every 30s), load balancer timeouts (fix: increase idle timeout), or single server limits (fix: horizontal scale + Redis pub/sub for cross-server broadcast).
+
+---
+
+### Scenario 7: "Prevent duplicate order processing — idempotency"
+
+**What the interviewer is testing:** Distributed systems correctness — handling retries safely.
+
+**Problem:** A client sends `POST /orders` → network error → client retries → you create the order twice. User is charged twice.
+
+#### Idempotency Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as Node.js API
+    participant Redis as Redis (idempotency keys)
+    participant DB as Database
+
+    C->>API: POST /orders\nIdempotency-Key: uuid-abc-123
+
+    API->>Redis: GET idempotency:uuid-abc-123
+
+    alt Key NOT found — first request
+        Redis-->>API: null
+        API->>DB: INSERT order (status=pending)
+        DB-->>API: order created
+        API->>Redis: SETEX idempotency:uuid-abc-123 86400 response_payload
+        API-->>C: 201 Created — order #456
+    else Key FOUND — duplicate request
+        Redis-->>API: cached response_payload
+        API-->>C: 201 Created — order #456 (same response, no duplicate)
+    end
+```
+
+#### Implementation
+
+```js
+async function idempotencyMiddleware(req, res, next) {
+    const key = req.headers["idempotency-key"];
+    if (!key) return next(); // idempotency is optional for GET requests
+
+    const cacheKey = `idempotency:${key}`;
+    const cached = await redis.get(cacheKey);
+
+    if (cached) {
+        // Duplicate request — return stored response, do nothing else
+        const { status, body } = JSON.parse(cached);
+        return res.status(status).json(body);
+    }
+
+    // First request — intercept the response to store it
+    const originalJson = res.json.bind(res);
+    res.json = (body) => {
+        // Store the response for 24 hours (86400 seconds)
+        redis.setex(
+            cacheKey,
+            86_400,
+            JSON.stringify({
+                status: res.statusCode,
+                body,
+            }),
+        );
+        return originalJson(body);
+    };
+
+    next();
+}
+
+app.post("/orders", idempotencyMiddleware, async (req, res) => {
+    const order = await db.createOrder(req.body);
+    res.status(201).json(order);
+    // If client retries with same Idempotency-Key → same response, no duplicate order
+});
+```
+
+**Interview One-Liner:** Clients send a unique `Idempotency-Key` header. Server stores the response in Redis with that key (TTL 24h). On retry, return the stored response immediately without re-processing. Database `ON CONFLICT DO NOTHING` as a second safety layer.
+
+---
+
+### Scenario 8: "Your Node.js server crashes every few hours — OOM Killed"
+
+**What the interviewer is testing:** Memory management and production reliability.
+
+#### OOM Diagnosis & Fix
+
+```mermaid
+flowchart TD
+    OOM["Process killed by OS\n'Killed' in logs\nor exit code 137"] --> CONFIRM
+
+    CONFIRM["Check:\ndmesg | grep -i 'out of memory'\nor container logs"] --> CAUSE
+
+    CAUSE{"Memory growth\npattern?"}
+
+    CAUSE -->|"Gradual growth over hours"| LEAK["Memory leak\n→ see Scenario 3"]
+    CAUSE -->|"Spike on large requests"| LARGE["Large payload\nbuffered in memory"]
+    CAUSE -->|"Constant high usage"| LIMIT["Heap limit reached\ndefault ~1.5GB"]
+
+    LARGE --> FIX_LARGE["Stream large files\nDon't JSON.parse 100MB strings\nUse multipart streaming upload"]
+    LIMIT --> FIX_LIMIT["Increase: node --max-old-space-size=4096\nOr add more RAM\nOr horizontally scale"]
+    LEAK --> FIX_LEAK["Find and fix leak\nRestart on schedule as interim:\nPM2 --max-memory-restart 500M"]
+
+    style OOM fill:#ef5350,color:#fff
+    style FIX_LARGE fill:#66bb6a,color:#fff
+    style FIX_LIMIT fill:#66bb6a,color:#fff
+    style FIX_LEAK fill:#66bb6a,color:#fff
+```
+
+```js
+// Interim fix: PM2 auto-restart when memory exceeds limit
+// ecosystem.config.js
+module.exports = {
+    apps: [
+        {
+            name: "api",
+            script: "server.js",
+            max_memory_restart: "500M", // restart before OOM kill
+            instances: "max", // cluster mode — other workers handle requests during restart
+            exp_backoff_restart_delay: 100,
+        },
+    ],
+};
+
+// Proper fix: never buffer large data
+// ❌ BAD — reads entire file into memory
+app.post("/upload", async (req, res) => {
+    const data = await streamToBuffer(req); // 500MB in RAM
+    await s3.put(data);
+});
+
+// ✅ GOOD — stream directly to S3 without buffering
+app.post("/upload", (req, res) => {
+    const upload = s3.upload({ Bucket: "my-bucket", Key: uuid(), Body: req }); // req is a stream
+    upload.promise().then(() => res.json({ ok: true }));
+});
+```
+
+**Interview One-Liner:** OOM = either a memory leak (fix: find root cause with clinic.js heap), large payload buffered in memory (fix: stream it), or heap limit too low (fix: increase `--max-old-space-size`). Use PM2 `max_memory_restart` as a safety net while investigating.
+
+---
+
+### Scenario 9: "Design an API rate limiter from scratch"
+
+**What the interviewer is testing:** Redis data structure knowledge and distributed system design.
+
+#### Algorithm Comparison
+
+| Algorithm      | Behavior                     | Burst allowed?                 | Complexity |
+| -------------- | ---------------------------- | ------------------------------ | ---------- |
+| Fixed window   | 100 req per minute window    | Yes — burst at window boundary | Simple     |
+| Sliding window | 100 req in any 60s window    | Controlled                     | Medium     |
+| Token bucket   | N tokens refilled per second | Yes — up to bucket size        | Medium     |
+| Leaky bucket   | Constant output rate         | No                             | Medium     |
+
+#### Sliding Window with Redis
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant MW as Rate Limiter Middleware
+    participant R as Redis (sorted set)
+
+    C->>MW: POST /api/checkout
+    MW->>R: ZREMRANGEBYSCORE ip:1.2.3.4 0 (now - 60s)
+    MW->>R: ZCARD ip:1.2.3.4
+    R-->>MW: count = 87
+
+    alt count < 100 (limit)
+        MW->>R: ZADD ip:1.2.3.4 now now:uuid
+        MW->>R: EXPIRE ip:1.2.3.4 60
+        MW-->>C: 200 OK (pass through to handler)
+    else count >= 100
+        MW-->>C: 429 Too Many Requests\nRetry-After: 14s
+    end
+```
+
+```js
+async function rateLimiter(req, res, next) {
+    const key = `rate:${req.ip}`;
+    const limit = 100; // max requests
+    const window = 60; // per 60 seconds
+    const now = Date.now();
+    const cutoff = now - window * 1000;
+
+    const pipeline = redis.pipeline();
+    pipeline.zremrangebyscore(key, 0, cutoff); // remove old entries
+    pipeline.zcard(key); // count remaining
+    pipeline.zadd(key, now, `${now}:${Math.random()}`); // add this request
+    pipeline.expire(key, window); // auto-expire the key
+    const results = await pipeline.exec();
+
+    const count = results[1][1]; // zcard result
+
+    res.setHeader("X-RateLimit-Limit", limit);
+    res.setHeader("X-RateLimit-Remaining", Math.max(0, limit - count));
+
+    if (count > limit) {
+        return res.status(429).json({
+            error: "Too many requests",
+            retryAfter: `${window}s`,
+        });
+    }
+    next();
+}
+
+app.use("/api/", rateLimiter);
+```
+
+**Interview One-Liner:** Sliding window rate limiter uses a Redis sorted set per IP. Score = timestamp. Remove entries older than the window. If count exceeds limit, return 429. All Redis ops in a pipeline = one round-trip.
+
+---
+
+### Scenario 10: "Graceful shutdown — zero downtime deploys"
+
+**What the interviewer is testing:** Production operations and DevOps mindset.
+
+#### Graceful Shutdown Flow
+
+```mermaid
+sequenceDiagram
+    participant K8s as Kubernetes / PM2
+    participant Server as Node.js Server
+    participant LB as Load Balancer
+    participant Client as Active Request
+
+    K8s->>Server: SIGTERM (deploy triggered)
+    Server->>LB: Stop accepting new connections
+    Server->>Server: Set status = draining
+
+    Note over Server,Client: In-flight requests complete normally
+
+    Client->>Server: GET /api/data (already in progress)
+    Server-->>Client: 200 OK (finished before timeout)
+
+    Server->>Server: Close DB pool\nClose Redis connections\nFlush logs
+
+    Server->>K8s: process.exit(0) — clean shutdown
+
+    Note over K8s: New version starts\nLB routes to new pods
+```
+
+```js
+const server = app.listen(3000);
+let isShuttingDown = false;
+
+// Health check — load balancer stops sending traffic immediately
+app.get("/health", (req, res) => {
+    if (isShuttingDown)
+        return res.status(503).json({ status: "shutting down" });
+    res.json({ status: "ok" });
+});
+
+async function gracefulShutdown(signal) {
+    console.log(`Received ${signal}. Starting graceful shutdown...`);
+    isShuttingDown = true;
+
+    // Step 1: Stop accepting new connections
+    server.close(async () => {
+        console.log("HTTP server closed — no new connections accepted");
+
+        // Step 2: Wait for in-flight requests then close resources
+        try {
+            await db.pool.end(); // wait for DB queries to finish, close pool
+            await redisClient.quit(); // flush Redis operations, disconnect
+            console.log("All connections closed. Exiting cleanly.");
+            process.exit(0);
+        } catch (err) {
+            console.error("Error during shutdown:", err);
+            process.exit(1);
+        }
+    });
+
+    // Force exit if graceful shutdown takes too long (K8s default terminationGracePeriod = 30s)
+    setTimeout(() => {
+        console.error("Shutdown timeout — forcing exit");
+        process.exit(1);
+    }, 25_000); // 25s < 30s so K8s doesn't SIGKILL us
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM")); // Kubernetes / PM2
+process.on("SIGINT", () => gracefulShutdown("SIGINT")); // Ctrl+C in dev
+```
+
+**Interview One-Liner:** On `SIGTERM`: mark server as draining (health check returns 503 so LB stops routing traffic), stop accepting new connections via `server.close()`, wait for in-flight requests to finish, close DB pool and Redis, then `process.exit(0)`. Add a forced timeout shorter than Kubernetes' `terminationGracePeriodSeconds`.
+
+---
+
+### Scenario 11: "A slow API endpoint is bottlenecking all concurrent requests — how do you scale it?"
+
+**What the interviewer is testing:** Your understanding of concurrency, horizontal scaling, load balancing, clustering, and request isolation. This is the most holistic Node.js scaling question.
+
+#### The Core Problem
+
+A single Node.js process is single-threaded. If one endpoint takes 2 seconds to respond, and 200 requests arrive per second, the queue of waiting requests grows endlessly on that one process.
+
+```mermaid
+flowchart TD
+    PROB["Single Node.js process\nSlow endpoint: 2s per req\n200 req/s arriving\nQueue builds → timeouts → 503s"]
+
+    PROB --> LAYERS
+
+    LAYERS{"Which layers\ncan absorb more load?"}
+
+    LAYERS --> L1["Layer 1\nReverse Proxy / Load Balancer"]
+    LAYERS --> L2["Layer 2\nNode.js — use all CPU cores"]
+    LAYERS --> L3["Layer 3\nIsolate the slow endpoint"]
+    LAYERS --> L4["Layer 4\nCache — avoid doing the work at all"]
+    LAYERS --> L5["Layer 5\nAsync queue — decouple request from processing"]
+
+    L1 --> F1["nginx / HAProxy / AWS ALB\nRound-robin across N Node instances\nEach instance handles its own queue"]
+    L2 --> F2["cluster module or PM2\n1 process per CPU core\n8 cores = 8× throughput"]
+    L3 --> F3["Worker Thread for CPU work\nAsync non-blocking I/O\nSet per-endpoint timeout"]
+    L4 --> F4["Redis cache slow result\nReturn cached in <1ms\nCache key = request params hash"]
+    L5 --> F5["Accept → return jobId (202)\nProcess in background queue\nClient polls or uses WebSocket"]
+
+    style PROB fill:#ef5350,color:#fff
+    style F1 fill:#ff9800,color:#fff
+    style F2 fill:#42a5f5,color:#fff
+    style F3 fill:#ab47bc,color:#fff
+    style F4 fill:#ef5350,color:#fff
+    style F5 fill:#26a69a,color:#fff
+```
+
+---
+
+#### Step 1 — Horizontal Scaling with a Load Balancer
+
+Deploy multiple Node instances behind nginx. Each one independently handles requests. If one is busy, others pick up new ones.
+
+```mermaid
+flowchart LR
+    C1[Client A] --> LB
+    C2[Client B] --> LB
+    C3[Client C] --> LB
+    C4[Client D] --> LB
+
+    LB["nginx\nLoad Balancer\nport 80 / 443\nRound-robin"]
+
+    LB --> N1["Node :3001\nProcess 1"]
+    LB --> N2["Node :3002\nProcess 2"]
+    LB --> N3["Node :3003\nProcess 3"]
+    LB --> N4["Node :3004\nProcess 4"]
+
+    N1 --> DB[(PostgreSQL)]
+    N2 --> DB
+    N3 --> DB
+    N4 --> DB
+
+    N1 --> R[(Redis)]
+    N2 --> R
+    N3 --> R
+    N4 --> R
+
+    style LB fill:#ff9800,color:#fff
+    style N1 fill:#42a5f5,color:#fff
+    style N2 fill:#42a5f5,color:#fff
+    style N3 fill:#42a5f5,color:#fff
+    style N4 fill:#42a5f5,color:#fff
+    style DB fill:#ab47bc,color:#fff
+    style R fill:#ef5350,color:#fff
+```
+
+**nginx config for load balancing:**
+
+```nginx
+upstream nodeapp {
+    least_conn;                 # route to least busy server (better than round_robin for slow endpoints)
+    server 127.0.0.1:3001;
+    server 127.0.0.1:3002;
+    server 127.0.0.1:3003;
+    server 127.0.0.1:3004;
+    keepalive 32;               # keep connections alive — avoids TCP handshake per request
+}
+
+server {
+    listen 80;
+
+    location /api/ {
+        proxy_pass         http://nodeapp;
+        proxy_http_version 1.1;
+        proxy_set_header   Connection "";          # required for keepalive
+        proxy_read_timeout 30s;                    # fail fast if Node hangs
+        proxy_next_upstream error timeout;         # retry on another instance if one fails
+    }
+}
+```
+
+---
+
+#### Step 2 — Use All CPU Cores with Cluster Module
+
+One Node.js process uses only ONE core. On an 8-core machine you waste 7 cores unless you cluster.
+
+```mermaid
+flowchart TD
+    MASTER["Master Process\nPID 1000\nForks workers\nRestarts crashed workers\nHandles SIGTERM"]
+
+    MASTER --> W1["Worker 1\nCore 0\nport 3000"]
+    MASTER --> W2["Worker 2\nCore 1\nport 3000"]
+    MASTER --> W3["Worker 3\nCore 2\nport 3000"]
+    MASTER --> W4["Worker 4\nCore 3\nport 3000"]
+
+    OS["OS kernel\nRound-robins incoming\nconnections across workers"]
+
+    OS --> W1
+    OS --> W2
+    OS --> W3
+    OS --> W4
+
+    style MASTER fill:#ff9800,color:#fff
+    style W1 fill:#42a5f5,color:#fff
+    style W2 fill:#42a5f5,color:#fff
+    style W3 fill:#42a5f5,color:#fff
+    style W4 fill:#42a5f5,color:#fff
+    style OS fill:#66bb6a,color:#fff
+```
+
+```js
+// cluster.js — master + workers on same machine
+const cluster = require("cluster");
+const os = require("os");
+
+if (cluster.isPrimary) {
+    const numCPUs = os.cpus().length;
+    console.log(`Master PID ${process.pid} — forking ${numCPUs} workers`);
+
+    for (let i = 0; i < numCPUs; i++) cluster.fork();
+
+    // Auto-restart crashed workers
+    cluster.on("exit", (worker, code, signal) => {
+        console.log(
+            `Worker ${worker.process.pid} died (${signal || code}). Restarting...`,
+        );
+        cluster.fork();
+    });
+} else {
+    // Each worker runs the full HTTP server on the same port
+    // OS distributes incoming connections across workers
+    require("./server");
+    console.log(`Worker PID ${process.pid} started`);
+}
+
+// Or use PM2 (zero-config cluster):
+// pm2 start server.js -i max     ← -i max = 1 process per CPU core
+// pm2 start server.js -i 4       ← exactly 4 workers
+```
+
+---
+
+#### Step 3 — Isolate the Slow Endpoint (concurrency control)
+
+If one slow endpoint hogs all workers, fast endpoints suffer too. Control max concurrent slow requests.
+
+```mermaid
+flowchart LR
+    REQS["100 concurrent\n/report requests\n(each takes 2s)"] --> GATE
+
+    GATE["Concurrency Limiter\nmax 10 parallel\n90 wait in queue"]
+
+    GATE -->|"slot available"| WORK["Worker Thread\nPDF / Report\ngeneration"]
+    GATE -->|"queue full"| REJ["503 Service Busy\nretry-after header"]
+
+    WORK --> RESP["Response\nto client"]
+
+    style GATE fill:#ff9800,color:#fff
+    style WORK fill:#42a5f5,color:#fff
+    style REJ fill:#ef5350,color:#fff
+```
+
+```js
+// p-limit: control how many run simultaneously
+const pLimit = require("p-limit");
+const limit = pLimit(10); // at most 10 concurrent report generations
+
+app.get("/report", async (req, res) => {
+    try {
+        // If 10 are already running, this will queue until one finishes
+        const result = await limit(() => generateReport(req.query));
+        res.json(result);
+    } catch (err) {
+        res.status(503).json({ error: "Server busy, try again shortly" });
+    }
+});
+
+// Combining with a queue for persistence:
+// limit() = in-memory queue (lost on restart)
+// BullMQ  = persistent queue (survives restarts, retries on failure)
+```
+
+---
+
+#### Step 4 — Cache the Slow Result
+
+If the same slow query is called repeatedly with the same params, cache it. 200 req/s with 90% cache hit rate = only 20 real queries per second.
+
+```mermaid
+sequenceDiagram
+    participant C1 as Client 1
+    participant C2 as Client 2..200
+    participant MW as Cache Middleware
+    participant R as Redis
+    participant DB as Database (slow)
+
+    C1->>MW: GET /report?type=monthly&year=2026
+    MW->>R: GET cache:report:monthly:2026
+    R-->>MW: null (cache miss)
+    MW->>DB: SELECT ... (2 seconds)
+    DB-->>MW: 50,000 rows
+    MW->>R: SETEX cache:report:monthly:2026 300 result
+    MW-->>C1: 200 OK (2s)
+
+    Note over C2,R: Next 199 requests hit cache — <1ms each
+
+    C2->>MW: GET /report?type=monthly&year=2026
+    MW->>R: GET cache:report:monthly:2026
+    R-->>MW: cached result
+    MW-->>C2: 200 OK (<1ms)
+```
+
+```js
+// Cache middleware with request coalescing (stampede protection)
+const inFlight = new Map();
+
+async function withCache(key, ttl, fn) {
+    // 1. Check Redis
+    const cached = await redis.get(key);
+    if (cached) return JSON.parse(cached);
+
+    // 2. Stampede protection: if a request for this key is already in-flight,
+    //    wait for IT instead of all 50 clients hitting DB simultaneously
+    if (inFlight.has(key)) return inFlight.get(key);
+
+    // 3. First caller: run the actual work
+    const promise = fn().then((result) => {
+        redis.setex(key, ttl, JSON.stringify(result));
+        inFlight.delete(key);
+        return result;
+    });
+
+    inFlight.set(key, promise);
+    return promise;
+}
+
+app.get("/report", async (req, res) => {
+    const key = `report:${req.query.type}:${req.query.year}`;
+    const result = await withCache(key, 300, () =>
+        db.generateReport(req.query),
+    );
+    res.json(result);
+    // 200 simultaneous requests for same report → only 1 DB query
+});
+```
+
+---
+
+#### Step 5 — Decouple with Async Queue (Accept → Process → Notify)
+
+If the work is genuinely slow (10–60 seconds), don't make HTTP clients wait. Accept the request immediately, process in background, notify when done.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as Node.js API
+    participant Q as BullMQ (Redis)
+    participant W as Worker Pool
+    participant WS as WebSocket / Webhook
+
+    C->>API: POST /reports/generate\n{type: monthly, year: 2026}
+    API->>Q: enqueue job (jobId: abc-123)
+    API-->>C: 202 Accepted\n{jobId: "abc-123", status: "queued"}
+
+    Note over C: Client is free — not blocked
+
+    Q->>W: dequeue job abc-123
+    W->>W: generate report (30s)
+    W->>Q: job complete — result stored
+
+    Note over W,WS: Notify client
+    W->>WS: ws.send({ jobId, status: done, url: /reports/abc-123 })
+    C->>API: GET /reports/abc-123
+    API-->>C: 200 OK — report data
+```
+
+```js
+const { Queue, Worker } = require("bullmq");
+const reportQueue = new Queue("reports", { connection: redis });
+
+// Producer — API handler
+app.post("/reports/generate", async (req, res) => {
+    const job = await reportQueue.add("generate", req.body, {
+        attempts: 3,
+        backoff: { type: "exponential", delay: 2000 },
+    });
+    res.status(202).json({ jobId: job.id, status: "queued" });
+    // Returns in < 5ms — client is not blocked
+});
+
+// Consumer — runs in separate process or worker pool
+const worker = new Worker(
+    "reports",
+    async (job) => {
+        const result = await generateReport(job.data); // runs for 30s
+        await db.saveReport(job.id, result);
+        notifyClientViaWebSocket(job.data.userId, job.id); // push notification
+    },
+    {
+        connection: redis,
+        concurrency: 5, // 5 reports generated simultaneously
+    },
+);
+
+// Progress polling endpoint
+app.get("/reports/:jobId", async (req, res) => {
+    const job = await reportQueue.getJob(req.params.jobId);
+    if (!job) return res.status(404).json({ error: "Not found" });
+    const state = await job.getState(); // queued | active | completed | failed
+    if (state === "completed")
+        return res.json(await db.getReport(req.params.jobId));
+    res.status(202).json({ state, progress: job.progress });
+});
+```
+
+---
+
+#### Full Architecture — All Layers Working Together
+
+```mermaid
+flowchart TB
+    USERS["Thousands of clients\nslow endpoint requests"]
+
+    CDN["CDN / Cloudflare\nCache static + cacheable API responses\nDDoS protection, TLS"]
+
+    LB["nginx Load Balancer\nleast_conn algorithm\nhealth checks\nretry on failure"]
+
+    subgraph CLUSTER["Node.js Cluster — 1 process per CPU core"]
+        W1["Worker 1"]
+        W2["Worker 2"]
+        W3["Worker 3"]
+        W4["Worker 4"]
+    end
+
+    GATE["Concurrency Limiter\np-limit / semaphore\nper endpoint"]
+
+    subgraph CACHE["Cache Layer"]
+        REDIS["Redis\nL1: response cache\nL2: session store\nL3: rate limit counters"]
+    end
+
+    subgraph QUEUE["Async Queue"]
+        MQ["BullMQ\nBackground jobs\nRetry + DLQ\n5 concurrent workers"]
+    end
+
+    DB["PostgreSQL\nRead replicas\nConnection pool\nIndexes on hot columns"]
+
+    USERS --> CDN --> LB
+    LB --> W1 & W2 & W3 & W4
+    W1 & W2 & W3 & W4 --> GATE
+    GATE --> REDIS
+    REDIS -->|"cache miss"| DB
+    GATE -->|"slow work"| MQ
+    MQ --> DB
+
+    style CDN fill:#ff9800,color:#fff
+    style LB fill:#ff9800,color:#fff
+    style CLUSTER fill:#42a5f5,color:#fff
+    style GATE fill:#ab47bc,color:#fff
+    style CACHE fill:#ef5350,color:#fff
+    style QUEUE fill:#26a69a,color:#fff
+    style DB fill:#5c6bc0,color:#fff
+```
+
+---
+
+#### Decision Matrix — Which technique for which problem?
+
+| Problem                                | Solution                            | Result                           |
+| -------------------------------------- | ----------------------------------- | -------------------------------- |
+| One process, one core used             | `cluster` or PM2 `-i max`           | N× throughput (N = CPU cores)    |
+| One server can't handle traffic        | Load balancer + multiple servers    | Linear horizontal scale          |
+| Same slow query called by many clients | Redis cache (+ stampede protection) | ~1ms response after first caller |
+| Slow endpoint blocks fast ones         | `p-limit` concurrency limiter       | Fast endpoints unaffected        |
+| Work takes 10–60 seconds               | Async queue (BullMQ) + 202 response | Client never waits               |
+| CPU-bound work blocks event loop       | Worker Thread + `piscina` pool      | Main thread stays free           |
+| DB is the bottleneck                   | Read replicas + indexes + pooling   | DB scales independently          |
+| External API is slow                   | Cache response + circuit breaker    | External latency hidden          |
+
+**Interview One-Liner:** A slow endpoint scales through layers — reverse proxy (distribute traffic), cluster (use all cores), concurrency limiter (protect other endpoints), Redis cache (avoid the work entirely), and async queue (decouple request from processing so the client never waits for slow work).
+
+---
+
+### Scenario 12: "Your GraphQL / REST API has an N+1 query problem"
+
+**What the interviewer is testing:** Database query efficiency — one of the most common real-world performance bugs.
+
+**The problem:** Loading 10 posts, then fetching each post's author individually = 1 + 10 = 11 queries. With 100 posts = 101 queries. With 1000 users hitting it = 101,000 queries per second.
+
+#### N+1 Visualised
+
+```mermaid
+sequenceDiagram
+    participant API as Node.js API
+    participant DB as Database
+
+    Note over API,DB: ❌ N+1 PROBLEM — 1 + N queries
+
+    API->>DB: SELECT * FROM posts LIMIT 10
+    DB-->>API: 10 posts (authorId: 1,2,3,4,5,6,7,8,9,10)
+
+    API->>DB: SELECT * FROM users WHERE id = 1
+    API->>DB: SELECT * FROM users WHERE id = 2
+    API->>DB: SELECT * FROM users WHERE id = 3
+    Note over API,DB: ...7 more individual queries...
+    API->>DB: SELECT * FROM users WHERE id = 10
+
+    Note over API,DB: ✅ FIX — 2 queries total (batch fetch)
+
+    API->>DB: SELECT * FROM posts LIMIT 10
+    DB-->>API: 10 posts (authorIds: [1..10])
+    API->>DB: SELECT * FROM users WHERE id IN (1,2,3,4,5,6,7,8,9,10)
+    DB-->>API: 10 users in one round-trip
+```
+
+#### Fix 1 — Batch fetch with WHERE IN
+
+```js
+// ❌ N+1: one query per post author
+async function getPostsWithAuthors() {
+    const posts = await db.query("SELECT * FROM posts LIMIT 10");
+    for (const post of posts) {
+        post.author = await db.query(
+            // runs 10 separate queries!
+            "SELECT * FROM users WHERE id = $1",
+            [post.authorId],
+        );
+    }
+    return posts;
+}
+
+// ✅ FIX: batch fetch with WHERE IN — 2 queries total
+async function getPostsWithAuthors() {
+    const posts = await db.query("SELECT * FROM posts LIMIT 10");
+
+    const authorIds = [...new Set(posts.map((p) => p.authorId))];
+    const authors = await db.query("SELECT * FROM users WHERE id = ANY($1)", [
+        authorIds,
+    ]);
+
+    // map for O(1) lookup instead of O(n) find
+    const authorMap = Object.fromEntries(authors.map((a) => [a.id, a]));
+    return posts.map((p) => ({ ...p, author: authorMap[p.authorId] }));
+}
+```
+
+#### Fix 2 — DataLoader (for GraphQL — batches within one tick)
+
+```js
+const DataLoader = require("dataloader");
+
+// DataLoader batches all calls within the same event loop tick
+const userLoader = new DataLoader(async (ids) => {
+    const users = await db.query("SELECT * FROM users WHERE id = ANY($1)", [
+        ids,
+    ]);
+    // MUST return results in the SAME ORDER as ids (DataLoader requirement)
+    const map = Object.fromEntries(users.map((u) => [u.id, u]));
+    return ids.map((id) => map[id] ?? null);
+});
+
+// GraphQL resolver — looks like N+1 but DataLoader batches automatically
+const resolvers = {
+    Post: {
+        author: (post) => userLoader.load(post.authorId),
+        // 100 posts' authors → DataLoader collects all 100 IDs → fires ONE SQL query
+    },
+};
+```
+
+#### Fix 3 — JOIN (when data isn't too large)
+
+```js
+// Single query with JOIN — no extra round-trips at all
+const posts = await db.query(`
+    SELECT p.*, u.name AS author_name, u.email AS author_email
+    FROM posts p
+    JOIN users u ON u.id = p.author_id
+    LIMIT 10
+`);
+// Downside: duplicates user data per post row — use batch fetch for large datasets
+```
+
+**Interview One-Liner:** N+1 happens when code fetches a list then loops to fetch related data one-by-one. Fix with `WHERE id IN (...)` batch fetch, DataLoader for GraphQL (auto-batches per tick), or a JOIN for simple cases.
+
+---
+
+### Scenario 13: "Design a secure JWT authentication flow with token refresh"
+
+**What the interviewer is testing:** Auth architecture — access tokens, refresh tokens, revocation, storage.
+
+#### Token Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client (Browser)
+    participant API as Node.js API
+    participant R as Redis (token store)
+    participant DB as PostgreSQL
+
+    Note over C,DB: LOGIN
+    C->>API: POST /auth/login {email, password}
+    API->>DB: SELECT user WHERE email = ?
+    DB-->>API: user record
+    API->>API: bcrypt.compare(password, hash)
+    API->>API: sign accessToken (15m TTL)
+    API->>API: sign refreshToken (7d TTL)
+    API->>R: SETEX refresh:userId:tokenId 604800 "valid"
+    API-->>C: { accessToken, refreshToken } ← refreshToken in httpOnly cookie
+
+    Note over C,DB: AUTHENTICATED REQUEST
+    C->>API: GET /api/orders\nAuthorization: Bearer <accessToken>
+    API->>API: jwt.verify(token, secret)
+    API-->>C: 200 OK — orders data
+
+    Note over C,DB: ACCESS TOKEN EXPIRED — REFRESH
+    C->>API: POST /auth/refresh\ncookie: refreshToken
+    API->>API: jwt.verify(refreshToken)
+    API->>R: GET refresh:userId:tokenId
+    R-->>API: "valid" (token not revoked)
+    API->>API: sign new accessToken (15m)
+    API-->>C: { accessToken }
+
+    Note over C,DB: LOGOUT — REVOKE TOKEN
+    C->>API: POST /auth/logout
+    API->>R: DEL refresh:userId:tokenId
+    API-->>C: 200 OK — tokens invalidated
+```
+
+#### Implementation
+
+```js
+const jwt = require("jsonwebtoken");
+const bcrypt = require("bcrypt");
+const crypto = require("crypto");
+
+const ACCESS_SECRET = process.env.JWT_ACCESS_SECRET; // rotate periodically
+const REFRESH_SECRET = process.env.JWT_REFRESH_SECRET; // different secret!
+
+// LOGIN — issue both tokens
+app.post("/auth/login", async (req, res) => {
+    const user = await db.findUserByEmail(req.body.email);
+    if (!user) return res.status(401).json({ error: "Invalid credentials" });
+
+    const valid = await bcrypt.compare(req.body.password, user.passwordHash);
+    if (!valid) return res.status(401).json({ error: "Invalid credentials" });
+
+    const tokenId = crypto.randomUUID(); // unique ID for this refresh token
+
+    const accessToken = jwt.sign(
+        { sub: user.id, role: user.role },
+        ACCESS_SECRET,
+        { expiresIn: "15m" }, // short-lived — limits damage if stolen
+    );
+    const refreshToken = jwt.sign(
+        { sub: user.id, jti: tokenId },
+        REFRESH_SECRET,
+        { expiresIn: "7d" },
+    );
+
+    // Store refresh token ID in Redis — allows revocation
+    await redis.setex(`refresh:${user.id}:${tokenId}`, 7 * 24 * 3600, "valid");
+
+    // Refresh token in httpOnly cookie — JS cannot read it (XSS protection)
+    res.cookie("refreshToken", refreshToken, {
+        httpOnly: true,
+        secure: true, // HTTPS only
+        sameSite: "strict", // CSRF protection
+        maxAge: 7 * 24 * 3600 * 1000,
+    });
+
+    res.json({ accessToken });
+});
+
+// REFRESH — issue new access token
+app.post("/auth/refresh", async (req, res) => {
+    const token = req.cookies.refreshToken;
+    if (!token) return res.status(401).json({ error: "No refresh token" });
+
+    let payload;
+    try {
+        payload = jwt.verify(token, REFRESH_SECRET);
+    } catch {
+        return res.status(401).json({ error: "Invalid refresh token" });
+    }
+
+    // Check token hasn't been revoked (logout, password change, admin revoke)
+    const valid = await redis.get(`refresh:${payload.sub}:${payload.jti}`);
+    if (!valid) return res.status(401).json({ error: "Token revoked" });
+
+    const accessToken = jwt.sign({ sub: payload.sub }, ACCESS_SECRET, {
+        expiresIn: "15m",
+    });
+    res.json({ accessToken });
+});
+
+// AUTH MIDDLEWARE
+function authenticate(req, res, next) {
+    const header = req.headers.authorization;
+    if (!header?.startsWith("Bearer "))
+        return res.status(401).json({ error: "Missing token" });
+
+    try {
+        req.user = jwt.verify(header.slice(7), ACCESS_SECRET);
+        next();
+    } catch (err) {
+        const status = err.name === "TokenExpiredError" ? 401 : 403;
+        res.status(status).json({ error: err.message });
+    }
+}
+
+// LOGOUT — revoke the refresh token
+app.post("/auth/logout", authenticate, async (req, res) => {
+    const token = req.cookies.refreshToken;
+    const payload = jwt.decode(token);
+    await redis.del(`refresh:${payload.sub}:${payload.jti}`);
+    res.clearCookie("refreshToken");
+    res.json({ ok: true });
+});
+```
+
+**Interview One-Liner:** Access token = short-lived JWT (15m) in memory or Authorization header. Refresh token = long-lived JWT (7d) in httpOnly cookie (XSS-safe). On refresh, verify signature AND check Redis — allows revocation on logout or password change. Never store tokens in localStorage.
+
+---
+
+### Scenario 14: "Your cache is serving stale data — cache invalidation strategy"
+
+**What the interviewer is testing:** Understanding of caching trade-offs, consistency, and invalidation patterns.
+
+#### Cache Invalidation Strategies Compared
+
+```mermaid
+flowchart TB
+    subgraph CA["Cache-Aside (Lazy Loading)"]
+        CA1["Read: check cache\nMISS → read DB → write cache\nHIT → return from cache"]
+        CA2["Write: update DB\nthen DELETE cache key\n(not update — avoids race)"]
+    end
+
+    subgraph WT["Write-Through"]
+        WT1["Write: update DB AND cache\nat the same time\nCache always current"]
+        WT2["Con: write latency doubles\nCaches data that may never be read"]
+    end
+
+    subgraph WB["Write-Behind (Write-Back)"]
+        WB1["Write to cache ONLY\nBackground job flushes to DB\nFastest writes"]
+        WB2["Risk: data loss if cache crashes\nbefore flush"]
+    end
+
+    subgraph TTL["TTL-based (Expire & Refresh)"]
+        TTL1["Set key with TTL\nExpires automatically\nNext read triggers refresh"]
+        TTL2["Simple — eventual consistency\nStale window = TTL duration"]
+    end
+
+    style CA fill:#42a5f5,color:#fff
+    style WT fill:#66bb6a,color:#fff
+    style WB fill:#ff9800,color:#fff
+    style TTL fill:#ab47bc,color:#fff
+```
+
+#### The Real Problem — Cache Stampede
+
+When a hot cache key expires, 1000 concurrent requests all miss and hit the DB simultaneously.
+
+```mermaid
+flowchart TD
+    EXPIRE["Hot cache key expires\nproduct:123 TTL = 0"] --> MISS
+
+    MISS["1000 concurrent\nrequests all get MISS\nall try to query DB"]
+
+    DB["Database\nsuddenly gets 1000 queries\nfor the same row\n→ overloaded"]
+
+    MISS --> DB
+
+    FIX["Fix options:"]
+    DB --> FIX
+
+    FIX --> L["Mutex / Lock\nOnly 1 caller queries DB\nothers wait for it"]
+    FIX --> EL["Early re-cache\nRefresh before TTL = 0\n(probabilistic early expiry)"]
+    FIX --> SW["Stale-While-Revalidate\nReturn stale immediately\nRefresh in background"]
+
+    style EXPIRE fill:#ef5350,color:#fff
+    style DB fill:#ef5350,color:#fff
+    style L fill:#66bb6a,color:#fff
+    style EL fill:#66bb6a,color:#fff
+    style SW fill:#66bb6a,color:#fff
+```
+
+#### Implementation
+
+```js
+// ✅ Cache-Aside with DELETE on write (safest pattern)
+async function getProduct(id) {
+    const key = `product:${id}`;
+    const cached = await redis.get(key);
+    if (cached) return JSON.parse(cached);
+
+    const product = await db.query("SELECT * FROM products WHERE id = $1", [
+        id,
+    ]);
+    await redis.setex(key, 300, JSON.stringify(product)); // 5 min TTL
+    return product;
+}
+
+async function updateProduct(id, data) {
+    await db.query("UPDATE products SET ... WHERE id = $1", [id]);
+    await redis.del(`product:${id}`); // DELETE — not update (avoids race condition)
+    // Next read will repopulate from DB
+    // ❌ Don't do: redis.set(key, newData) — race: another request may overwrite with old data
+}
+
+// ✅ Stampede protection: Redis SETNX mutex
+async function getProductSafe(id) {
+    const key = `product:${id}`;
+    const lockKey = `lock:${key}`;
+
+    const cached = await redis.get(key);
+    if (cached) return JSON.parse(cached);
+
+    // Try to acquire a short lock
+    const gotLock = await redis.set(lockKey, "1", "NX", "PX", 200); // 200ms lock
+
+    if (gotLock) {
+        // This process won the race — query DB and populate cache
+        const product = await db.query("SELECT * FROM products WHERE id = $1", [
+            id,
+        ]);
+        await redis.setex(key, 300, JSON.stringify(product));
+        await redis.del(lockKey);
+        return product;
+    } else {
+        // Another process is already fetching — wait briefly then retry from cache
+        await new Promise((r) => setTimeout(r, 50));
+        const retry = await redis.get(key);
+        return retry ? JSON.parse(retry) : getProductSafe(id);
+    }
+}
+
+// ✅ Stale-While-Revalidate: return old value instantly, refresh in background
+const staleData = new Map(); // in-process store for stale value
+
+async function getWithSWR(key, ttl, fetcher) {
+    const cached = await redis.get(key);
+
+    if (cached) {
+        const { data, expiresAt } = JSON.parse(cached);
+        const isNearExpiry = expiresAt - Date.now() < ttl * 200; // final 20% of TTL
+
+        if (isNearExpiry) {
+            // Refresh in background — caller gets stale data immediately
+            fetcher().then((fresh) => {
+                redis.setex(
+                    key,
+                    ttl,
+                    JSON.stringify({
+                        data: fresh,
+                        expiresAt: Date.now() + ttl * 1000,
+                    }),
+                );
+            });
+        }
+        return data; // return stale immediately — no wait
+    }
+
+    const fresh = await fetcher();
+    await redis.setex(
+        key,
+        ttl,
+        JSON.stringify({
+            data: fresh,
+            expiresAt: Date.now() + ttl * 1000,
+        }),
+    );
+    return fresh;
+}
+```
+
+| Strategy      | Consistency           | Write Speed | Complexity | Best For                   |
+| ------------- | --------------------- | ----------- | ---------- | -------------------------- |
+| Cache-Aside   | Eventual (TTL window) | Fast        | Low        | Read-heavy data            |
+| Write-Through | Strong                | Slower      | Medium     | Financial data             |
+| Write-Behind  | Eventual              | Fastest     | High       | High-write, tolerate loss  |
+| TTL + SWR     | Eventual              | Fast        | Medium     | Public content, dashboards |
+
+**Interview One-Liner:** Always DELETE the cache key on write — never update it (avoids race conditions). For high-traffic keys, protect against stampede with a Redis NX lock or stale-while-revalidate. Prefer cache-aside for read-heavy data, write-through for critical data that must be consistent.
+
+---
+
+### Scenario 15: "Stream a large file upload directly to S3 without buffering in memory"
+
+**What the interviewer is testing:** Stream knowledge, memory efficiency, and cloud storage patterns.
+
+#### The Problem vs Solution
+
+```mermaid
+flowchart LR
+    subgraph BAD["❌ BAD — Buffer in memory"]
+        C1[Client] -->|"500MB file"| BUF["Node.js\nbuffers 500MB\nin heap memory"]
+        BUF --> S3A["Then uploads\nto S3"]
+        BUF --> OOM["💥 OOM if\nmany concurrent\nuploads"]
+    end
+
+    subgraph GOOD["✅ GOOD — Stream through Node"]
+        C2[Client] -->|"stream chunks"| NODE["Node.js\n(passes chunks\nthrough)"]
+        NODE -->|"multipart upload chunks"| S3B["S3\nreassembles\nthe file"]
+        NODE --> MEM["Memory usage:\n~constant ~16KB\nregardless of file size"]
+    end
+
+    style BAD fill:#ef5350,color:#fff
+    style GOOD fill:#66bb6a,color:#fff
+    style OOM fill:#ef5350,color:#fff
+    style MEM fill:#66bb6a,color:#fff
+```
+
+#### Implementation — Pipe request stream to S3
+
+```js
+const {
+    S3Client,
+    CreateMultipartUploadCommand,
+    UploadPartCommand,
+    CompleteMultipartUploadCommand,
+} = require("@aws-sdk/client-s3");
+const { Upload } = require("@aws-sdk/lib-storage");
+const crypto = require("crypto");
+
+const s3 = new S3Client({ region: process.env.AWS_REGION });
+
+// ✅ SIMPLEST: @aws-sdk/lib-storage handles multipart automatically
+app.post("/upload", async (req, res) => {
+    const filename = req.headers["x-filename"] || crypto.randomUUID();
+    const mimeType = req.headers["content-type"] || "application/octet-stream";
+
+    // Validate content-type against allowlist (security: prevent malicious uploads)
+    const allowed = [
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        "application/pdf",
+    ];
+    if (!allowed.includes(mimeType))
+        return res.status(400).json({ error: "File type not allowed" });
+
+    // Validate content-length header (prevent huge uploads — fail fast)
+    const maxBytes = 500 * 1024 * 1024; // 500MB
+    if (parseInt(req.headers["content-length"]) > maxBytes)
+        return res.status(413).json({ error: "File too large" });
+
+    try {
+        const upload = new Upload({
+            client: s3,
+            params: {
+                Bucket: process.env.S3_BUCKET,
+                Key: `uploads/${Date.now()}-${filename}`,
+                Body: req, // req IS a readable stream — no Buffer() needed
+                ContentType: mimeType,
+            },
+            queueSize: 4, // 4 parts upload in parallel
+            partSize: 10 * 1024 * 1024, // 10MB per part
+        });
+
+        // Track upload progress (for UI progress bars)
+        upload.on("httpUploadProgress", (progress) => {
+            console.log(
+                `Uploaded ${progress.loaded} / ${progress.total} bytes`,
+            );
+        });
+
+        const result = await upload.done();
+        res.json({ url: result.Location, key: result.Key });
+    } catch (err) {
+        // Always destroy the stream on error — prevents memory leak
+        req.destroy();
+        throw err;
+    }
+});
+
+// ✅ DOWNLOAD large file from S3 — stream to client (no buffering)
+app.get("/download/:key", async (req, res) => {
+    const command = new GetObjectCommand({
+        Bucket: process.env.S3_BUCKET,
+        Key: req.params.key,
+    });
+
+    const s3Object = await s3.send(command);
+
+    res.setHeader("Content-Type", s3Object.ContentType);
+    res.setHeader("Content-Length", s3Object.ContentLength);
+    res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${req.params.key}"`,
+    );
+
+    // Stream S3 body → client. Memory usage = one chunk at a time (~16KB)
+    s3Object.Body.pipe(res);
+});
+```
+
+**Interview One-Liner:** Never `Buffer()` large uploads — pipe `req` (a readable stream) directly into S3's multipart upload SDK. Memory stays constant at ~16KB per request regardless of file size. Validate content-type against an allowlist and check content-length before accepting. For downloads, pipe the S3 `GetObject` response body directly to `res`.
+
+---
+
+### Scenario 16: "Debug a request that fails in production but not locally — correlation IDs"
+
+**What the interviewer is testing:** Observability, distributed tracing, and production debugging skills.
+
+#### The Problem
+
+In a microservice system, a request touches 5 services. One step fails. Without correlation IDs, you see 5 separate log streams with no way to connect them to one failing request.
+
+#### Correlation ID Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant GW as API Gateway
+    participant US as User Service
+    participant OS as Order Service
+    participant PS as Payment Service
+    participant L as Log Aggregator (ELK)
+
+    C->>GW: POST /checkout\nX-Request-ID: req-abc-123
+
+    GW->>US: GET /user/42\nX-Request-ID: req-abc-123
+    US->>L: log {reqId: req-abc-123, msg: "fetched user"}
+
+    GW->>OS: POST /order\nX-Request-ID: req-abc-123
+    OS->>PS: POST /charge\nX-Request-ID: req-abc-123
+    PS->>L: log {reqId: req-abc-123, msg: "payment FAILED", error: "card declined"}
+    OS->>L: log {reqId: req-abc-123, msg: "order failed — payment error"}
+
+    GW-->>C: 402 Payment Required
+
+    Note over L: Search logs: reqId = req-abc-123\n→ see full trace across all 5 services instantly
+```
+
+#### Implementation
+
+```js
+const { AsyncLocalStorage } = require("async_hooks");
+const crypto = require("crypto");
+
+// AsyncLocalStorage propagates context through async calls automatically
+// Like thread-local storage, but for async chains
+const requestContext = new AsyncLocalStorage();
+
+// Middleware: attach correlation ID to every request
+app.use((req, res, next) => {
+    const reqId =
+        req.headers["x-request-id"] || // honour if client sent one
+        req.headers["x-correlation-id"] ||
+        `req-${crypto.randomUUID()}`; // generate if not present
+
+    // Propagate ID downstream to other services
+    res.setHeader("X-Request-ID", reqId);
+
+    // Store in AsyncLocalStorage — available anywhere in the async call chain
+    requestContext.run({ reqId, startTime: Date.now() }, next);
+});
+
+// Logger: always includes correlation ID without passing it manually
+const logger = {
+    info: (msg, meta = {}) =>
+        console.log(
+            JSON.stringify({ level: "info", msg, ...getCtx(), ...meta }),
+        ),
+    error: (msg, meta = {}) =>
+        console.error(
+            JSON.stringify({ level: "error", msg, ...getCtx(), ...meta }),
+        ),
+    warn: (msg, meta = {}) =>
+        console.warn(
+            JSON.stringify({ level: "warn", msg, ...getCtx(), ...meta }),
+        ),
+};
+
+function getCtx() {
+    const ctx = requestContext.getStore();
+    return ctx ? { reqId: ctx.reqId, elapsed: Date.now() - ctx.startTime } : {};
+}
+
+// Usage: no need to pass reqId anywhere — AsyncLocalStorage does it automatically
+app.post("/checkout", async (req, res) => {
+    logger.info("Checkout started", { userId: req.user.id });
+
+    const user = await userService.getUser(req.user.id);
+    logger.info("User fetched", { plan: user.plan });
+
+    const order = await orderService.create(req.body);
+    logger.info("Order created", { orderId: order.id });
+
+    // Pass correlation ID to downstream HTTP calls
+    const ctx = requestContext.getStore();
+    await fetch("http://payment-service/charge", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "X-Request-ID": ctx.reqId, // forward to next service
+        },
+        body: JSON.stringify({ orderId: order.id }),
+    });
+
+    logger.info("Checkout complete");
+    res.json({ orderId: order.id });
+});
+
+// Log output (structured JSON — searchable in ELK / Datadog / CloudWatch)
+// {"level":"info","msg":"Checkout started","reqId":"req-abc-123","elapsed":2,"userId":42}
+// {"level":"info","msg":"Order created","reqId":"req-abc-123","elapsed":87,"orderId":789}
+// {"level":"error","msg":"Payment failed","reqId":"req-abc-123","elapsed":203,"code":"CARD_DECLINED"}
+```
+
+**Interview One-Liner:** Attach an `X-Request-ID` header (generate if absent) at the API gateway. Use `AsyncLocalStorage` to propagate it through the entire async call chain without manual passing. Log it in every log line as structured JSON. Forward it in all downstream HTTP calls — then in Kibana/Datadog, filter by `reqId` to see the full trace of one request across all services.
+
+---
+
+### Scenario 17: "Race condition in Node.js — two requests read-then-write the same record"
+
+**What the interviewer is testing:** Concurrency understanding even in single-threaded Node.js, and distributed systems correctness.
+
+**The myth:** "Node.js is single-threaded, so there are no race conditions." — **Wrong.** Node.js is single-threaded for JS execution, but two requests can interleave at `await` boundaries.
+
+#### How the Race Happens
+
+```mermaid
+sequenceDiagram
+    participant R1 as Request 1 (buy ticket)
+    participant R2 as Request 2 (buy ticket)
+    participant DB as Database
+
+    Note over R1,DB: Both requests arrive simultaneously — last_seats = 1
+
+    R1->>DB: SELECT seats FROM events WHERE id = 1
+    DB-->>R1: seats = 1 ← "1 seat available!"
+
+    Note over R1,R2: R1 is now awaiting something else — R2 runs
+
+    R2->>DB: SELECT seats FROM events WHERE id = 1
+    DB-->>R2: seats = 1 ← "1 seat available!" (same read!)
+
+    R2->>DB: UPDATE events SET seats = seats - 1 WHERE id = 1
+    DB-->>R2: OK — seats now = 0
+
+    R1->>DB: UPDATE events SET seats = seats - 1 WHERE id = 1
+    DB-->>R1: OK — seats now = -1 ❌ OVERSOLD!
+```
+
+#### Fix 1 — Atomic DB operation (simplest)
+
+```js
+// ❌ RACE CONDITION: read then conditionally write
+const event = await db.query("SELECT seats FROM events WHERE id = $1", [id]);
+if (event.seats > 0) {
+    await db.query("UPDATE events SET seats = seats - 1 WHERE id = $1", [id]);
+    // Gap between read and write — race!
+}
+
+// ✅ FIX: atomic conditional update — check AND decrement in one query
+const result = await db.query(
+    `
+    UPDATE events
+    SET seats = seats - 1
+    WHERE id = $1 AND seats > 0   -- only decrements if still available
+    RETURNING seats
+`,
+    [id],
+);
+
+if (result.rowCount === 0) {
+    throw new Error("No seats available"); // someone else got the last seat
+}
+// seats can never go below 0 — DB enforces atomicity
+```
+
+#### Fix 2 — Pessimistic lock (FOR UPDATE)
+
+```js
+// Lock the row for the duration of the transaction
+// Other transactions trying to SELECT ... FOR UPDATE on same row must wait
+await db.transaction(async (trx) => {
+    const event = await trx.query(
+        "SELECT seats FROM events WHERE id = $1 FOR UPDATE", // row lock!
+        [id],
+    );
+
+    if (event.rows[0].seats <= 0) throw new Error("No seats available");
+
+    await trx.query("UPDATE events SET seats = seats - 1 WHERE id = $1", [id]);
+    await trx.query(
+        "INSERT INTO bookings (event_id, user_id) VALUES ($1, $2)",
+        [id, userId],
+    );
+    // Lock released when transaction commits or rolls back
+});
+```
+
+#### Fix 3 — Optimistic lock (version column)
+
+```js
+// Each row has a 'version' column that increments on every update
+// If two transactions read version = 5 and both try to write,
+// only the first succeeds — second gets rowCount = 0 and retries
+
+async function bookSeat(eventId, userId, retries = 3) {
+    for (let i = 0; i < retries; i++) {
+        const { rows } = await db.query(
+            "SELECT seats, version FROM events WHERE id = $1",
+            [eventId],
+        );
+        const { seats, version } = rows[0];
+        if (seats <= 0) throw new Error("No seats available");
+
+        const update = await db.query(
+            `
+            UPDATE events
+            SET seats = seats - 1, version = version + 1
+            WHERE id = $1 AND version = $2   -- fails if another tx already modified it
+            RETURNING id
+        `,
+            [eventId, version],
+        );
+
+        if (update.rowCount === 1) {
+            await db.query("INSERT INTO bookings ...", [eventId, userId]);
+            return; // success
+        }
+        // version mismatch — another tx beat us, retry
+        await new Promise((r) => setTimeout(r, 10 * (i + 1))); // small backoff
+    }
+    throw new Error("Could not book — too much contention, try again");
+}
+```
+
+| Strategy                       | Use When                                  | Trade-off                     |
+| ------------------------------ | ----------------------------------------- | ----------------------------- |
+| Atomic SQL (`WHERE seats > 0`) | Simple decrement/increment                | Best default choice           |
+| `SELECT FOR UPDATE`            | Multi-step transaction must be consistent | Locks row — lower concurrency |
+| Optimistic lock (version)      | Low contention, high throughput           | Retries on conflict           |
+| Redis `DECR` + Lua             | Extreme high throughput (flash sales)     | Eventually consistent with DB |
+
+**Interview One-Liner:** Race conditions happen in Node.js at every `await` boundary — two requests can read the same row between each other's awaits. Fix with atomic SQL (`UPDATE ... WHERE seats > 0 RETURNING seats`), `SELECT FOR UPDATE` for complex multi-step transactions, or optimistic locking (version column) for high-throughput scenarios.
+
+---
+
+### Quick Reference — Scenario Cheat Sheet
+
+| Scenario                 | First Action                          | Key Tool / Pattern                                     |
+| ------------------------ | ------------------------------------- | ------------------------------------------------------ |
+| Slow API (p99 high)      | Add timing to each layer              | APM / `Date.now()` per step                            |
+| Queue backlog growing    | Measure consume rate vs produce rate  | Increase concurrency, batch writes, scale consumers    |
+| Memory leak (OOM)        | Log `process.memoryUsage()` every 30s | `clinic.js heap`, heap snapshot                        |
+| 50k req/s target         | Cache + cluster + stream + pool       | Redis, cluster module, DB indexes                      |
+| External API fails       | Circuit breaker + timeout             | `CircuitBreaker` class, `AbortSignal.timeout`          |
+| WebSocket drops          | Heartbeat + Redis pub/sub             | `ws.ping()` / `ws.pong()`, Redis subscriber per server |
+| Duplicate orders         | Idempotency key in Redis              | `Idempotency-Key` header, `SETEX` response payload     |
+| Process OOM killed       | Stream large data, find leak          | `--max-old-space-size`, PM2 `max_memory_restart`       |
+| Rate limiting            | Sliding window sorted set in Redis    | `ZREMRANGEBYSCORE` + `ZCARD` + `ZADD` pipeline         |
+| Zero-downtime deploy     | Graceful shutdown on SIGTERM          | `server.close()` + drain check + forced timeout        |
+| Slow endpoint bottleneck | Cluster + LB + cache + queue          | `p-limit`, nginx `least_conn`, BullMQ 202 pattern      |
+| N+1 query problem        | Batch fetch with `WHERE id IN (...)`  | DataLoader (GraphQL), JOIN, batch array fetch          |
+| JWT auth + refresh token | Short access token + httpOnly cookie  | `jwt.sign` 15m + Redis revocation store                |
+| Cache stale data         | DELETE on write, not update           | Cache-aside + NX lock stampede protection, SWR         |
+| Large file upload        | Pipe `req` stream to S3 multipart     | `@aws-sdk/lib-storage Upload`, never buffer            |
+| Production debug         | Correlation ID in every log line      | `AsyncLocalStorage`, `X-Request-ID`, structured JSON   |
+| Race condition           | Atomic SQL or SELECT FOR UPDATE       | `WHERE seats > 0`, optimistic version lock, Redis DECR |
 
 ---
 
