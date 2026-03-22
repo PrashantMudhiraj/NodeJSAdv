@@ -5925,6 +5925,336 @@ System design in Node.js is about building applications that handle **real-world
 
 **Queue-based architecture:** For long-running tasks (image processing, email sending, report generation), don't make the user wait. Accept the request, put a job in a queue (Redis, RabbitMQ), return immediately with a job ID, and process asynchronously. The user polls for the result.
 
+---
+
+### Proxy, Reverse Proxy & Types
+
+Before discussing scaling patterns, it helps to understand what a **proxy** is and why a **reverse proxy** is central to every production Node.js system.
+
+#### What is a Proxy?
+
+A **proxy** is an intermediate server that sits between two communicating systems.
+
+Instead of direct communication:
+
+```text
+Client → Server
+```
+
+the request flows through a middleman:
+
+```text
+Client → Proxy → Server
+```
+
+The proxy may:
+
+- forward requests on behalf of the client
+- hide one side from the other
+- filter or block traffic
+- cache responses
+- apply security rules
+- log everything passing through
+- compress data
+
+```mermaid
+flowchart LR
+    C[Client] --> P[Proxy]
+    P --> S[Target Server]
+
+    style C fill:#42a5f5,color:#fff
+    style P fill:#ff9800,color:#fff
+    style S fill:#66bb6a,color:#fff
+```
+
+---
+
+#### Types of Proxy
+
+##### 1. Forward Proxy
+
+A **forward proxy** sits in front of the **client**.
+
+The client knows it is talking to a proxy. The proxy makes requests to the internet on behalf of the client. The destination server never sees the real client.
+
+```text
+Client → Forward Proxy → Internet / Target Server
+```
+
+**Common uses:**
+
+- corporate internet filtering (block social media, gambling sites)
+- hiding client IP address
+- accessing geo-restricted content
+- caching frequently visited pages
+
+```mermaid
+flowchart LR
+    C[Client / Corporate Laptop] --> FP[Forward Proxy]
+    FP --> I[Internet / Target Server]
+
+    style C fill:#42a5f5,color:#fff
+    style FP fill:#ff9800,color:#fff
+    style I fill:#66bb6a,color:#fff
+```
+
+**Example:** A company routes all employee internet traffic through a proxy that blocks gambling sites. The destination website only sees the proxy's IP — not the employee's machine.
+
+---
+
+##### 2. Reverse Proxy
+
+A **reverse proxy** sits in front of the **server**.
+
+The client thinks it is talking directly to the application server. In reality, the request first hits the reverse proxy which then forwards it to one of many backend servers.
+
+```text
+Client → Reverse Proxy → Backend App Server
+```
+
+**Common uses:**
+
+- load balancing across multiple servers
+- SSL/TLS termination (HTTPS decryption happens here, not in Node)
+- caching responses
+- rate limiting and DDoS protection
+- request routing (`/api` → Node app, `/assets` → CDN)
+- hiding backend server IPs from the public internet
+- gzip compression
+
+```mermaid
+flowchart LR
+    C[Client / Browser] --> RP["Reverse Proxy\nnginx / HAProxy"]
+    RP --> A1[Node App Instance 1]
+    RP --> A2[Node App Instance 2]
+    RP --> A3[Node App Instance 3]
+
+    style C fill:#42a5f5,color:#fff
+    style RP fill:#ff9800,color:#fff
+    style A1 fill:#66bb6a,color:#fff
+    style A2 fill:#66bb6a,color:#fff
+    style A3 fill:#66bb6a,color:#fff
+```
+
+**Example:** User hits `api.myapp.com` → nginx receives the HTTPS request → decrypts TLS → forwards plain HTTP to one of 3 Node.js instances → Node responds → nginx sends it back to the user.
+
+---
+
+##### 3. Transparent Proxy
+
+Intercepts traffic **without the client knowing or configuring anything**. Common at ISP level or enterprise networks for caching and filtering.
+
+##### 4. Open Proxy
+
+A publicly accessible proxy that forwards requests for anyone. Generally unsafe and often abused — not a production architecture pattern.
+
+---
+
+#### Forward Proxy vs Reverse Proxy — Side by Side
+
+| Feature | Forward Proxy | Reverse Proxy |
+|---|---|---|
+| Sits in front of | **Client** | **Server** |
+| Protects / hides | Client identity | Backend servers |
+| Who configures it | Client (explicit) | Server owner |
+| Common tool | Squid, corporate firewall | nginx, HAProxy, Traefik |
+| Common use | Outbound traffic control | Load balancing, TLS, routing |
+
+```mermaid
+flowchart TB
+    subgraph FP_Flow["Forward Proxy — hides the client"]
+        C1[Client] --> FP[Forward Proxy]
+        FP --> T1[Target Server]
+    end
+
+    subgraph RP_Flow["Reverse Proxy — hides the servers"]
+        C2[Client] --> RP[Reverse Proxy]
+        RP --> T2[Backend Server A]
+        RP --> T3[Backend Server B]
+    end
+
+    style FP fill:#ff9800,color:#fff
+    style RP fill:#ff9800,color:#fff
+    style C1 fill:#42a5f5,color:#fff
+    style C2 fill:#42a5f5,color:#fff
+    style T1 fill:#66bb6a,color:#fff
+    style T2 fill:#66bb6a,color:#fff
+    style T3 fill:#66bb6a,color:#fff
+```
+
+---
+
+#### Why Node.js Always Uses a Reverse Proxy in Production
+
+A raw Node.js process listening on port 3000 is **not production-ready**. A reverse proxy is placed in front of it for several reasons:
+
+##### Reason 1: Load Balancing
+
+Distribute requests across multiple Node instances so no single process is overwhelmed.
+
+```mermaid
+flowchart LR
+    U[1000 Users] --> RP["Reverse Proxy\nport 443"]
+
+    RP --> N1["Node :3001\nPID 1234"]
+    RP --> N2["Node :3002\nPID 1235"]
+    RP --> N3["Node :3003\nPID 1236"]
+    RP --> N4["Node :3004\nPID 1237"]
+
+    style U fill:#42a5f5,color:#fff
+    style RP fill:#ff9800,color:#fff
+    style N1 fill:#66bb6a,color:#fff
+    style N2 fill:#66bb6a,color:#fff
+    style N3 fill:#66bb6a,color:#fff
+    style N4 fill:#66bb6a,color:#fff
+```
+
+##### Reason 2: TLS / SSL Termination
+
+The reverse proxy handles HTTPS certificates and decryption. Node.js only sees plain HTTP internally — no certificate management in your app code.
+
+```mermaid
+flowchart LR
+    C[Client] -->|"HTTPS encrypted"| RP["Reverse Proxy\nDecrypts TLS here"]
+    RP -->|"Plain HTTP internal"| N[Node.js App]
+
+    style C fill:#42a5f5,color:#fff
+    style RP fill:#ff9800,color:#fff
+    style N fill:#66bb6a,color:#fff
+```
+
+##### Reason 3: Request Routing
+
+Route different URL paths to completely different backend services.
+
+```mermaid
+flowchart LR
+    C[Client] --> RP[Reverse Proxy]
+
+    RP -->|"/api/*"| API["Node.js API\nport 3001"]
+    RP -->|"/admin/*"| ADMIN["Admin Service\nport 3002"]
+    RP -->|"/assets/*"| STATIC["Static File Server\nCDN / nginx"]
+    RP -->|"/ws/*"| WS["WebSocket Server\nport 3003"]
+
+    style C fill:#42a5f5,color:#fff
+    style RP fill:#ff9800,color:#fff
+    style API fill:#66bb6a,color:#fff
+    style ADMIN fill:#66bb6a,color:#fff
+    style STATIC fill:#66bb6a,color:#fff
+    style WS fill:#66bb6a,color:#fff
+```
+
+##### Reason 4: Security — Hide Backend Servers
+
+The reverse proxy is the only publicly exposed component. Backend servers live inside a private network — attackers cannot directly reach them.
+
+```mermaid
+flowchart LR
+    Internet[Public Internet] --> RP
+
+    subgraph Private["Private Network — not accessible from internet"]
+        RP["Reverse Proxy\nOnly public-facing component"]
+        N1[Node App 1]
+        N2[Node App 2]
+        DB[(Database)]
+
+        RP --> N1
+        RP --> N2
+        N1 --> DB
+        N2 --> DB
+    end
+
+    style Internet fill:#ef5350,color:#fff
+    style RP fill:#ff9800,color:#fff
+    style N1 fill:#66bb6a,color:#fff
+    style N2 fill:#66bb6a,color:#fff
+    style DB fill:#ab47bc,color:#fff
+```
+
+##### Reason 5: Static File Serving
+
+nginx serves static files (images, CSS, JS bundles) far more efficiently than Node.js for most workloads, freeing Node to handle only API logic.
+
+##### Reason 6: Caching
+
+Frequently requested responses can be cached at the reverse proxy layer. Identical requests may never even reach Node.js.
+
+---
+
+#### Reverse Proxy vs Load Balancer — Are They the Same?
+
+These two terms are often used interchangeably, but they are not identical.
+
+| Term | Definition |
+|---|---|
+| **Reverse Proxy** | Forwards requests from clients to backend servers. May have one or many backends. |
+| **Load Balancer** | A reverse proxy that also distributes traffic across **multiple** backends using an algorithm (round-robin, least-connections, IP hash). |
+
+**Conclusion:** Every load balancer is a reverse proxy. Not every reverse proxy is a load balancer.
+
+---
+
+#### Full Production Request Flow
+
+This is the complete picture from a user typing a URL to your Node.js handler running.
+
+```mermaid
+sequenceDiagram
+    participant U as User / Browser
+    participant DNS as DNS Server
+    participant CF as Cloudflare / CDN Edge
+    participant LB as Load Balancer (nginx)
+    participant N as Node.js App
+    participant R as Redis Cache
+    participant DB as PostgreSQL
+
+    U->>DNS: Resolve api.myapp.com
+    DNS-->>U: IP address
+
+    U->>CF: HTTPS request (TLS terminated at edge)
+    CF-->>U: Cache HIT? Serve immediately
+
+    CF->>LB: Forward to origin (plain HTTP)
+    LB->>LB: Health check backends
+    LB->>N: Forward to available Node instance
+
+    N->>R: Check cache
+    R-->>N: Cache HIT — return data
+    R-->>N: Cache MISS — query DB
+
+    N->>DB: SQL query
+    DB-->>N: Result rows
+
+    N->>R: Store in cache (TTL 3600s)
+    N-->>LB: HTTP response
+    LB-->>CF: Response
+    CF-->>U: HTTPS response
+```
+
+---
+
+#### Common Reverse Proxy Tools in Node.js Ecosystems
+
+| Tool | Type | Common Use |
+|---|---|---|
+| **nginx** | Open source | Most popular — static files + reverse proxy + TLS |
+| **HAProxy** | Open source | High-performance TCP/HTTP load balancer |
+| **Traefik** | Open source | Cloud-native, auto-discovers Docker/K8s services |
+| **AWS ALB** | Cloud (AWS) | Application load balancer |
+| **AWS NLB** | Cloud (AWS) | Network load balancer (TCP level) |
+| **Cloudflare** | CDN + Proxy | Edge caching, DDoS protection, TLS |
+
+---
+
+#### Interview One-Liners
+
+- **What is a reverse proxy?** → A server placed in front of backend servers that receives client requests and forwards them to the appropriate application server — handles load balancing, TLS, routing, and security.
+- **Reverse proxy vs load balancer?** → Every load balancer is a reverse proxy. A load balancer adds health checks and traffic distribution across multiple backends.
+- **Why put nginx in front of Node.js?** → Node.js is single-process by default. nginx handles TLS, static files, rate limiting, and distributes traffic across multiple Node instances — things Node should not do itself.
+- **Forward proxy vs reverse proxy?** → Forward proxy hides the client (outbound traffic control). Reverse proxy hides the server (load balancing, TLS, routing).
+
+---
+
 ### Scalability Patterns
 
 #### Pattern 1: Horizontal Scaling with Reverse Proxy

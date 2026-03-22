@@ -1,2 +1,35 @@
 - SIGTERM
 - SIGKILL
+
+
+- SharedArrayBuffer
+    - A raw block of binary memory shared between threads. Zero Copy
+- Int32Array(sharedBuffer)
+    - A typed view over the shared buffer
+
+    - const sharedBuffer = new SharedArrayBuffer(4);
+    - const sharedArray = new Int32Array(sharedBuffer);
+    - sharedArray[0] = 0;
+
+- Atomics
+    - Atomic.wait(sharedBuffer , 0 , 0) - block this thread until sharedBuffer[0] changes from 0
+    - Atomic.notify(sharedBuffer, 1) - awake waiting thread
+    - Atomic.add()
+
+
+- System design
+    - Stateless server - add more server behind the load balancer
+    - Connection pool - create 10 - 20 connections and reuse them, instead of creating on again.
+    - Cache-aside pattern - check cache before hitting a db or an api
+    - queue-based architecture - async - put it a queue and return a job id
+
+- Users (12000)
+    - load Balancer(nginx)
+        - Server 1
+            - 4000
+        - Server 2
+            - 4000
+        - Server 3
+            - 4000
+    - redis server to maintain session state
+    - Database to store state 

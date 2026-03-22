@@ -29,7 +29,5 @@ parentPort.on("message", (arrBuff) => {
 });
 
 function hashBuffer(payload) {
-    const hash = createHash("sha256");
-    hash.update(payload);
-    return hash.digest("hex");
+    return createHash("sha256").update(payload).digest("hex");
 }
