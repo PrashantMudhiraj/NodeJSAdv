@@ -76,5 +76,12 @@
         await pool.end()
     })
 
-- import redis from "redis"
-- redis.createClient({ url : "localhost:5432"});
+- Redis
+    - import redis from "redis"
+    - redis.createClient({ url : "localhost:5432"});
+
+- REST
+    - GET /api/v1/users
+    - GET /api/v1/users/:id
+    - POST /api/v1/users
+    - PUT /api/v1/users/:id

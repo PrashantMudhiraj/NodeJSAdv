@@ -7980,6 +7980,1977 @@ app.use((req, res, next) => {
 
 ---
 
+### 6.2 WebSockets & Real-time Communication
+
+### Concepts
+
+HTTP is **request-response** — the client asks, the server answers, and the connection is idle until the next request. **WebSockets** upgrade the HTTP connection to a persistent, **full-duplex** channel where both sides can send messages at any time. This is essential for real-time applications: chat, live dashboards, multiplayer games, collaborative editing.
+
+**How WebSocket works:** The client sends an HTTP request with `Upgrade: websocket`. If the server agrees, the connection switches from HTTP to the WebSocket protocol (ws:// or wss://). From that point, either side can send frames (messages) without the overhead of HTTP headers on each message.
+
+**ws vs socket.io:** `ws` is the minimal, standards-compliant WebSocket library. `socket.io` adds auto-reconnection, rooms, namespaces, fallbacks (long-polling), and broadcasting — but at the cost of a custom protocol that only works with socket.io clients.
+
+**Scaling WebSockets:** A single Node process can handle ~10K–50K concurrent WebSocket connections (depending on message rate). Beyond that, use multiple processes with a **pub/sub backend** (Redis) to broadcast messages across instances.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Server as Node.js Server
+    Client->>Server: HTTP GET /ws (Upgrade: websocket)
+    Server-->>Client: 101 Switching Protocols
+    Note over Client,Server: Full-duplex WebSocket channel open
+    Client->>Server: Send message (frame)
+    Server->>Client: Push notification (frame)
+    Server->>Client: Push update (frame)
+    Client->>Server: Send message (frame)
+    Note over Client,Server: Connection stays open until close
+    Client->>Server: Close frame
+    Server-->>Client: Close ACK
+```
+
+### Key APIs & Patterns
+
+> 📖 **What this example demonstrates:** A complete WebSocket server with heartbeat detection. The server accepts connections, echoes messages back, and pings every 30 seconds to detect dead connections (clients that disconnected without sending a close frame, e.g., due to network failure). Without heartbeats, dead connections accumulate and waste memory.
+>
+> 🔑 **Key terms:**
+>
+> - **WebSocket upgrade** — Connection starts as HTTP, then the client sends `Upgrade: websocket`. Server responds with `101 Switching Protocols`, and the connection becomes full-duplex.
+> - **Full-duplex** — Both sides can send and receive simultaneously (unlike HTTP where you send, wait, receive).
+> - **Heartbeat (ping/pong)** — Every 30s, server sends a `ping` frame. The client must respond with a `pong`. If no pong arrives, the connection is dead — terminate it.
+> - **`ws.readyState === 1`** — 1 = OPEN (WebSocket is connected and can send). Other states: 0=CONNECTING, 2=CLOSING, 3=CLOSED.
+
+```js
+// --- ws (minimal WebSocket) ---
+const { WebSocketServer } = require("ws");
+const wss = new WebSocketServer({ port: 8080 });
+
+wss.on("connection", (ws, req) => {
+    console.log("Client connected from", req.socket.remoteAddress);
+
+    ws.on("message", (data) => {
+        const msg = data.toString();
+        console.log("Received:", msg);
+        ws.send(`Echo: ${msg}`); // Send back to this specific client
+    });
+
+    ws.on("close", () => console.log("Client disconnected"));
+
+    // Heartbeat: track whether this connection is still alive
+    ws.isAlive = true;
+    ws.on("pong", () => {
+        ws.isAlive = true; // Client responded — still alive!
+    });
+});
+
+// Heartbeat interval: every 30s, check all connections
+const interval = setInterval(() => {
+    wss.clients.forEach((ws) => {
+        if (!ws.isAlive) return ws.terminate(); // No pong in 30s — dead connection, kill it
+        ws.isAlive = false; // Assume dead until we get a pong
+        ws.ping(); // Send ping — client must respond with pong
+    });
+}, 30000);
+
+wss.on("close", () => clearInterval(interval)); // Stop heartbeat when server stops
+```
+
+```js
+// --- Broadcasting to all clients ---
+// Use case: chat message, live score update, notification
+function broadcast(data) {
+    const msg = JSON.stringify(data);
+    wss.clients.forEach((client) => {
+        if (client.readyState === 1) {
+            // 1 = OPEN (only send to connected clients)
+            client.send(msg);
+        }
+    });
+}
+```
+
+> 📖 **What this example demonstrates:** Scaling WebSockets across multiple Node.js instances using Redis Pub/Sub. Without this, a message from User A (on Server 1) would never reach User B (on Server 2). Redis acts as the broadcast backbone: any server can publish, all servers subscribe and forward to their local clients.
+
+```js
+// --- Scaling with Redis pub/sub ---
+const Redis = require("ioredis");
+const pub = new Redis(); // Separate client for publishing
+const sub = new Redis(); // Separate client for subscribing (can't do both on same client)
+
+sub.subscribe("chat"); // This server listens for messages on the 'chat' channel
+sub.on("message", (channel, message) => {
+    broadcast(JSON.parse(message)); // Forward to all WebSocket clients on THIS server
+});
+
+wss.on("connection", (ws) => {
+    ws.on("message", (data) => {
+        // When a client sends a message, publish it to Redis
+        // ALL servers subscribed to 'chat' will receive it and forward to their clients
+        pub.publish("chat", data.toString());
+    });
+});
+```
+
+### Senior-Level Q&A
+
+**Q1: How do you handle backpressure on WebSocket connections?**
+
+A: If the client is slow to consume messages, the send buffer fills up. Check `ws.bufferedAmount` before sending or use `ws.send(msg, err => {...})` callback.
+
+```js
+function safeSend(ws, data) {
+    if (ws.bufferedAmount < 1024 * 1024) {
+        // < 1MB buffered
+        ws.send(data);
+    } else {
+        console.warn("Client too slow, dropping message");
+    }
+}
+```
+
+**Q2: ws vs socket.io — when to choose each?**
+
+| Feature            | ws                                     | socket.io                       |
+| ------------------ | -------------------------------------- | ------------------------------- |
+| Protocol           | Standard WebSocket                     | Custom (WS + fallbacks)         |
+| Auto-reconnect     | Manual                                 | Built-in                        |
+| Rooms/namespaces   | Manual                                 | Built-in                        |
+| Fallback (polling) | No                                     | Yes                             |
+| Binary support     | Yes                                    | Yes                             |
+| Bundle size        | ~3KB                                   | ~40KB                           |
+| **Use when**       | Performance critical, standard clients | Rapid dev, need rooms, fallback |
+
+**Q3: Design a chat system for 100K concurrent users across 10 servers.**
+
+A: Each server handles ~10K WS connections. Use Redis pub/sub to relay messages across servers; each server subscribes to chat channels and broadcasts to its local clients. Presence is tracked in Redis sets (SADD/SREM on connect/disconnect).
+
+```mermaid
+flowchart LR
+    C1[Clients 1-10K] --> S1[Server 1]
+    C2[Clients 10K-20K] --> S2[Server 2]
+    S1 <-->|pub/sub| R[(Redis)]
+    S2 <-->|pub/sub| R
+    S3[Server N] <-->|pub/sub| R
+```
+
+> **💡 Interview Tip — One-Liner Answers:**
+>
+> - _"WebSocket vs HTTP?"_ → HTTP = request/response (client initiates). WebSocket = persistent full-duplex connection — server can push data anytime. Uses single TCP connection after HTTP upgrade handshake.
+> - _"How do you detect dead WebSocket connections?"_ → Ping/pong heartbeat. Send ping every 30s; if no pong, terminate. Prevents ghost connections holding memory.
+> - _"ws vs socket.io?"_ → `ws` = raw WebSocket (~3KB), fast, standard protocol. `socket.io` = framework (~40KB) with auto-reconnect, rooms, namespaces, and HTTP fallback.
+> - _"How to scale WebSockets across servers?"_ → Redis pub/sub — each server subscribes to channels and relays messages to its local clients.
+
+> **📝 Quick Revision — WebSockets:**
+> | Concept | Key Point |
+> |---|---|
+> | Protocol | Full-duplex over single TCP; starts as HTTP upgrade |
+> | Heartbeat | Ping/pong every 30s; terminate dead connections |
+> | Backpressure | Check `ws.bufferedAmount` before sending |
+> | Scaling | Redis pub/sub to relay across multiple servers |
+> | `ws` library | Lightweight, standard WebSocket, manual reconnect |
+> | `socket.io` | Auto-reconnect, rooms, fallback to polling |
+
+[↑ Back to Index](#table-of-contents)
+
+---
+
+### 6.3 Message Queues & Background Jobs
+
+### Concepts
+
+Not all work should be done inside the HTTP request cycle. Sending emails, generating PDFs, resizing images, processing payments — these are **background jobs** that should be queued and processed asynchronously. The user gets an immediate response ("Your export is being prepared") while the heavy work happens in the background.
+
+**Message queue pattern:** A **producer** pushes a message onto a queue/topic. A **consumer** (worker) picks it up and processes it. If the worker crashes, the message is **re-queued** (at-least-once delivery). This decouples your web server from slow operations and lets you scale workers independently.
+
+```mermaid
+flowchart LR
+    API[API Server] -->|"produce"| Q[(Queue / Topic<br/>Redis · RabbitMQ · Kafka)]
+    Q -->|"consume"| W1[Worker 1]
+    Q -->|"consume"| W2[Worker 2]
+    W1 -->|"on failure"| DLQ[Dead Letter Queue]
+    W2 -->|"on success"| DB[(Database)]
+    style Q fill:#ff9800,color:#fff
+    style DLQ fill:#f44336,color:#fff
+```
+
+---
+
+### Quick Notes: RabbitMQ & BullMQ
+
+> **These are two popular alternatives to Kafka. Below is a quick overview so you can compare them in interviews.**
+
+#### RabbitMQ (AMQP Protocol) — In a Nutshell
+
+RabbitMQ is a **traditional message broker** written in Erlang. Think of it as a smart post office:
+
+- **Exchange** receives messages and routes them to **queues** based on rules (direct, fanout, topic).
+- **Queues** hold messages until a consumer picks them up.
+- **Consumers** pull (or push via prefetch) messages from queues.
+- Supports **acknowledgement** — the message stays in the queue until the consumer confirms processing.
+- Best for **complex routing** — e.g., "send order events to billing AND shipping queues."
+
+```
+Producer → Exchange → [Routing Rules] → Queue → Consumer
+                                       → Queue → Consumer
+```
+
+**Key difference from Kafka:** Messages are **deleted** after consumption. No replay. Good for task distribution, not for event sourcing.
+
+| Term        | What it is                                              |
+| ----------- | ------------------------------------------------------- |
+| Exchange    | Router that receives messages and distributes to queues |
+| Queue       | Buffer that holds messages for consumers                |
+| Binding     | Rule connecting an exchange to a queue (routing key)    |
+| Ack/Nack    | Consumer confirms (ack) or rejects (nack) a message     |
+| Prefetch    | Limits how many unacked messages a consumer can hold    |
+| Dead Letter | Queue for messages that failed all retries              |
+
+**Node.js library:** `amqplib` (`npm install amqplib`).
+
+#### BullMQ (Redis-backed) — In a Nutshell
+
+BullMQ is a **job/task queue** for Node.js, backed by Redis. Think of it as a to-do list for your server:
+
+- **Queue** stores jobs (JSON payloads) in Redis.
+- **Worker** picks up jobs and processes them.
+- Built-in: **retry with backoff**, delayed jobs, repeatable/cron jobs, rate limiting, priorities, progress tracking.
+- Has a dashboard UI (Bull Board) to monitor job status.
+
+```js
+// BullMQ — Quick example
+const { Queue, Worker } = require("bullmq");
+const connection = { host: "127.0.0.1", port: 6379 };
+
+// Producer: add a job
+const emailQueue = new Queue("emails", { connection });
+await emailQueue.add(
+    "welcome",
+    { userId: 42 },
+    {
+        attempts: 3,
+        backoff: { type: "exponential", delay: 1000 },
+    },
+);
+
+// Consumer: process jobs
+const worker = new Worker(
+    "emails",
+    async (job) => {
+        await sendEmail(job.data.userId);
+    },
+    { connection, concurrency: 5 },
+);
+
+worker.on("failed", (job, err) => console.error(`Failed: ${err.message}`));
+worker.on("completed", (job) => console.log(`Done: ${job.id}`));
+```
+
+**When to use BullMQ:** Simple job queues (emails, image resize, PDF generation) where you already have Redis. Not suited for high-throughput event streaming.
+
+| Feature        | BullMQ             | RabbitMQ           | Kafka                       |
+| -------------- | ------------------ | ------------------ | --------------------------- |
+| Backend        | Redis              | Erlang VM          | JVM cluster                 |
+| Throughput     | ~10K/s             | ~50K/s             | **~1M/s**                   |
+| Best for       | Task queues        | Complex routing    | Event streaming             |
+| Node.js lib    | bullmq             | amqplib            | **kafkajs**                 |
+| Delayed jobs   | Built-in           | Plugin             | Manual                      |
+| Message replay | ❌ No              | ❌ No              | ✅ Yes (log-based)          |
+| Ordering       | Per-queue          | Per-queue          | **Per-partition**           |
+| Exactly-once   | No (at-least-once) | No (at-least-once) | **Yes (with transactions)** |
+
+---
+
+### Deep Dive: Apache Kafka with KafkaJS
+
+This is the section to study deeply. Kafka is the industry standard for **high-throughput event streaming** — used at LinkedIn, Uber, Netflix, and almost every large-scale system.
+
+### Kafka Core Architecture
+
+**Three key components:**
+
+1. **Broker** — A Kafka server that stores messages. A Kafka cluster has multiple brokers for fault tolerance. Each broker stores a subset of the data.
+2. **Producer** — Your application code that **sends** messages to a Kafka topic. The producer decides which partition to send to (round-robin, key-based, or custom).
+3. **Consumer** — Your application code that **reads** messages from a Kafka topic. Consumers belong to a **consumer group** — Kafka distributes partitions across consumers in the same group.
+
+**Topics & Partitions:**
+
+- A **topic** is a named channel (like `"orders"`, `"user-events"`).
+- Each topic is split into **partitions** (like shards). Partitions enable parallelism.
+- Each partition is an **ordered, immutable log** — messages are appended and never deleted (until retention expires).
+- Messages within a partition are ordered. Messages across partitions are NOT guaranteed to be ordered.
+
+**Consumer Groups:**
+
+- Consumers with the same `groupId` share the work — each partition is assigned to exactly one consumer in the group.
+- If you have 6 partitions and 3 consumers → each consumer reads 2 partitions.
+- If a consumer dies, Kafka **rebalances** partitions across surviving consumers.
+- Two different consumer groups can read the same topic independently (each gets all messages).
+
+**Offsets:**
+
+- Each message in a partition has a sequential **offset** (0, 1, 2, 3...).
+- Consumers track their offset — "I've processed up to offset 42."
+- On restart, the consumer resumes from its last committed offset.
+- **Auto-commit** (default): Offsets are committed periodically. Risk: crash between process and commit = **reprocessing**.
+- **Manual commit**: You commit after successful processing. Safer but more code.
+
+```mermaid
+graph TB
+    subgraph Cluster["Kafka Cluster (3 Brokers)"]
+        direction TB
+        B1["Broker 1<br/>Leader: P0, P1"]
+        B2["Broker 2<br/>Leader: P2, P3"]
+        B3["Broker 3<br/>Replicas"]
+    end
+
+    subgraph Topic["Topic: 'orders' (4 Partitions)"]
+        P0["Partition 0<br/>offset: 0,1,2,3..."]
+        P1["Partition 1<br/>offset: 0,1,2,3..."]
+        P2["Partition 2<br/>offset: 0,1,2,3..."]
+        P3["Partition 3<br/>offset: 0,1,2,3..."]
+    end
+
+    subgraph CG["Consumer Group: 'order-service'"]
+        C1["Consumer 1<br/>reads P0, P1"]
+        C2["Consumer 2<br/>reads P2, P3"]
+    end
+
+    Producer1["Producer<br/>(API Server)"] -->|"send()"| Topic
+    P0 --> C1
+    P1 --> C1
+    P2 --> C2
+    P3 --> C2
+
+    style Cluster fill:#42a5f5,color:#fff
+    style CG fill:#66bb6a,color:#fff
+    style Producer1 fill:#ff9800,color:#fff
+```
+
+### KafkaJS Setup — Producer & Consumer
+
+> 📖 **What this example demonstrates:** The core KafkaJS setup: creating a client, then a producer and consumer. The producer `send()` call puts messages onto a Kafka topic. The consumer's `run()` loop continuously reads new messages as they arrive. Everything is async — your app stays responsive while waiting for messages.
+>
+> 🔑 **Key terms:**
+>
+> - **`clientId`** — A human-readable name for your app in Kafka logs and metrics. Helps identify traffic sources.
+> - **`brokers`** — Kafka cluster addresses. Always specify multiple for fault tolerance (if one broker is down, others take over).
+> - **`key`** (partition key) — A string that determines which partition the message goes to. Same key → same partition → messages for that key are always in order. No key → round-robin across partitions.
+> - **`idempotent: true`** — The producer assigns sequence numbers. If a message is retried (network error), Kafka deduplicates it. You get exactly-once producer semantics.
+> - **`groupId`** — Consumer group identifier. All consumers with the same `groupId` share the load (each partition assigned to one consumer). Different `groupId` = independent consumption.
+
+```js
+const { Kafka, Partitioners, logLevel } = require("kafkajs");
+
+// 1. CREATE KAFKA CLIENT
+const kafka = new Kafka({
+    clientId: "my-app", // Human-readable name for logs
+    brokers: ["broker1:9092", "broker2:9092", "broker3:9092"], // Connect to multiple brokers for HA
+    retry: {
+        initialRetryTime: 300, // ms before first retry
+        retries: 10, // Retry up to 10 times on transient errors
+    },
+    logLevel: logLevel.WARN, // Only log warnings and errors (not every consumed message)
+});
+
+// 2. PRODUCER — Sending Messages
+const producer = kafka.producer({
+    createPartitioner: Partitioners.DefaultPartitioner, // Key-based routing (key → partition)
+    idempotent: true, // Prevent duplicates on retry (safe to use)
+    transactionalId: "my-transactional-id", // Enables atomic multi-topic writes (optional)
+});
+
+async function startProducer() {
+    await producer.connect(); // Establish connection to Kafka brokers
+
+    // Send a single message
+    await producer.send({
+        topic: "orders",
+        messages: [
+            {
+                key: "user-123", // Same key → same partition → all user-123 events are ordered!
+                value: JSON.stringify({ orderId: "ORD-001", amount: 99.99 }), // Serialized to bytes
+                headers: { source: "api-server" }, // Optional metadata (logged, searchable)
+            },
+        ],
+    });
+
+    // Send a batch of messages (higher throughput — fewer network round trips)
+    await producer.sendBatch({
+        topicMessages: [
+            {
+                topic: "orders",
+                messages: [
+                    {
+                        key: "user-123",
+                        value: JSON.stringify({
+                            orderId: "ORD-002",
+                            amount: 50,
+                        }),
+                    },
+                    {
+                        key: "user-456",
+                        value: JSON.stringify({
+                            orderId: "ORD-003",
+                            amount: 75,
+                        }),
+                    },
+                ],
+            },
+            {
+                topic: "notifications",
+                messages: [
+                    {
+                        value: JSON.stringify({
+                            type: "order_created",
+                            orderId: "ORD-002",
+                        }),
+                    },
+                ],
+            },
+        ],
+    });
+}
+
+// 3. CONSUMER — Reading Messages
+const consumer = kafka.consumer({
+    groupId: "order-service", // All instances with same groupId share the partitions
+    sessionTimeout: 30000, // 30s: if no heartbeat, Kafka assumes consumer died → rebalance
+    heartbeatInterval: 3000, // Every 3s: "I'm alive" signal to Kafka broker
+    maxWaitTimeInMs: 5000, // Long poll: wait up to 5s for new messages (saves CPU)
+});
+```
+
+### Consumer: `eachMessage` vs `eachBatch`
+
+This is a critical performance choice. `eachMessage` is simpler; `eachBatch` gives you much higher throughput.
+
+> 📖 **What these examples demonstrate:** Two ways to consume Kafka messages. `eachMessage` calls your handler once per message — simple but slow (one DB write per message). `eachBatch` gives you all messages arrived so far as an array — you can do bulk inserts, dramatically reducing round trips to the database.
+>
+> 🔑 **Key terms:**
+>
+> - **`heartbeat()`** — Long-running processing must periodically call this to tell Kafka: "I'm still alive, don't trigger a rebalance". Call it every few seconds inside a slow loop.
+> - **`isRunning()`** — Returns false when the consumer is shutting down. Check this in long loops to exit cleanly.
+> - **`isStale()`** — Returns true if a rebalance happened while you were processing. The batch belongs to a partition you no longer own. Stop processing and skip commit.
+> - **`resolveOffset(offset)`** — Marks this specific message's offset as processed (ready to commit). Like checking off items on a to-do list.
+> - **`commitOffsetsIfNecessary()`** — Sends the committed offsets to Kafka. "I've processed up to this message; if I restart, start from the next one."
+
+```js
+// ─── OPTION A: eachMessage (Simple, Lower Throughput) ───
+// Kafka calls your handler once PER message
+// Good for: low-volume topics, simple processing
+
+async function runConsumerSimple() {
+    await consumer.connect();
+    await consumer.subscribe({ topic: "orders", fromBeginning: false }); // Only new messages
+
+    await consumer.run({
+        // Called once per message (one DB write per message — can be slow)
+        eachMessage: async ({ topic, partition, message, heartbeat }) => {
+            const order = JSON.parse(message.value.toString()); // Deserialize bytes to object
+            console.log(
+                `Processing order ${order.orderId} from partition ${partition}`,
+            );
+
+            await processOrder(order); // Your business logic
+
+            // Call heartbeat() if processing takes > 3s to prevent Kafka rebalance
+            await heartbeat();
+        },
+    });
+}
+
+// ─── OPTION B: eachBatch (High Throughput, More Control) ───
+// Kafka gives you a BATCH of messages at once
+// Good for: high-volume topics, bulk DB inserts, analytics
+
+async function runConsumerBatch() {
+    await consumer.connect();
+    await consumer.subscribe({ topic: "orders", fromBeginning: false });
+
+    await consumer.run({
+        eachBatchAutoResolve: false, // WE control offset commits
+
+        eachBatch: async ({
+            batch,
+            resolveOffset,
+            heartbeat,
+            commitOffsetsIfNecessary,
+            isRunning,
+            isStale,
+        }) => {
+            const { topic, partition, messages } = batch;
+
+            console.log(
+                `Batch: ${messages.length} messages from ${topic}[${partition}]`,
+            );
+
+            for (const message of messages) {
+                // Check if consumer is still running (e.g., SIGTERM received)
+                if (!isRunning() || isStale()) break; // Stop processing if shutting down or rebalanced
+
+                const order = JSON.parse(message.value.toString());
+                await processOrder(order);
+
+                resolveOffset(message.offset); // Mark this message as processed
+
+                await heartbeat(); // Let Kafka know we're still alive (do this every few messages)
+            }
+
+            await commitOffsetsIfNecessary(); // Commit all resolved offsets at once (one network call)
+        },
+    });
+}
+```
+
+### eachBatch — Why It's Faster
+
+```mermaid
+sequenceDiagram
+    participant Broker as Kafka Broker
+    participant C as Consumer
+
+    Note over Broker,C: eachMessage (N network calls)
+    Broker->>C: message 1
+    C->>C: process
+    C->>Broker: commit offset 1
+    Broker->>C: message 2
+    C->>C: process
+    C->>Broker: commit offset 2
+    Note over Broker,C: (one by one — slow)
+
+    Note over Broker,C: eachBatch (1 network call for N messages)
+    Broker->>C: batch [msg 1, msg 2, ..., msg 100]
+    C->>C: process all
+    C->>Broker: commit offset 100
+    Note over Broker,C: (bulk — fast, fewer round trips)
+```
+
+### KafkaJS Configuration Tuning — Increasing Throughput
+
+```js
+// ─── PRODUCER TUNING ───
+const producer = kafka.producer({
+    idempotent: true,
+    // Allow more in-flight requests (parallelism)
+    maxInFlightRequests: 5, // default: null (unlimited in non-idempotent mode)
+    // Batch messages before sending (latency vs throughput tradeoff)
+    allowAutoTopicCreation: false, // Don't auto-create topics in production
+});
+
+// send() options for throughput
+await producer.send({
+    topic: "events",
+    // Compression reduces network I/O (CPU trade-off)
+    compression: 2, // 0=None, 1=Gzip, 2=Snappy, 3=LZ4, 4=ZSTD
+    // acks: 0=fire-and-forget, 1=leader-only, -1=all replicas (safest)
+    acks: -1, // Wait for ALL replicas (safest, slowest)
+    // acks: 1 → leader only (faster, small risk of data loss)
+    // acks: 0 → fire and forget (fastest, messages can be lost)
+    timeout: 30000,
+    messages: [{ key: "k1", value: "v1" }],
+});
+
+// ─── CONSUMER TUNING ───
+const consumer = kafka.consumer({
+    groupId: "my-group",
+    // How many bytes to fetch per request (larger = fewer requests = higher throughput)
+    maxBytes: 10485760, // 10MB per fetch (default: 1MB)
+    minBytes: 1, // Fetch immediately when any data available
+    maxWaitTimeInMs: 5000, // Max wait for minBytes (long poll)
+    // Read N messages from partition before moving to next
+    maxBytesPerPartition: 1048576, // 1MB per partition per fetch
+
+    // Session & rebalance
+    sessionTimeout: 30000, // 30s — increase for slow consumers
+    heartbeatInterval: 3000, // Must be < sessionTimeout / 3
+    rebalanceTimeout: 60000, // Time allowed for rebalance
+
+    // Retry
+    retry: {
+        retries: 5,
+        initialRetryTime: 300,
+    },
+});
+
+// ─── Subscribe to multiple topics ───
+await consumer.subscribe({
+    topics: ["orders", "payments"],
+    fromBeginning: false,
+});
+```
+
+### Throughput Optimization Checklist
+
+| Lever           | Setting                             | Effect                                      |
+| --------------- | ----------------------------------- | ------------------------------------------- |
+| **Compression** | `compression: 2` (Snappy)           | 50-80% less network I/O, slight CPU cost    |
+| **Batch size**  | `maxBytes: 10MB`                    | Fewer fetch requests, higher throughput     |
+| **acks**        | `acks: 1` (leader only)             | 2-3x faster writes, tiny durability risk    |
+| **Partitions**  | Increase partition count            | More parallelism (1 consumer per partition) |
+| **eachBatch**   | Use instead of eachMessage          | Bulk processing, fewer offset commits       |
+| **Concurrency** | `partitionsConsumedConcurrently: 3` | Process multiple partitions in parallel     |
+| **Idempotent**  | `idempotent: true`                  | Prevents duplicates on producer retry       |
+
+```js
+// Consume multiple partitions concurrently
+await consumer.run({
+    partitionsConsumedConcurrently: 3, // Process 3 partitions at the same time
+    eachMessage: async ({ topic, partition, message }) => {
+        await processMessage(message);
+    },
+});
+```
+
+### Consumer Offset Management
+
+```js
+// ─── AUTO COMMIT (Default) ───
+// Offsets committed every 5 seconds automatically
+// Risk: crash between process + commit = reprocessing
+const consumer = kafka.consumer({
+    groupId: "my-group",
+    // Auto-commit settings (default: enabled)
+    autoCommit: true,
+    autoCommitInterval: 5000, // Commit every 5s
+    autoCommitThreshold: 100, // Or every 100 messages
+});
+
+// ─── MANUAL COMMIT (Safer) ───
+// You decide when to commit — after successful processing
+const consumer2 = kafka.consumer({
+    groupId: "my-group",
+    autoCommit: false, // Disable auto-commit
+});
+
+await consumer2.run({
+    eachMessage: async ({ topic, partition, message }) => {
+        await processMessage(message);
+
+        // Commit AFTER successful processing
+        await consumer2.commitOffsets([
+            {
+                topic,
+                partition,
+                offset: (Number(message.offset) + 1).toString(), // +1 = next offset to read
+            },
+        ]);
+    },
+});
+
+// ─── SEEK: Reset consumer to specific offset ───
+// Useful for replaying events or skipping bad messages
+consumer.seek({ topic: "orders", partition: 0, offset: "0" }); // Replay from beginning
+consumer.seek({ topic: "orders", partition: 0, offset: "1000" }); // Skip to offset 1000
+```
+
+### Dead Letter Queue Pattern with KafkaJS
+
+```js
+const dlqProducer = kafka.producer();
+await dlqProducer.connect();
+
+await consumer.run({
+    eachMessage: async ({ topic, partition, message }) => {
+        try {
+            await processMessage(message);
+        } catch (err) {
+            // Send failed message to DLQ topic for manual inspection
+            await dlqProducer.send({
+                topic: `${topic}.dlq`,
+                messages: [
+                    {
+                        key: message.key,
+                        value: message.value,
+                        headers: {
+                            ...message.headers,
+                            "x-original-topic": topic,
+                            "x-original-partition": String(partition),
+                            "x-original-offset": message.offset,
+                            "x-error": err.message,
+                            "x-failed-at": new Date().toISOString(),
+                        },
+                    },
+                ],
+            });
+            console.error(`Message sent to DLQ: ${err.message}`);
+        }
+    },
+});
+```
+
+### Kafka Partition Key Strategy
+
+Choosing the right partition key determines **ordering and load distribution**:
+
+```js
+// SCENARIO 1: Order events — key by userId
+// All events for the same user go to the same partition → guaranteed order per user
+await producer.send({
+    topic: "orders",
+    messages: [
+        { key: "user-123", value: JSON.stringify({ event: "order_created" }) },
+        {
+            key: "user-123",
+            value: JSON.stringify({ event: "payment_received" }),
+        },
+        // Both go to same partition → processed in order
+    ],
+});
+
+// SCENARIO 2: Analytics events — no key (round-robin)
+// Events spread evenly across partitions → max throughput, no ordering
+await producer.send({
+    topic: "page-views",
+    messages: [
+        { value: JSON.stringify({ page: "/home", ts: Date.now() }) },
+        // No key → round-robin across partitions
+    ],
+});
+
+// SCENARIO 3: Hot partition problem — bad key choice
+// ❌ BAD: key = "country" → 90% of traffic goes to partition for "US"
+// ✅ FIX: Use more granular key (userId, sessionId) for even distribution
+```
+
+```mermaid
+graph LR
+    subgraph Keys["Partition Key Strategy"]
+        direction TB
+        K1["key: 'user-123'<br/>→ hash('user-123') % 4<br/>→ Partition 2"]
+        K2["key: 'user-456'<br/>→ hash('user-456') % 4<br/>→ Partition 0"]
+        K3["key: null<br/>→ Round Robin<br/>→ P0, P1, P2, P3..."]
+    end
+
+    subgraph Partitions["Topic: 'orders' (4 partitions)"]
+        P0["P0: user-456 events"]
+        P1["P1: ..."]
+        P2["P2: user-123 events"]
+        P3["P3: ..."]
+    end
+
+    K2 --> P0
+    K1 --> P2
+    K3 --> P0
+    K3 --> P1
+    K3 --> P2
+    K3 --> P3
+
+    style Keys fill:#42a5f5,color:#fff
+    style Partitions fill:#66bb6a,color:#fff
+```
+
+### Graceful Shutdown
+
+```js
+// Always disconnect producers & consumers on shutdown
+const shutdown = async () => {
+    console.log("Shutting down Kafka...");
+    await consumer.disconnect(); // Commits final offsets, leaves consumer group
+    await producer.disconnect();
+    process.exit(0);
+};
+
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
+```
+
+### Senior-Level Q&A
+
+**Q1: How do you identify a slow consumer?**
+
+A: Monitor **consumer lag** — the difference between the latest offset in the partition and the consumer's committed offset.
+
+```
+Consumer Lag = Latest Offset (log-end-offset) − Consumer Committed Offset
+```
+
+- **Lag = 0** → Consumer is caught up (healthy).
+- **Lag growing over time** → Consumer is slower than the producer (problem!).
+- **Lag spikes then recovers** → Temporary slowdown (GC pauses, slow DB query).
+
+**How to measure:**
+
+```bash
+# Kafka CLI (built-in)
+kafka-consumer-groups.sh --bootstrap-server broker:9092 \
+    --describe --group order-service
+
+# Output:
+# TOPIC     PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+# orders    0          1000            1050            50    ← 50 messages behind
+# orders    1          2000            2000            0     ← caught up
+```
+
+```js
+// Programmatic lag monitoring with KafkaJS admin API
+const admin = kafka.admin();
+await admin.connect();
+
+// Get consumer group offsets
+const offsets = await admin.fetchOffsets({
+    groupId: "order-service",
+    topics: ["orders"],
+});
+
+// Get latest offsets (log-end)
+const topicOffsets = await admin.fetchTopicOffsets("orders");
+
+// Calculate lag per partition
+topicOffsets.forEach((partitionInfo) => {
+    const consumerOffset = offsets
+        .find((o) => o.topic === "orders")
+        ?.partitions.find((p) => p.partition === partitionInfo.partition);
+
+    const lag =
+        Number(partitionInfo.offset) - Number(consumerOffset?.offset || 0);
+    console.log(`Partition ${partitionInfo.partition}: lag = ${lag}`);
+
+    if (lag > 10000) {
+        console.warn(`⚠️ HIGH LAG on partition ${partitionInfo.partition}!`);
+    }
+});
+
+await admin.disconnect();
+```
+
+**Fixing a slow consumer:**
+
+1. **Scale out** — add more consumers to the group (max = number of partitions)
+2. **Use `eachBatch`** — bulk process instead of one-by-one
+3. **Optimize processing** — batch DB inserts, cache lookups, reduce I/O
+4. **Increase partitions** — more partitions = more parallelism
+5. **Check for blocking code** — sync DB calls, missing `await`, tight loops
+
+**Q2: What happens when a consumer crashes mid-batch?**
+
+A: It depends on your commit strategy:
+
+- **Auto-commit (default):** If the offset was auto-committed before the crash, the message is "lost" (skipped on restart). If not yet committed, the message is **reprocessed** on restart. Neither is exactly-once.
+- **Manual commit:** If you commit AFTER processing, the unprocessed messages are reprocessed on restart (at-least-once). Make your processing **idempotent** to handle duplicates.
+
+```js
+// Idempotent processing: safe to reprocess
+async function processOrder(order) {
+    // Use INSERT ... ON CONFLICT DO NOTHING (PostgreSQL)
+    await db.query(
+        `INSERT INTO processed_orders (order_id, amount)
+         VALUES ($1, $2)
+         ON CONFLICT (order_id) DO NOTHING`,
+        [order.orderId, order.amount],
+    );
+    // If reprocessed, the duplicate insert is silently ignored
+}
+```
+
+**Q3: How do you guarantee message ordering?**
+
+A: Kafka guarantees order **within a single partition only**. To ensure ordering for related events:
+
+1. Use the same **partition key** for related messages (e.g., `userId` for all events of that user).
+2. Set `maxInFlightRequests: 1` on the producer if you need strict ordering even during retries.
+3. Use a single partition (but this kills parallelism — only for low-volume topics).
+
+```js
+// All events for user-123 go to the same partition → guaranteed order
+await producer.send({
+    topic: "user-events",
+    messages: [
+        { key: "user-123", value: JSON.stringify({ event: "signup" }) },
+        { key: "user-123", value: JSON.stringify({ event: "email_verified" }) },
+        { key: "user-123", value: JSON.stringify({ event: "first_purchase" }) },
+    ],
+});
+// Consumer reading this partition sees: signup → email_verified → first_purchase (in order)
+```
+
+**Q4: Partition count — how to decide?**
+
+A: Rule of thumb:
+
+- **Partitions ≥ max consumers** in the group (each consumer gets at least 1 partition)
+- **More partitions = more parallelism** but more overhead (memory, file handles, rebalance time)
+- **Start with ~6-12 partitions** for most topics; scale when needed
+- **Upper limit:** ~thousands per broker; each partition uses ~10MB memory on the broker
+- **You can increase partitions but NEVER decrease** (would break key-based routing)
+
+**Q5: What is a rebalance and how do you minimize it?**
+
+A: A rebalance happens when Kafka reassigns partitions to consumers — triggered by a consumer joining, leaving, or crashing, or when partitions are added.
+
+**During rebalance, ALL consumers in the group PAUSE** — no messages are processed. This can last seconds to minutes.
+
+**Minimize rebalances:**
+
+1. **Increase `sessionTimeout`** (e.g., 60s) — gives slow consumers more time before being considered dead
+2. **Decrease `heartbeatInterval`** (e.g., 2s) — faster heartbeats = faster detection, fewer false positives
+3. **Use `CooperativeStickyAssigner`** — only reassigns affected partitions instead of all
+4. **Avoid short-lived consumers** — don't spin up/down consumers frequently
+5. **Call `heartbeat()` in long processing loops** — prevents the broker from thinking the consumer is dead
+
+```js
+const consumer = kafka.consumer({
+    groupId: "my-group",
+    sessionTimeout: 60000, // 60s (generous)
+    heartbeatInterval: 2000, // Every 2s
+    maxWaitTimeInMs: 5000,
+    // Use cooperative-sticky to minimize rebalance disruption
+    rebalanceTimeout: 60000,
+});
+```
+
+**Q6: How is Kafka different from a traditional message queue (RabbitMQ/BullMQ)?**
+
+A:
+
+| Aspect          | Kafka                                 | RabbitMQ / BullMQ                    |
+| --------------- | ------------------------------------- | ------------------------------------ |
+| Model           | **Distributed log** (append-only)     | Message queue (delete after consume) |
+| Replay          | ✅ Yes — seek to any offset           | ❌ No — message gone after ack       |
+| Ordering        | Per-partition guaranteed              | Per-queue (single consumer)          |
+| Throughput      | **~1M messages/sec**                  | ~10-50K messages/sec                 |
+| Consumer groups | ✅ Multiple groups read independently | Competing consumers share            |
+| Retention       | Time/size-based (keep 7 days, 100GB)  | Until consumed                       |
+| Use case        | Event streaming, analytics, CDC       | Task queues, job processing          |
+
+**Q7: Your producer is slow. How do you increase write throughput?**
+
+A:
+
+1. **Compression** — `compression: 2` (Snappy) or `4` (ZSTD) reduces message size
+2. **Batching** — Use `sendBatch()` to send many messages per API call
+3. **acks: 1** — Wait for leader only (instead of all replicas)
+4. **acks: 0** — Fire-and-forget (fastest, risk of loss — only for non-critical data like logs)
+5. **Increase partitions** — More partitions = producer distributes across more brokers
+6. **Idempotent producer** — `idempotent: true` allows safe retries without duplicates
+
+**Q8: How do you ensure exactly-once processing end-to-end?**
+
+A: Three pieces:
+
+1. **Idempotent producer** (`idempotent: true`) — prevents duplicate messages on retry
+2. **Transactional producer** (`transactionalId: 'xxx'`) — atomic writes across multiple topics
+3. **Consumer: read-process-commit atomically** — manual offset commit AFTER processing + idempotent processing (upsert/dedup in DB)
+
+```js
+// Transactional producer: atomic write to multiple topics
+const producer = kafka.producer({
+    idempotent: true,
+    transactionalId: "order-tx",
+});
+await producer.connect();
+
+const transaction = await producer.transaction();
+try {
+    await transaction.send({
+        topic: "orders",
+        messages: [{ value: orderData }],
+    });
+    await transaction.send({
+        topic: "notifications",
+        messages: [{ value: notifData }],
+    });
+    // Commit both sends atomically — either both succeed or both fail
+    await transaction.commit();
+} catch (err) {
+    await transaction.abort();
+    throw err;
+}
+```
+
+> **💡 Interview Tip — One-Liner Answers:**
+>
+> - _"What is consumer lag?"_ → The difference between the latest offset in the partition and the consumer's committed offset. Growing lag = slow consumer.
+> - _"eachMessage vs eachBatch?"_ → `eachMessage` calls your handler per message (simple, slower). `eachBatch` gives you a batch (bulk processing, fewer commits, higher throughput).
+> - _"How does Kafka guarantee ordering?"_ → Within a single partition only. Use the same partition key for related messages.
+> - _"Kafka vs RabbitMQ?"_ → Kafka is a distributed log (replay, high throughput, event streaming). RabbitMQ is a message broker (routing, task queues, delete after consume).
+> - _"What triggers a rebalance?"_ → Consumer join/leave/crash, partition count change. During rebalance, ALL consumers pause. Minimize with cooperative-sticky assigner and generous session timeout.
+
+> **📝 Quick Revision — Kafka with KafkaJS:**
+> | Concept | Key Point |
+> |---|---|
+> | Broker | Server that stores messages; cluster = multiple brokers |
+> | Topic | Named channel; split into partitions |
+> | Partition | Ordered log; unit of parallelism |
+> | Consumer Group | Consumers sharing work; 1 partition → 1 consumer |
+> | Offset | Sequential message ID in partition; consumer tracks progress |
+> | `eachBatch` | Bulk consume; fewer commits; higher throughput |
+> | Consumer Lag | `log-end-offset − committed-offset`; monitor to detect slow consumers |
+> | Partition Key | Same key → same partition → ordered; null key → round-robin |
+> | Rebalance | Partition reassignment; all consumers pause; minimize disruption |
+> | Exactly-once | Idempotent producer + transactional writes + idempotent consumer |
+
+[↑ Back to Index](#table-of-contents)
+
+---
+
+## Phase 7 — Testing, Performance & API Design
+
+### 7.1 Testing & CI/CD
+
+### Concepts
+
+Testing in Node.js isn't optional — it's what separates production-ready code from prototypes. **Unit tests** verify individual functions in isolation. **Integration tests** verify that modules work together (e.g., API + database). **End-to-end (e2e) tests** simulate real user flows.
+
+**Test runners:** Node.js 18+ includes a built-in test runner (`node:test`). Popular alternatives: **Jest** (batteries-included, mocking, coverage), **Vitest** (fast, ESM-native), **Mocha** (flexible, pairs with Chai/Sinon).
+
+**Mocking:** Replace real dependencies (database, HTTP calls, file system) with controlled fakes so tests are fast, reliable, and isolated. Jest has built-in `jest.mock()`. For manual mocking, use **Sinon.js** stubs/spies.
+
+**CI/CD:** Run tests automatically on every push/PR using GitHub Actions, GitLab CI, or Jenkins. A typical pipeline: install → lint → test → build → deploy.
+
+```mermaid
+flowchart LR
+    subgraph Dev ["Developer"]
+        Code[Write Code] --> Push[git push]
+    end
+    subgraph CI ["CI Pipeline"]
+        Install[npm install] --> Lint[ESLint]
+        Lint --> Test[Run Tests]
+        Test --> Coverage[Coverage Report]
+        Coverage --> Build[Build / Bundle]
+    end
+    subgraph CD ["CD Pipeline"]
+        Build --> Stage[Deploy Staging]
+        Stage --> E2E[E2E Tests]
+        E2E --> Prod[Deploy Production]
+    end
+    Push --> Install
+    style Test fill:#66bb6a,color:#fff
+    style Prod fill:#1565c0,color:#fff
+```
+
+### Key Patterns
+
+> 📖 **What this example demonstrates:** Three levels of testing in Node.js. Built-in `node:test` for pure unit tests (no dependencies). Jest for unit tests with mocking (replace the real DB with a fake). Supertest for integration tests (make real HTTP calls to your Express app without starting a real server).
+>
+> 🔑 **Key terms:**
+>
+> - **`jest.mock('./db')`** — Replaces the entire `./db` module with auto-generated mock functions. Any function in `db` becomes a Jest spy that returns `undefined` by default.
+> - **`mockResolvedValue(val)`** — Sets what the mock function returns when awaited. Simulates a DB returning a user.
+> - **`rejects.toThrow(msg)`** — Asserts that the promise rejects with an error containing `msg`. Tests error paths.
+> - **`supertest(app)`** — Creates an HTTP test client for your Express app. Doesn't need `app.listen()` — it binds an ephemeral port internally. No server cleanup needed.
+
+```js
+// --- Node.js built-in test runner (node:test) ---
+const { describe, it } = require("node:test");
+const assert = require("node:assert");
+
+describe("Math utils", () => {
+    it("should add two numbers", () => {
+        assert.strictEqual(1 + 2, 3); // strictEqual: checks value AND type (=== not ==)
+    });
+
+    it("should handle negative numbers", () => {
+        assert.strictEqual(-1 + -2, -3);
+    });
+});
+// Run: node --test math.test.js
+```
+
+```js
+// --- Jest example with mocking ---
+// userService.js
+const db = require("./db");
+
+async function getUser(id) {
+    const user = await db.findById(id);
+    if (!user) throw new Error("User not found");
+    return user;
+}
+module.exports = { getUser };
+
+// userService.test.js
+jest.mock("./db"); // Replace entire ./db module with mocks (all functions become jest fns)
+const db = require("./db");
+const { getUser } = require("./userService");
+
+test("returns user when found", async () => {
+    db.findById.mockResolvedValue({ id: 1, name: "Alice" }); // Mock DB: "return this user"
+    const user = await getUser(1);
+    expect(user.name).toBe("Alice"); // Asserts without ever touching a real database!
+});
+
+test("throws when user not found", async () => {
+    db.findById.mockResolvedValue(null); // Mock DB: "user doesn't exist"
+    await expect(getUser(999)).rejects.toThrow("User not found"); // Test the error path
+});
+```
+
+```js
+// --- Integration test (supertest + Express) ---
+// Tests the entire HTTP layer: routing, middleware, request parsing, response formatting
+const request = require("supertest");
+const app = require("./app"); // Your Express app (must NOT call app.listen!)
+
+describe("GET /api/users", () => {
+    it("returns 200 and array of users", async () => {
+        const res = await request(app).get("/api/users"); // Makes real HTTP request internally
+        expect(res.status).toBe(200);
+        expect(Array.isArray(res.body)).toBe(true); // Response body is auto-parsed JSON
+    });
+
+    it("returns 404 for unknown user", async () => {
+        const res = await request(app).get("/api/users/99999");
+        expect(res.status).toBe(404); // Verifies error handling works
+    });
+});
+```
+
+```yaml
+# --- GitHub Actions CI ---
+# .github/workflows/ci.yml
+name: CI
+on: [push, pull_request]
+jobs:
+    test:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with: { node-version: 20 }
+            - run: npm ci
+            - run: npm run lint
+            - run: npm test -- --coverage
+```
+
+### Senior-Level Q&A
+
+**Q1: Unit vs integration vs e2e — when to use each?**
+
+A: Follow the **testing pyramid**: many unit tests (fast, cheap) → fewer integration tests → few e2e tests (slow, expensive). Unit tests catch logic bugs. Integration tests catch wiring bugs. E2e tests catch user-facing bugs.
+
+**Q2: How do you mock `fs` or `http` in tests?**
+
+A: Use `jest.mock('fs')` or inject dependencies. For HTTP, use **nock** or **msw** to intercept outgoing requests.
+
+```js
+const nock = require("nock");
+nock("https://api.example.com")
+    .get("/users/1")
+    .reply(200, { id: 1, name: "Alice" });
+// Now any HTTP call to that URL returns the mock
+```
+
+**Q3: What's a good code coverage target?**
+
+A: Aim for **80%+ line coverage** as a baseline. 100% is impractical and gives false confidence. Focus on testing **critical paths** (auth, payments, data mutations) rather than chasing numbers.
+
+> **💡 Interview Tip — One-Liner Answers:**
+>
+> - _"Unit vs integration vs e2e tests?"_ → Unit = isolated function. Integration = modules together (API + DB). E2e = full user flow (browser/UI). Pyramid: many unit, some integration, few e2e.
+> - _"How do you mock external APIs in tests?"_ → Use `nock` to intercept HTTP calls and return controlled responses. For functions, use `jest.mock()` or sinon stubs.
+> - _"What's the testing pyramid?"_ → Many fast unit tests at the bottom, some integration tests in the middle, few slow e2e tests at the top. Invert it and your CI is slow and flaky.
+> - _"How do you test async code?"_ → Return the promise from the test, or use `async/await`. Jest auto-waits if test function returns a promise.
+
+> **📝 Quick Revision — Testing:**
+> | Test Type | Scope | Speed | Tools |
+> |---|---|---|---|
+> | Unit | Single function | Fast (~ms) | Jest, Vitest, node:test |
+> | Integration | Module + DB/API | Medium (~s) | Supertest, testcontainers |
+> | E2E | Full user flow | Slow (~10s+) | Playwright, Cypress |
+> | Mocking | Replace external deps | N/A | nock, jest.mock, sinon |
+
+[↑ Back to Index](#table-of-contents)
+
+---
+
+### 7.2 Performance & Benchmarking
+
+### Concepts
+
+Performance in Node.js means keeping the event loop responsive and throughput high. The key metrics are: **requests/second**, **latency (p50/p95/p99)**, **event loop lag**, and **memory usage**.
+
+**Tools:**
+
+- **autocannon** — HTTP load testing tool for Node.js (like `ab` or `wrk`, but in JS)
+- **clinic.js** — Suite of profiling tools: Clinic Doctor (event loop), Clinic Flame (flamegraph), Clinic Bubbleprof (async)
+- **0x** — Flamegraph generator for CPU profiling
+- **perf_hooks** — Built-in module for performance measurement
+
+```mermaid
+flowchart TB
+    subgraph Metrics ["Key Performance Metrics"]
+        RPS["Requests/sec<br/>(throughput)"]
+        LAT["Latency p99<br/>(tail latency)"]
+        EL["Event Loop Lag<br/>(responsiveness)"]
+        MEM["Memory Usage<br/>(heap + RSS)"]
+    end
+    subgraph Tools ["Profiling Tools"]
+        AC[autocannon]
+        CL[clinic.js]
+        FL[0x / flamegraph]
+        PH[perf_hooks]
+    end
+    AC --> RPS
+    AC --> LAT
+    CL --> EL
+    CL --> MEM
+    FL --> EL
+    PH --> LAT
+    style RPS fill:#4caf50,color:#fff
+    style LAT fill:#ff9800,color:#fff
+```
+
+### Key Patterns
+
+> 📖 **What this example demonstrates:** Three performance measurement tools. The event loop delay monitor tracks how long Node's event loop is backed up (healthy: < 20ms). Performance marks let you time specific operations precisely. autocannon is a CLI load tester that simulates real traffic and shows you throughput and latency distribution.
+>
+> 🔑 **Key terms:**
+>
+> - **`monitorEventLoopDelay`** — Samples the gap between when a timer was supposed to fire and when it actually fired. High lag = something blocking the event loop (CPU work, sync I/O).
+> - **p50/p99 percentile** — p50 = 50% of requests are faster than this (the median). p99 = 99% are faster. p99 reveals your worst-case experience. Always optimize p99.
+> - **`performance.mark/measure`** — Same API as browser Performance API. Mark start/end points, then measure the duration between them.
+> - **`-c 100`** in autocannon — 100 concurrent HTTP connections hammering your server simultaneously. Simulates real load.
+
+```js
+// --- Measure event loop lag ---
+const { monitorEventLoopDelay } = require("perf_hooks");
+const h = monitorEventLoopDelay({ resolution: 10 }); // Sample every 10ms
+h.enable();
+
+setInterval(() => {
+    // percentile(50) = median lag; percentile(99) = worst 1% lag
+    // / 1e6 converts nanoseconds to milliseconds
+    console.log(
+        `Event loop lag — p50: ${(h.percentile(50) / 1e6).toFixed(2)}ms, p99: ${(h.percentile(99) / 1e6).toFixed(2)}ms`,
+    );
+    h.reset(); // Reset histogram for next interval
+}, 5000);
+// Healthy: p50 < 5ms, p99 < 20ms
+// Red flag: p99 > 100ms = something blocking the event loop
+```
+
+```js
+// --- Custom performance marks ---
+const { performance, PerformanceObserver } = require("perf_hooks");
+
+// Observer receives measurement results asynchronously
+const obs = new PerformanceObserver((list) => {
+    list.getEntries().forEach((e) => {
+        console.log(`${e.name}: ${e.duration.toFixed(2)}ms`);
+    });
+});
+obs.observe({ entryTypes: ["measure"] }); // Listen for 'measure' entries
+
+performance.mark("db-start"); // Timestamp: before query
+await db.query("SELECT * FROM users"); // The operation you want to time
+performance.mark("db-end"); // Timestamp: after query
+performance.measure("DB Query", "db-start", "db-end"); // Calculate duration
+// Observer logs: "DB Query: 12.45ms"
+```
+
+```bash
+# --- Load test with autocannon ---
+npx autocannon -c 100 -d 10 http://localhost:3000/api/users
+# -c 100 = 100 concurrent connections (simulates 100 simultaneous users)
+# -d 10  = run for 10 seconds
+# Output: req/sec, latency percentiles (p50, p97.5, p99), throughput (MB/s)
+```
+
+```bash
+# --- Flamegraph with clinic ---
+npx clinic flame -- node server.js
+# Runs your server with V8 profiling
+# After load testing, press Ctrl+C
+# Opens flamegraph in browser: wide bars = functions consuming most CPU time
+```
+
+### Senior-Level Q&A
+
+**Q1: Your API's p99 latency jumped from 50ms to 500ms. How do you diagnose?**
+
+A:
+
+1. Check event loop lag (perf_hooks) — if high, something is blocking
+2. Run clinic doctor to find the bottleneck
+3. Check if thread pool is saturated (`UV_THREADPOOL_SIZE`)
+4. Profile with flamegraph to find hot functions
+5. Check external dependencies (DB, Redis latency)
+
+**Q2: How do you benchmark properly? Common mistakes?**
+
+A: Use `autocannon` or `wrk` with realistic payloads. Warm up the server first (JIT, connection pools). Run for at least 30 seconds. Measure p99, not just average. Don't benchmark on the same machine as the server. Common mistake: testing with `curl` in a loop (no concurrency).
+
+> **💡 Interview Tip — One-Liner Answers:**
+>
+> - _"How do you measure Node.js performance?"_ → Event loop lag (`perf_hooks`), throughput (`autocannon`), CPU profiling (`clinic flame`), memory (`process.memoryUsage()`), and p99 latency.
+> - _"What is p99 latency?"_ → The response time at the 99th percentile — 99% of requests are faster than this. More useful than average because it reveals tail latency.
+> - _"Your API is slow. How do you diagnose?"_ → Check event loop lag → clinic doctor → thread pool saturation → flamegraph for hot functions → external deps (DB, Redis latency).
+> - _"autocannon vs wrk?"_ → Both are load testers. `autocannon` is Node-native (npm install). `wrk` is C-based (faster, but needs compilation). Both measure throughput, latency distribution.
+
+> **📝 Quick Revision — Performance:**
+> | Metric | How to Measure | Healthy Value |
+> |---|---|---|
+> | Event loop lag | `monitorEventLoopDelay()` | < 20ms |
+> | Throughput (req/s) | `autocannon -c 100 -d 10` | Depends on app |
+> | p99 latency | autocannon/wrk output | < 200ms for APIs |
+> | Memory (RSS) | `process.memoryUsage().rss` | Stable, not growing |
+> | CPU profiling | `clinic flame` | No single function > 30% |
+
+[↑ Back to Index](#table-of-contents)
+
+---
+
+### 7.3 API Design & Versioning
+
+### Concepts
+
+Good API design makes your backend usable, maintainable, and scalable. **REST** and **GraphQL** are the two dominant paradigms for Node.js APIs.
+
+**REST** organizes resources around URLs (`/users/123/posts`) with HTTP verbs (GET, POST, PUT, DELETE). It's simple, cacheable, and well-understood. Use it when your data model maps well to resources.
+
+**GraphQL** lets clients request exactly the data they need in a single query. It avoids over-fetching and under-fetching. Use it when you have complex relationships or mobile clients that need bandwidth efficiency.
+
+**Versioning** keeps old clients working when you change the API. Common strategies: URL path (`/v1/users`), header (`Accept: application/vnd.api.v2+json`), or query param (`?version=2`).
+
+**Idempotency** ensures that retrying a request produces the same result. Critical for payment APIs — if the client retries a charge, use an **idempotency key** so the server doesn't charge twice.
+
+```mermaid
+flowchart TB
+    subgraph REST ["REST API"]
+        R1["GET /users"] --> R2["GET /users/123"]
+        R2 --> R3["GET /users/123/posts"]
+    end
+    subgraph GQL ["GraphQL"]
+        G1["POST /graphql"] --> G2["query { user(id:123) { name posts { title } } }"]
+    end
+    subgraph Choice ["Decision"]
+        D{"Simple resources?"}
+        D -->|Yes| REST
+        D -->|Complex queries| GQL
+    end
+    style REST fill:#e3f2fd
+    style GQL fill:#fce4ec
+```
+
+### Key Patterns
+
+> 📖 **What this example demonstrates:** Three core REST API design patterns. Cursor-based pagination is more efficient than offset for large tables. Rate limiting protects against abuse. Idempotency keys prevent duplicate charges when payment requests are retried.
+>
+> 🔑 **Key terms:**
+>
+> - **Cursor-based pagination** — Instead of `OFFSET 1000`, use `WHERE id > lastId`. Much faster for PostgreSQL: offset scans skip rows, cursor jumps directly to the index.
+> - **`Math.min(parseInt(limit), 100)`** — Input validation and capping. Prevents a client from requesting 10,000 rows in one call.
+> - **`windowMs: 15 * 60 * 1000`** — 15 minutes in milliseconds. Rate limiting window: max 100 requests per IP per 15 minutes.
+> - **Idempotency key** — A UUID the client generates per request. If the same key is sent twice, the server returns the SAME response instead of charging again. Essential for payment retries.
+
+```js
+// --- REST best practices ---
+// Resource naming: plural nouns, predictable hierarchy
+// GET    /api/v1/users        → list all users
+// GET    /api/v1/users/:id    → get one user
+// POST   /api/v1/users        → create user
+// PUT    /api/v1/users/:id    → full update (replace)
+// PATCH  /api/v1/users/:id    → partial update (only changed fields)
+// DELETE /api/v1/users/:id    → delete
+
+// Pagination (cursor-based, better than offset for large datasets)
+app.get("/api/v1/users", async (req, res) => {
+    const { cursor, limit = 20 } = req.query;
+    const safeLimit = Math.min(parseInt(limit) || 20, 100); // Cap at 100 (prevent abuse)
+    const users = await db.query(
+        "SELECT * FROM users WHERE id > $1 ORDER BY id LIMIT $2",
+        [cursor || 0, safeLimit], // Cursor = last seen ID; fetch the next page from there
+    );
+    res.json({
+        data: users,
+        nextCursor: users.length ? users[users.length - 1].id : null, // Null = no more pages
+    });
+});
+```
+
+```js
+// --- Rate limiting ---
+const rateLimit = require("express-rate-limit");
+
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15-minute window
+    max: 100, // Max 100 requests per IP in that window
+    standardHeaders: true, // Include rate limit info in response headers (X-RateLimit-*)
+    message: { error: "Too many requests, try again later" },
+});
+
+app.use("/api/", limiter); // Apply to all API routes
+```
+
+```js
+// --- Idempotency for payments ---
+app.post("/api/v1/charges", async (req, res) => {
+    const idempotencyKey = req.headers["idempotency-key"]; // Client-generated UUID
+    if (!idempotencyKey)
+        return res
+            .status(400)
+            .json({ error: "Idempotency-Key header required" });
+
+    // Check if this request was already processed (don't charge twice!)
+    const existing = await db.query(
+        "SELECT * FROM charges WHERE idempotency_key = $1",
+        [idempotencyKey],
+    );
+    if (existing.rows.length) return res.json(existing.rows[0]); // Return same result
+
+    // First time seeing this key — process the payment
+    const charge = await processPayment(req.body);
+    await db.query(
+        "INSERT INTO charges (idempotency_key, data) VALUES ($1, $2)",
+        [idempotencyKey, charge], // Store so future retries return this same result
+    );
+    res.status(201).json(charge);
+});
+```
+
+### Senior-Level Q&A
+
+**Q1: REST vs GraphQL — tradeoffs?**
+
+|                | REST                | GraphQL                |
+| -------------- | ------------------- | ---------------------- |
+| Caching        | Easy (HTTP caching) | Hard (single endpoint) |
+| Over-fetching  | Common              | Eliminated             |
+| Learning curve | Low                 | Medium                 |
+| Tooling        | Mature              | Growing                |
+| File uploads   | Simple              | Complex                |
+| **Best for**   | CRUD apps           | Complex data graphs    |
+
+**Q2: How do you version a REST API without breaking clients?**
+
+A: Use URL versioning (`/v1/`, `/v2/`) for simplicity. Support the old version for a deprecation period. Use feature flags internally to avoid duplicating code.
+
+**Q3: How do you prevent abuse of your API?**
+
+A: Layer defenses: rate limiting (per IP, per API key), input validation (Joi/Zod), request size limits, authentication, and monitoring for anomalies.
+
+> **💡 Interview Tip — One-Liner Answers:**
+>
+> - _"REST vs GraphQL?"_ → REST = resource-based URLs, fixed response shape, cacheable. GraphQL = single endpoint, client specifies fields, avoids over/under-fetching. REST for CRUD, GraphQL for complex data graphs.
+> - _"How do you handle pagination?"_ → Cursor-based (better for real-time data, no skipping issues) or offset-based (simpler, but slow for deep pages). Return `nextCursor` or `totalPages`.
+> - _"What is idempotency in APIs?"_ → Repeating the same request produces the same result. Use idempotency keys (client-generated UUID) to prevent duplicate side effects on retries.
+> - _"How do you version an API?"_ → URL versioning (`/v1/`, `/v2/`) is simplest. Header versioning (`Accept: application/vnd.api+json;version=2`) is cleaner but harder to test.
+
+> **📝 Quick Revision — API Design:**
+> | Concept | REST | GraphQL |
+> |---|---|---|
+> | Endpoints | Multiple (`/users`, `/posts`) | Single (`/graphql`) |
+> | Data fetching | Fixed response shape | Client specifies fields |
+> | Over-fetching | Common problem | Solved by design |
+> | Caching | Built-in (HTTP cache) | Needs Apollo/Relay |
+> | Versioning | URL (`/v1/`) or header | Schema evolution |
+> | Best for | CRUD APIs | Complex nested data |
+
+[↑ Back to Index](#table-of-contents)
+
+---
+
+## Phase 8 — Deployment, Security & Operations
+
+### 8.1 Deployment & Operations
+
+### Concepts
+
+Getting Node.js code from your laptop to production involves **containerization**, **process management**, **health checks**, and **deployment strategies**.
+
+**Docker** packages your app with its exact Node version and dependencies into a portable container. It eliminates "works on my machine" problems.
+
+**Process managers** (PM2, systemd) keep your app running, restart on crash, and manage logs. PM2 also supports cluster mode (multiple processes per server).
+
+**Health checks** let load balancers and orchestrators know if your app is alive and ready to serve traffic. A liveness check confirms the process is running; a readiness check confirms it can handle requests (DB connected, caches warm).
+
+**Deployment strategies:**
+
+- **Rolling update** — replace instances one at a time (zero downtime)
+- **Blue-green** — run two identical environments; swap traffic instantly
+- **Canary** — route a small % of traffic to the new version first
+
+```mermaid
+flowchart TB
+    subgraph Build ["Build"]
+        Code[Source Code] --> Docker[Docker Image]
+        Docker --> Registry[Container Registry]
+    end
+    subgraph Deploy ["Deploy"]
+        Registry --> K8s[Kubernetes / ECS]
+        K8s --> Pod1[Pod 1]
+        K8s --> Pod2[Pod 2]
+        K8s --> Pod3[Pod 3]
+    end
+    subgraph Monitor ["Monitor"]
+        Pod1 --> Health[Health Checks]
+        Pod2 --> Health
+        Pod3 --> Health
+        Health --> LB[Load Balancer]
+    end
+    style Docker fill:#2196f3,color:#fff
+    style LB fill:#4caf50,color:#fff
+```
+
+### Key Patterns
+
+> 📖 **What this Dockerfile demonstrates:** Multi-stage build — the `builder` stage installs dependencies and compiles, then the `production` stage copies only the final artifacts. The image runs as a non-root user (`appuser`) for security. A built-in HEALTHCHECK tells Docker/Kubernetes whether the container is healthy.
+>
+> 🔑 **Key terms:**
+>
+> - **`node:20-alpine`** — Alpine Linux variant (~60MB) instead of Debian (~900MB). Dramatically smaller images.
+> - **`npm ci`** — "Clean Install" — strictly follows `package-lock.json`. Faster and more reproducible than `npm install` (fails if lock file is inconsistent).
+> - **`--only=production`** — Skip `devDependencies` (Jest, TypeScript, etc.) in the final image. Reduces size and attack surface.
+> - **Multi-stage** — The `builder` stage has compiler tools. The final stage has only what's needed at runtime. Final image ~5-10x smaller.
+> - **`HEALTHCHECK`** — Docker pings this command every 30s. If it fails 3 times, Docker marks the container unhealthy. Load balancer stops routing traffic to it.
+
+```dockerfile
+# --- Optimized Dockerfile for Node.js ---
+FROM node:20-alpine AS builder          # Stage 1: install deps (Alpine = small Linux)
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production           # Install only production deps (no Jest, TypeScript, etc.)
+COPY . .                               # Copy source code AFTER npm install (better Docker layer caching)
+
+FROM node:20-alpine                    # Stage 2: production image (starts fresh, no build tools)
+WORKDIR /app
+# Security: never run as root (if app is compromised, attacker has limited permissions)
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+COPY --from=builder /app .            # Copy only the built artifacts from Stage 1
+USER appuser                          # Switch to non-root user
+EXPOSE 3000                           # Documentation: this container listens on port 3000
+# Health check: Docker/K8s runs this every 30s; exit 1 = unhealthy
+HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://localhost:3000/health || exit 1
+CMD ["node", "server.js"]             # Start the app
+```
+
+> 📖 **What this example demonstrates:** Combined graceful shutdown + health check endpoints. The `/health` endpoint tells the load balancer the service is up. The `/ready` endpoint checks all dependencies (DB, Redis) before accepting traffic. `gracefulShutdown` ensures no requests are dropped during deployment.
+
+```js
+// --- Graceful shutdown ---
+const server = app.listen(3000);
+
+async function gracefulShutdown(signal) {
+    console.log(`${signal} received. Shutting down gracefully...`);
+
+    server.close(() => {
+        // Stop accepting new connections; existing finish naturally
+        console.log("HTTP server closed");
+    });
+
+    await db.end(); // Close all database connections cleanly (finish pending queries)
+    await logger.flush(); // Flush buffered logs to disk/network
+
+    setTimeout(() => {
+        console.error("Forced shutdown"); // Stuck? Kill after 10s
+        process.exit(1);
+    }, 10000);
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM")); // K8s/PM2 sends this
+process.on("SIGINT", () => gracefulShutdown("SIGINT")); // Ctrl+C during development
+```
+
+```js
+// --- Health check endpoints ---
+// /health = liveness: "is the process alive?" - K8s restarts if this fails
+app.get("/health", (req, res) => {
+    res.status(200).json({ status: "ok", uptime: process.uptime() }); // uptime in seconds
+});
+
+// /ready = readiness: "is the app ready to serve traffic?" - K8s stops routing if this fails
+app.get("/ready", async (req, res) => {
+    try {
+        await db.query("SELECT 1"); // Verify DB connection (throws if DB is down)
+        await redis.ping(); // Verify Redis connection (throws if Redis is down)
+        res.status(200).json({ status: "ready" });
+    } catch (err) {
+        // Return 503 (Service Unavailable) — load balancer stops sending traffic until ready
+        res.status(503).json({ status: "not ready", error: err.message });
+    }
+});
+```
+
+```bash
+# --- PM2 commands ---
+pm2 start server.js -i max       # Cluster mode: fork one worker per CPU core
+pm2 reload server                # Zero-downtime restart: replace workers one by one
+pm2 logs                         # View logs (all workers combined)
+pm2 monit                        # Live monitoring dashboard (CPU, RAM per worker)
+pm2 save                         # Save current process list
+pm2 startup                      # Generate and configure auto-start on server reboot
+```
+
+### Senior-Level Q&A
+
+**Q1: Docker multi-stage build — why is it important?**
+
+A: Reduces final image size. The builder stage installs dev dependencies and compiles; the production stage copies only what's needed. A typical Node.js image drops from ~900MB to ~150MB.
+
+**Q2: How do you implement zero-downtime deploys?**
+
+A: Use rolling updates (Kubernetes) or PM2 reload. The old process keeps handling in-flight requests while new processes start. Graceful shutdown ensures no requests are dropped.
+
+**Q3: SIGTERM vs SIGKILL — what's the difference?**
+
+A: `SIGTERM` is a polite "please shut down" — your process can catch it and clean up. `SIGKILL` is an immediate kill — no cleanup, no catch. Kubernetes sends `SIGTERM` first, waits 30s (configurable), then sends `SIGKILL`.
+
+> **💡 Interview Tip — One-Liner Answers:**
+>
+> - _"Docker multi-stage build?"_ → First stage installs all deps + compiles; second stage copies only production artifacts. Image drops from ~900MB to ~150MB.
+> - _"What is a health check?"_ → An endpoint (`/health`) that returns 200 if the service is operational. K8s/LB uses it to route traffic only to healthy instances. Check DB, Redis, disk space.
+> - _"PM2 vs Docker for process management?"_ → PM2 = Node-specific (cluster mode, log management, reload). Docker/K8s = container orchestration (language-agnostic, scaling, self-healing). Use both: PM2 inside container for cluster, K8s outside for orchestration.
+> - _"What goes in .dockerignore?"_ → `node_modules`, `.git`, `*.md`, test files, `.env` — anything not needed at runtime. Smaller context = faster builds.
+
+> **📝 Quick Revision — Deployment:**
+> | Concept | Key Point |
+> |---|---|
+> | Multi-stage Docker | Separate build stage from production; smaller images |
+> | Health checks | `/health` endpoint; LB/K8s routes only to healthy |
+> | Graceful shutdown | SIGTERM → drain → close connections → exit 0 |
+> | Rolling update | Replace instances one by one; zero downtime |
+> | PM2 cluster | `pm2 start app.js -i max` — all CPU cores |
+> | SIGTERM vs SIGKILL | SIGTERM = catchable. SIGKILL = instant death |
+
+[↑ Back to Index](#table-of-contents)
+
+---
+
+### 8.2 Security Checklist & Hardening
+
+### Concepts
+
+Security isn't a feature — it's a requirement. Node.js apps face the same web vulnerabilities as any server, plus some unique risks around dependency management and prototype pollution.
+
+**OWASP Top 10 for Node.js:**
+
+1. **Injection** (SQL, NoSQL, command) — always parameterize queries
+2. **Broken authentication** — use bcrypt, JWT with short expiry, rate limit login
+3. **Sensitive data exposure** — encrypt at rest and in transit (TLS)
+4. **Broken access control** — check permissions on every request
+5. **Security misconfiguration** — use helmet, disable `X-Powered-By`
+6. **XSS** — sanitize output, use CSP headers
+7. **Insecure deserialization** — validate JSON schemas (Zod/Joi)
+8. **Using components with known vulns** — `npm audit`, Snyk
+9. **Insufficient logging** — log auth failures, suspicious patterns
+10. **SSRF** — validate/restrict outgoing URLs
+
+```mermaid
+flowchart TB
+    subgraph Input ["Input Layer"]
+        V[Validate Input<br/>Zod / Joi]
+        RL[Rate Limit<br/>express-rate-limit]
+        CORS2[CORS Headers]
+    end
+    subgraph App ["Application Layer"]
+        Auth[Authentication<br/>bcrypt + JWT]
+        AuthZ[Authorization<br/>RBAC / ABAC]
+        San[Sanitize Output<br/>DOMPurify]
+    end
+    subgraph Infra ["Infrastructure Layer"]
+        TLS2[TLS 1.2+]
+        Helm[Helmet Headers]
+        Dep[Dependency Audit<br/>npm audit / Snyk]
+    end
+    Input --> App --> Infra
+    style V fill:#4caf50,color:#fff
+    style Auth fill:#2196f3,color:#fff
+    style TLS2 fill:#ff9800,color:#fff
+```
+
+### Security Checklist
+
+> 📖 **What this example demonstrates:** Seven layered security practices. Each one prevents a specific attack. Together they address the OWASP Node.js Top 10. Input validation stops garbage data before it reaches the DB. Parameterized queries stop SQL injection. bcrypt makes stolen passwords useless. JWT with short expiry limits damage from token theft.
+>
+> 🔑 **Key terms:**
+>
+> - **Zod** — A TypeScript schema validation library. `.safeParse()` returns `{ success, data, error }` instead of throwing — great for request validation.
+> - **bcrypt salt rounds** — The `12` in `bcrypt.hash(password, 12)` is the cost factor. Higher = more CPU per hash = harder to brute force. 12 rounds ≈ 250ms per hash on modern CPU.
+> - **`jwt.sign({ expiresIn: '15m' })`** — Token expires in 15 minutes. Stolen token becomes useless after 15 min. Use refresh tokens for longer sessions.
+> - **`app.disable('x-powered-by')`** — Removes the `X-Powered-By: Express` header that tells attackers what framework you use.
+
+```js
+// 1. Input validation (Zod example)
+const { z } = require("zod");
+const UserSchema = z.object({
+    email: z.string().email(), // Must be a valid email format
+    password: z.string().min(8).max(128), // 8-128 chars (max prevents bcrypt DoS)
+    age: z.number().int().min(13).max(150).optional(), // Optional, bounded
+});
+
+app.post("/register", (req, res) => {
+    const result = UserSchema.safeParse(req.body); // Validate without throwing
+    if (!result.success)
+        return res.status(400).json({ errors: result.error.issues }); // Return what's wrong
+    // Use result.data which is type-safe and validated
+});
+
+// 2. SQL injection prevention (parameterized queries)
+// ❌ BAD: String concatenation — attacker can inject SQL
+// db.query(`SELECT * FROM users WHERE id = ${req.params.id}`);
+// ✅ GOOD: Parameterized — DB treats the value as data, NEVER as SQL
+const user = await db.query("SELECT * FROM users WHERE id = $1", [
+    req.params.id,
+]);
+
+// 3. Password hashing (bcrypt)
+const bcrypt = require("bcrypt");
+const hash = await bcrypt.hash(password, 12); // 12 rounds ≈ 250ms — resistant to brute force
+const match = await bcrypt.compare(inputPassword, storedHash); // Returns true/false
+
+// 4. JWT with short expiry
+const jwt = require("jsonwebtoken");
+const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, {
+    expiresIn: "15m", // Token valid for 15 minutes only
+    // Combined with refresh tokens: short access token + long refresh token
+});
+
+// 5. Helmet (security headers)
+app.use(helmet()); // Sets: CSP, HSTS, X-Frame-Options, X-Content-Type-Options, etc.
+app.disable("x-powered-by"); // Remove "X-Powered-By: Express" to avoid fingerprinting
+
+// 6. Dependency scanning
+// npm audit              (built-in, free)
+// npx snyk test          (deeper, can check reachability)
+// npm audit fix --force  (auto-fix, careful — may break APIs)
+
+// 7. Environment variables (never hardcode secrets)
+// ❌ const secret = 'my-secret-key'; // Exposed in source control!
+// ✅ const secret = process.env.JWT_SECRET; // From environment or secret manager
+```
+
+### Senior-Level Q&A
+
+**Q1: How do you prevent prototype pollution in Node.js?**
+
+A: Prototype pollution occurs when an attacker sets `__proto__` or `constructor.prototype` via user input. Freeze prototypes, validate input keys, or use `Object.create(null)` for lookup maps.
+
+```js
+// ❌ Vulnerable to prototype pollution
+function merge(target, source) {
+    for (const key in source) {
+        target[key] = source[key]; // __proto__ can be set!
+    }
+}
+
+// ✅ Safe merge
+function safeMerge(target, source) {
+    for (const key of Object.keys(source)) {
+        if (key === "__proto__" || key === "constructor" || key === "prototype")
+            continue;
+        target[key] = source[key];
+    }
+}
+```
+
+**Q2: Your `npm audit` shows 15 high vulnerabilities. How do you prioritize?**
+
+A:
+
+1. Check if the vulnerable package is a **direct** dependency (fix first) or transitive
+2. Check if the vulnerability is **reachable** in your code path
+3. Use `npm audit fix` for non-breaking fixes
+4. For breaking changes, evaluate if upgrading is worth the effort
+5. Use `npm overrides` or `resolutions` to force a safe version of transitive deps
+
+> **💡 Interview Tip — One-Liner Answers:**
+>
+> - _"Top 3 Node.js security risks?"_ → (1) Prototype pollution via JSON input. (2) Dependency vulnerabilities (supply chain). (3) Injection (SQL, command, ReDoS).
+> - _"How do you manage secrets?"_ → Never hardcode. Use environment variables + secret manager (AWS Secrets Manager, Vault). `.env` files for development only (never commit).
+> - _"What is CSP?"_ → Content Security Policy — HTTP header that restricts which resources (scripts, images, styles) can load. Prevents XSS by blocking inline scripts and untrusted sources.
+> - _"How to handle npm audit vulnerabilities?"_ → Direct deps: upgrade. Transitive: use `npm overrides` or `resolutions`. Check if vulnerability is reachable in your code path.
+
+> **📝 Quick Revision — Security:**
+> | Threat | Prevention |
+> |---|---|
+> | Prototype pollution | Input validation (Joi/Zod), `Object.create(null)` |
+> | SQL injection | Parameterized queries, ORMs |
+> | XSS | CSP headers, output encoding |
+> | Command injection | `execFile` not `exec`; never pass user input to shell |
+> | Dependency vulns | `npm audit`, Snyk, Dependabot, lock files |
+> | Secrets leakage | Env vars + secret manager; never commit `.env` |
+
+[↑ Back to Index](#table-of-contents)
+
+---
+
+### 8.3 Observability: Tracing & APM
+
+### Concepts
+
+**Observability** is the ability to understand your system's internal state from its external outputs. The three pillars are **logs**, **metrics**, and **traces**.
+
+- **Logs** — structured events (use pino or winston; JSON format for machine parsing)
+- **Metrics** — numbers over time (request rate, error rate, latency histograms)
+- **Traces** — the journey of a single request across services (distributed tracing)
+
+**OpenTelemetry** is the industry standard for instrumenting Node.js apps. It collects traces, metrics, and logs and exports them to backends like Jaeger, Grafana Tempo, Datadog, or New Relic.
+
+**Correlation IDs** tie all logs and traces from a single request together. Generate a unique ID at the edge (API gateway or first service) and pass it in headers (`X-Request-ID`).
+
+```mermaid
+flowchart LR
+    subgraph App ["Node.js App"]
+        OT[OpenTelemetry SDK]
+        Log[Structured Logs<br/>pino]
+        Met[Metrics<br/>prom-client]
+    end
+    subgraph Backends ["Observability Backends"]
+        Jaeger[Jaeger / Tempo<br/>Traces]
+        Grafana[Grafana<br/>Dashboards]
+        Loki[Loki / ELK<br/>Logs]
+    end
+    OT --> Jaeger
+    Met --> Grafana
+    Log --> Loki
+    Jaeger --> Grafana
+    Loki --> Grafana
+    style OT fill:#ff9800,color:#fff
+    style Grafana fill:#4caf50,color:#fff
+```
+
+### Key Patterns
+
+> 📖 **What this example demonstrates:** Structured logging with request correlation. Instead of `console.log('user fetched')`, each log line is a JSON object with `requestId`, method, path, and any other context. This makes it searchable in Loki/ELK: find all logs for a specific request ID across all servers.
+>
+> 🔑 **Key terms:**
+>
+> - **`pino`** — The fastest Node.js logging library. Outputs JSON lines. Very low overhead (~3x faster than Winston).
+> - **`logger.child({ requestId })`** — Creates a new logger that includes the `requestId` field in every log line automatically. You don't have to pass it manually each time.
+> - **Correlation ID / Request ID** — A unique UUID per request. Passed as `X-Request-ID` header. All logs and traces for that request share this ID. Makes debugging distributed systems possible.
+> - **`process.LOG_LEVEL || 'info'`** — Control log verbosity via environment variable. `info` in production, `debug` locally.
+
+```js
+// --- Structured logging with pino ---
+const pino = require("pino");
+const logger = pino({
+    level: process.env.LOG_LEVEL || "info", // 'debug' locally, 'info'/'warn' in production
+    // JSON output: each line is parseable JSON for log management tools (Loki, ELK, Datadog)
+});
+
+// Add request context (correlation ID)
+app.use((req, res, next) => {
+    // Create a child logger with request-specific context attached to every log line
+    req.log = logger.child({
+        requestId: req.headers["x-request-id"] || crypto.randomUUID(), // Use provided or generate
+        method: req.method,
+        path: req.url,
+    });
+    next();
+});
+
+app.get("/api/users", async (req, res) => {
+    req.log.info("Fetching users"); // Outputs: {"requestId":"abc","method":"GET",...,"msg":"Fetching users"}
+    const users = await db.query("SELECT * FROM users");
+    req.log.info({ count: users.length }, "Users fetched"); // Add structured data to the log line
+    res.json(users);
+});
+```
+
+> 📖 **What this example demonstrates:** Exposing Prometheus metrics from a Node.js app. A Histogram records the duration of HTTP requests, labeled by method/route/status. Prometheus scrapes `/metrics` every 15s, and Grafana visualizes it as dashboards and alerts.
+>
+> 🔑 **Key terms:**
+>
+> - **Histogram** — Records distribution of values (e.g., request durations) in buckets. `buckets: [0.01, 0.05, 0.1, 0.5, 1, 5]` means: how many requests took <10ms, <50ms, <100ms, etc.
+> - **`labels`** — Dimensions for filtering. In Grafana you can query: "show p99 latency for method=GET route=/api/users".
+> - **Prometheus scrape** — Prometheus regularly calls `/metrics` endpoint and records the current metrics values. Your app doesn't push; Prometheus pulls.
+> - **`collectDefaultMetrics()`** — Auto-collects Node.js runtime metrics: event loop lag, heap usage, GC duration, active handles, etc.
+
+```js
+// --- Prometheus metrics (prom-client) ---
+const client = require("prom-client");
+const collectDefaultMetrics = client.collectDefaultMetrics;
+collectDefaultMetrics(); // Auto-collect: CPU, heap, event loop lag, GC, HTTP connections
+
+const httpRequestDuration = new client.Histogram({
+    name: "http_request_duration_seconds",
+    help: "Duration of HTTP requests in seconds",
+    labelNames: ["method", "route", "status"], // Dimensions for filtering in Grafana
+    buckets: [0.01, 0.05, 0.1, 0.5, 1, 5], // Bucket boundaries in seconds
+});
+
+app.use((req, res, next) => {
+    const end = httpRequestDuration.startTimer(); // Start timer for this request
+    res.on("finish", () =>
+        end({
+            method: req.method,
+            route: req.route?.path || req.url, // Use route pattern (/users/:id not /users/123)
+            status: res.statusCode,
+        }),
+    );
+    next();
+});
+
+// Prometheus scrapes this endpoint every 15s
+app.get("/metrics", async (req, res) => {
+    res.set("Content-Type", client.register.contentType); // Special content type prometheus expects
+    res.end(await client.register.metrics()); // All registered metrics as text
+});
+```
+
+> 📖 **What this example demonstrates:** Auto-instrumentation with OpenTelemetry. By loading `tracing.js` before your app starts, OTel automatically instruments Express routes, pg queries, Redis calls, HTTP outgoing requests, and more — with zero code changes to your business logic.
+>
+> 🔑 **Key terms:**
+>
+> - **Trace** — The complete journey of one request through your system. Consists of spans.
+> - **Span** — One operation within a trace ("DB query took 15ms", "Redis lookup 2ms", "total request 20ms").
+> - **OTLP (OpenTelemetry Protocol)** — Standard protocol for sending telemetry data to backends (Jaeger, Tempo, Datadog).
+> - **`-r ./tracing.js`** — Node.js `require` flag: load this module before anything else. OTel must be initialized before your imports.
+
+```js
+// --- OpenTelemetry auto-instrumentation ---
+// tracing.js (load BEFORE app code)
+const { NodeSDK } = require("@opentelemetry/sdk-node");
+const {
+    getNodeAutoInstrumentations,
+} = require("@opentelemetry/auto-instrumentations-node");
+const {
+    OTLPTraceExporter,
+} = require("@opentelemetry/exporter-trace-otlp-http");
+
+const sdk = new NodeSDK({
+    traceExporter: new OTLPTraceExporter({
+        url: "http://localhost:4318/v1/traces", // Send spans to local Jaeger/Tempo collector
+    }),
+    instrumentations: [getNodeAutoInstrumentations()], // Auto-instrument everything
+});
+
+sdk.start();
+// Auto-instruments: HTTP (req/res), Express (routes), pg (queries), redis (commands), fs, dns
+
+// Start app: node -r ./tracing.js server.js
+// Traces are automatically created for every incoming request
+// Grafana Tempo shows: GET /api/users -> SELECT * FROM users (12ms) -> Redis GET (1ms)
+```
+
+### Senior-Level Q&A
+
+**Q1: How do you trace a request across 5 microservices?**
+
+A: Use OpenTelemetry with distributed tracing. The first service creates a **trace ID** and **span**. Each subsequent service receives the trace context via HTTP headers (`traceparent`) and creates child spans. The trace backend (Jaeger) assembles the full request waterfall.
+
+**Q2: What's the difference between logs, metrics, and traces?**
+
+|              | Logs                    | Metrics                       | Traces                          |
+| ------------ | ----------------------- | ----------------------------- | ------------------------------- |
+| Format       | Text/JSON events        | Numbers + labels              | Span trees                      |
+| Cardinality  | High                    | Low                           | Medium                          |
+| Use for      | Debugging, audit        | Alerting, dashboards          | Performance, dependencies       |
+| Storage cost | High                    | Low                           | Medium                          |
+| Example      | "User 123 login failed" | `http_errors_total{code=500}` | Request → DB → Cache → Response |
+
+**Q3: Your dashboard shows high p99 latency but low average. What does this mean?**
+
+A: A small percentage of requests are very slow (tail latency). Common causes: garbage collection pauses, slow DB queries, thread pool exhaustion. Investigate with p99 flamegraphs and correlate with GC metrics.
+
+> **💡 Interview Tip — One-Liner Answers:**
+>
+> - _"What is OpenTelemetry?"_ → Vendor-neutral framework for collecting traces, metrics, and logs. Instrument once, export to any backend (Jaeger, Datadog, Grafana).
+> - _"What is a distributed trace?"_ → A tree of spans showing the entire request journey across microservices. Each span has: service name, duration, status, parent span ID.
+> - _"Logs vs metrics vs traces?"_ → Logs = what happened (debug). Metrics = how much (alert). Traces = how long, where (performance). Use all three together.
+> - _"What is a correlation ID?"_ → A unique ID (UUID) attached to every log and trace for a single request — lets you follow one request across all microservices.
+
+> **📝 Quick Revision — Observability:**
+> | Signal | Format | Use For | Tool |
+> |---|---|---|---|
+> | Logs | JSON events | Debugging, audit trail | pino, winston, ELK |
+> | Metrics | Numbers + labels | Alerting, dashboards | Prometheus, Grafana |
+> | Traces | Span trees | Latency, service dependencies | Jaeger, Datadog, Tempo |
+> | Correlation ID | UUID per request | Cross-service debugging | Custom middleware |
+
+[↑ Back to Index](#table-of-contents)
+
+---
+
 ## Phase 9 — Scenario-Based Interview Questions
 
 These questions are asked in senior Node.js interviews. Each one is a real-world problem. The answer structure is always:
@@ -10050,1977 +12021,6 @@ async function bookSeat(eventId, userId, retries = 3) {
 | Large file upload        | Pipe `req` stream to S3 multipart     | `@aws-sdk/lib-storage Upload`, never buffer            |
 | Production debug         | Correlation ID in every log line      | `AsyncLocalStorage`, `X-Request-ID`, structured JSON   |
 | Race condition           | Atomic SQL or SELECT FOR UPDATE       | `WHERE seats > 0`, optimistic version lock, Redis DECR |
-
----
-
-### 6.2 WebSockets & Real-time Communication
-
-### Concepts
-
-HTTP is **request-response** — the client asks, the server answers, and the connection is idle until the next request. **WebSockets** upgrade the HTTP connection to a persistent, **full-duplex** channel where both sides can send messages at any time. This is essential for real-time applications: chat, live dashboards, multiplayer games, collaborative editing.
-
-**How WebSocket works:** The client sends an HTTP request with `Upgrade: websocket`. If the server agrees, the connection switches from HTTP to the WebSocket protocol (ws:// or wss://). From that point, either side can send frames (messages) without the overhead of HTTP headers on each message.
-
-**ws vs socket.io:** `ws` is the minimal, standards-compliant WebSocket library. `socket.io` adds auto-reconnection, rooms, namespaces, fallbacks (long-polling), and broadcasting — but at the cost of a custom protocol that only works with socket.io clients.
-
-**Scaling WebSockets:** A single Node process can handle ~10K–50K concurrent WebSocket connections (depending on message rate). Beyond that, use multiple processes with a **pub/sub backend** (Redis) to broadcast messages across instances.
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Server as Node.js Server
-    Client->>Server: HTTP GET /ws (Upgrade: websocket)
-    Server-->>Client: 101 Switching Protocols
-    Note over Client,Server: Full-duplex WebSocket channel open
-    Client->>Server: Send message (frame)
-    Server->>Client: Push notification (frame)
-    Server->>Client: Push update (frame)
-    Client->>Server: Send message (frame)
-    Note over Client,Server: Connection stays open until close
-    Client->>Server: Close frame
-    Server-->>Client: Close ACK
-```
-
-### Key APIs & Patterns
-
-> 📖 **What this example demonstrates:** A complete WebSocket server with heartbeat detection. The server accepts connections, echoes messages back, and pings every 30 seconds to detect dead connections (clients that disconnected without sending a close frame, e.g., due to network failure). Without heartbeats, dead connections accumulate and waste memory.
->
-> 🔑 **Key terms:**
->
-> - **WebSocket upgrade** — Connection starts as HTTP, then the client sends `Upgrade: websocket`. Server responds with `101 Switching Protocols`, and the connection becomes full-duplex.
-> - **Full-duplex** — Both sides can send and receive simultaneously (unlike HTTP where you send, wait, receive).
-> - **Heartbeat (ping/pong)** — Every 30s, server sends a `ping` frame. The client must respond with a `pong`. If no pong arrives, the connection is dead — terminate it.
-> - **`ws.readyState === 1`** — 1 = OPEN (WebSocket is connected and can send). Other states: 0=CONNECTING, 2=CLOSING, 3=CLOSED.
-
-```js
-// --- ws (minimal WebSocket) ---
-const { WebSocketServer } = require("ws");
-const wss = new WebSocketServer({ port: 8080 });
-
-wss.on("connection", (ws, req) => {
-    console.log("Client connected from", req.socket.remoteAddress);
-
-    ws.on("message", (data) => {
-        const msg = data.toString();
-        console.log("Received:", msg);
-        ws.send(`Echo: ${msg}`); // Send back to this specific client
-    });
-
-    ws.on("close", () => console.log("Client disconnected"));
-
-    // Heartbeat: track whether this connection is still alive
-    ws.isAlive = true;
-    ws.on("pong", () => {
-        ws.isAlive = true; // Client responded — still alive!
-    });
-});
-
-// Heartbeat interval: every 30s, check all connections
-const interval = setInterval(() => {
-    wss.clients.forEach((ws) => {
-        if (!ws.isAlive) return ws.terminate(); // No pong in 30s — dead connection, kill it
-        ws.isAlive = false; // Assume dead until we get a pong
-        ws.ping(); // Send ping — client must respond with pong
-    });
-}, 30000);
-
-wss.on("close", () => clearInterval(interval)); // Stop heartbeat when server stops
-```
-
-```js
-// --- Broadcasting to all clients ---
-// Use case: chat message, live score update, notification
-function broadcast(data) {
-    const msg = JSON.stringify(data);
-    wss.clients.forEach((client) => {
-        if (client.readyState === 1) {
-            // 1 = OPEN (only send to connected clients)
-            client.send(msg);
-        }
-    });
-}
-```
-
-> 📖 **What this example demonstrates:** Scaling WebSockets across multiple Node.js instances using Redis Pub/Sub. Without this, a message from User A (on Server 1) would never reach User B (on Server 2). Redis acts as the broadcast backbone: any server can publish, all servers subscribe and forward to their local clients.
-
-```js
-// --- Scaling with Redis pub/sub ---
-const Redis = require("ioredis");
-const pub = new Redis(); // Separate client for publishing
-const sub = new Redis(); // Separate client for subscribing (can't do both on same client)
-
-sub.subscribe("chat"); // This server listens for messages on the 'chat' channel
-sub.on("message", (channel, message) => {
-    broadcast(JSON.parse(message)); // Forward to all WebSocket clients on THIS server
-});
-
-wss.on("connection", (ws) => {
-    ws.on("message", (data) => {
-        // When a client sends a message, publish it to Redis
-        // ALL servers subscribed to 'chat' will receive it and forward to their clients
-        pub.publish("chat", data.toString());
-    });
-});
-```
-
-### Senior-Level Q&A
-
-**Q1: How do you handle backpressure on WebSocket connections?**
-
-A: If the client is slow to consume messages, the send buffer fills up. Check `ws.bufferedAmount` before sending or use `ws.send(msg, err => {...})` callback.
-
-```js
-function safeSend(ws, data) {
-    if (ws.bufferedAmount < 1024 * 1024) {
-        // < 1MB buffered
-        ws.send(data);
-    } else {
-        console.warn("Client too slow, dropping message");
-    }
-}
-```
-
-**Q2: ws vs socket.io — when to choose each?**
-
-| Feature            | ws                                     | socket.io                       |
-| ------------------ | -------------------------------------- | ------------------------------- |
-| Protocol           | Standard WebSocket                     | Custom (WS + fallbacks)         |
-| Auto-reconnect     | Manual                                 | Built-in                        |
-| Rooms/namespaces   | Manual                                 | Built-in                        |
-| Fallback (polling) | No                                     | Yes                             |
-| Binary support     | Yes                                    | Yes                             |
-| Bundle size        | ~3KB                                   | ~40KB                           |
-| **Use when**       | Performance critical, standard clients | Rapid dev, need rooms, fallback |
-
-**Q3: Design a chat system for 100K concurrent users across 10 servers.**
-
-A: Each server handles ~10K WS connections. Use Redis pub/sub to relay messages across servers; each server subscribes to chat channels and broadcasts to its local clients. Presence is tracked in Redis sets (SADD/SREM on connect/disconnect).
-
-```mermaid
-flowchart LR
-    C1[Clients 1-10K] --> S1[Server 1]
-    C2[Clients 10K-20K] --> S2[Server 2]
-    S1 <-->|pub/sub| R[(Redis)]
-    S2 <-->|pub/sub| R
-    S3[Server N] <-->|pub/sub| R
-```
-
-> **💡 Interview Tip — One-Liner Answers:**
->
-> - _"WebSocket vs HTTP?"_ → HTTP = request/response (client initiates). WebSocket = persistent full-duplex connection — server can push data anytime. Uses single TCP connection after HTTP upgrade handshake.
-> - _"How do you detect dead WebSocket connections?"_ → Ping/pong heartbeat. Send ping every 30s; if no pong, terminate. Prevents ghost connections holding memory.
-> - _"ws vs socket.io?"_ → `ws` = raw WebSocket (~3KB), fast, standard protocol. `socket.io` = framework (~40KB) with auto-reconnect, rooms, namespaces, and HTTP fallback.
-> - _"How to scale WebSockets across servers?"_ → Redis pub/sub — each server subscribes to channels and relays messages to its local clients.
-
-> **📝 Quick Revision — WebSockets:**
-> | Concept | Key Point |
-> |---|---|
-> | Protocol | Full-duplex over single TCP; starts as HTTP upgrade |
-> | Heartbeat | Ping/pong every 30s; terminate dead connections |
-> | Backpressure | Check `ws.bufferedAmount` before sending |
-> | Scaling | Redis pub/sub to relay across multiple servers |
-> | `ws` library | Lightweight, standard WebSocket, manual reconnect |
-> | `socket.io` | Auto-reconnect, rooms, fallback to polling |
-
-[↑ Back to Index](#table-of-contents)
-
----
-
-### 6.3 Message Queues & Background Jobs
-
-### Concepts
-
-Not all work should be done inside the HTTP request cycle. Sending emails, generating PDFs, resizing images, processing payments — these are **background jobs** that should be queued and processed asynchronously. The user gets an immediate response ("Your export is being prepared") while the heavy work happens in the background.
-
-**Message queue pattern:** A **producer** pushes a message onto a queue/topic. A **consumer** (worker) picks it up and processes it. If the worker crashes, the message is **re-queued** (at-least-once delivery). This decouples your web server from slow operations and lets you scale workers independently.
-
-```mermaid
-flowchart LR
-    API[API Server] -->|"produce"| Q[(Queue / Topic<br/>Redis · RabbitMQ · Kafka)]
-    Q -->|"consume"| W1[Worker 1]
-    Q -->|"consume"| W2[Worker 2]
-    W1 -->|"on failure"| DLQ[Dead Letter Queue]
-    W2 -->|"on success"| DB[(Database)]
-    style Q fill:#ff9800,color:#fff
-    style DLQ fill:#f44336,color:#fff
-```
-
----
-
-### Quick Notes: RabbitMQ & BullMQ
-
-> **These are two popular alternatives to Kafka. Below is a quick overview so you can compare them in interviews.**
-
-#### RabbitMQ (AMQP Protocol) — In a Nutshell
-
-RabbitMQ is a **traditional message broker** written in Erlang. Think of it as a smart post office:
-
-- **Exchange** receives messages and routes them to **queues** based on rules (direct, fanout, topic).
-- **Queues** hold messages until a consumer picks them up.
-- **Consumers** pull (or push via prefetch) messages from queues.
-- Supports **acknowledgement** — the message stays in the queue until the consumer confirms processing.
-- Best for **complex routing** — e.g., "send order events to billing AND shipping queues."
-
-```
-Producer → Exchange → [Routing Rules] → Queue → Consumer
-                                       → Queue → Consumer
-```
-
-**Key difference from Kafka:** Messages are **deleted** after consumption. No replay. Good for task distribution, not for event sourcing.
-
-| Term        | What it is                                              |
-| ----------- | ------------------------------------------------------- |
-| Exchange    | Router that receives messages and distributes to queues |
-| Queue       | Buffer that holds messages for consumers                |
-| Binding     | Rule connecting an exchange to a queue (routing key)    |
-| Ack/Nack    | Consumer confirms (ack) or rejects (nack) a message     |
-| Prefetch    | Limits how many unacked messages a consumer can hold    |
-| Dead Letter | Queue for messages that failed all retries              |
-
-**Node.js library:** `amqplib` (`npm install amqplib`).
-
-#### BullMQ (Redis-backed) — In a Nutshell
-
-BullMQ is a **job/task queue** for Node.js, backed by Redis. Think of it as a to-do list for your server:
-
-- **Queue** stores jobs (JSON payloads) in Redis.
-- **Worker** picks up jobs and processes them.
-- Built-in: **retry with backoff**, delayed jobs, repeatable/cron jobs, rate limiting, priorities, progress tracking.
-- Has a dashboard UI (Bull Board) to monitor job status.
-
-```js
-// BullMQ — Quick example
-const { Queue, Worker } = require("bullmq");
-const connection = { host: "127.0.0.1", port: 6379 };
-
-// Producer: add a job
-const emailQueue = new Queue("emails", { connection });
-await emailQueue.add(
-    "welcome",
-    { userId: 42 },
-    {
-        attempts: 3,
-        backoff: { type: "exponential", delay: 1000 },
-    },
-);
-
-// Consumer: process jobs
-const worker = new Worker(
-    "emails",
-    async (job) => {
-        await sendEmail(job.data.userId);
-    },
-    { connection, concurrency: 5 },
-);
-
-worker.on("failed", (job, err) => console.error(`Failed: ${err.message}`));
-worker.on("completed", (job) => console.log(`Done: ${job.id}`));
-```
-
-**When to use BullMQ:** Simple job queues (emails, image resize, PDF generation) where you already have Redis. Not suited for high-throughput event streaming.
-
-| Feature        | BullMQ             | RabbitMQ           | Kafka                       |
-| -------------- | ------------------ | ------------------ | --------------------------- |
-| Backend        | Redis              | Erlang VM          | JVM cluster                 |
-| Throughput     | ~10K/s             | ~50K/s             | **~1M/s**                   |
-| Best for       | Task queues        | Complex routing    | Event streaming             |
-| Node.js lib    | bullmq             | amqplib            | **kafkajs**                 |
-| Delayed jobs   | Built-in           | Plugin             | Manual                      |
-| Message replay | ❌ No              | ❌ No              | ✅ Yes (log-based)          |
-| Ordering       | Per-queue          | Per-queue          | **Per-partition**           |
-| Exactly-once   | No (at-least-once) | No (at-least-once) | **Yes (with transactions)** |
-
----
-
-### Deep Dive: Apache Kafka with KafkaJS
-
-This is the section to study deeply. Kafka is the industry standard for **high-throughput event streaming** — used at LinkedIn, Uber, Netflix, and almost every large-scale system.
-
-### Kafka Core Architecture
-
-**Three key components:**
-
-1. **Broker** — A Kafka server that stores messages. A Kafka cluster has multiple brokers for fault tolerance. Each broker stores a subset of the data.
-2. **Producer** — Your application code that **sends** messages to a Kafka topic. The producer decides which partition to send to (round-robin, key-based, or custom).
-3. **Consumer** — Your application code that **reads** messages from a Kafka topic. Consumers belong to a **consumer group** — Kafka distributes partitions across consumers in the same group.
-
-**Topics & Partitions:**
-
-- A **topic** is a named channel (like `"orders"`, `"user-events"`).
-- Each topic is split into **partitions** (like shards). Partitions enable parallelism.
-- Each partition is an **ordered, immutable log** — messages are appended and never deleted (until retention expires).
-- Messages within a partition are ordered. Messages across partitions are NOT guaranteed to be ordered.
-
-**Consumer Groups:**
-
-- Consumers with the same `groupId` share the work — each partition is assigned to exactly one consumer in the group.
-- If you have 6 partitions and 3 consumers → each consumer reads 2 partitions.
-- If a consumer dies, Kafka **rebalances** partitions across surviving consumers.
-- Two different consumer groups can read the same topic independently (each gets all messages).
-
-**Offsets:**
-
-- Each message in a partition has a sequential **offset** (0, 1, 2, 3...).
-- Consumers track their offset — "I've processed up to offset 42."
-- On restart, the consumer resumes from its last committed offset.
-- **Auto-commit** (default): Offsets are committed periodically. Risk: crash between process and commit = **reprocessing**.
-- **Manual commit**: You commit after successful processing. Safer but more code.
-
-```mermaid
-graph TB
-    subgraph Cluster["Kafka Cluster (3 Brokers)"]
-        direction TB
-        B1["Broker 1<br/>Leader: P0, P1"]
-        B2["Broker 2<br/>Leader: P2, P3"]
-        B3["Broker 3<br/>Replicas"]
-    end
-
-    subgraph Topic["Topic: 'orders' (4 Partitions)"]
-        P0["Partition 0<br/>offset: 0,1,2,3..."]
-        P1["Partition 1<br/>offset: 0,1,2,3..."]
-        P2["Partition 2<br/>offset: 0,1,2,3..."]
-        P3["Partition 3<br/>offset: 0,1,2,3..."]
-    end
-
-    subgraph CG["Consumer Group: 'order-service'"]
-        C1["Consumer 1<br/>reads P0, P1"]
-        C2["Consumer 2<br/>reads P2, P3"]
-    end
-
-    Producer1["Producer<br/>(API Server)"] -->|"send()"| Topic
-    P0 --> C1
-    P1 --> C1
-    P2 --> C2
-    P3 --> C2
-
-    style Cluster fill:#42a5f5,color:#fff
-    style CG fill:#66bb6a,color:#fff
-    style Producer1 fill:#ff9800,color:#fff
-```
-
-### KafkaJS Setup — Producer & Consumer
-
-> 📖 **What this example demonstrates:** The core KafkaJS setup: creating a client, then a producer and consumer. The producer `send()` call puts messages onto a Kafka topic. The consumer's `run()` loop continuously reads new messages as they arrive. Everything is async — your app stays responsive while waiting for messages.
->
-> 🔑 **Key terms:**
->
-> - **`clientId`** — A human-readable name for your app in Kafka logs and metrics. Helps identify traffic sources.
-> - **`brokers`** — Kafka cluster addresses. Always specify multiple for fault tolerance (if one broker is down, others take over).
-> - **`key`** (partition key) — A string that determines which partition the message goes to. Same key → same partition → messages for that key are always in order. No key → round-robin across partitions.
-> - **`idempotent: true`** — The producer assigns sequence numbers. If a message is retried (network error), Kafka deduplicates it. You get exactly-once producer semantics.
-> - **`groupId`** — Consumer group identifier. All consumers with the same `groupId` share the load (each partition assigned to one consumer). Different `groupId` = independent consumption.
-
-```js
-const { Kafka, Partitioners, logLevel } = require("kafkajs");
-
-// 1. CREATE KAFKA CLIENT
-const kafka = new Kafka({
-    clientId: "my-app", // Human-readable name for logs
-    brokers: ["broker1:9092", "broker2:9092", "broker3:9092"], // Connect to multiple brokers for HA
-    retry: {
-        initialRetryTime: 300, // ms before first retry
-        retries: 10, // Retry up to 10 times on transient errors
-    },
-    logLevel: logLevel.WARN, // Only log warnings and errors (not every consumed message)
-});
-
-// 2. PRODUCER — Sending Messages
-const producer = kafka.producer({
-    createPartitioner: Partitioners.DefaultPartitioner, // Key-based routing (key → partition)
-    idempotent: true, // Prevent duplicates on retry (safe to use)
-    transactionalId: "my-transactional-id", // Enables atomic multi-topic writes (optional)
-});
-
-async function startProducer() {
-    await producer.connect(); // Establish connection to Kafka brokers
-
-    // Send a single message
-    await producer.send({
-        topic: "orders",
-        messages: [
-            {
-                key: "user-123", // Same key → same partition → all user-123 events are ordered!
-                value: JSON.stringify({ orderId: "ORD-001", amount: 99.99 }), // Serialized to bytes
-                headers: { source: "api-server" }, // Optional metadata (logged, searchable)
-            },
-        ],
-    });
-
-    // Send a batch of messages (higher throughput — fewer network round trips)
-    await producer.sendBatch({
-        topicMessages: [
-            {
-                topic: "orders",
-                messages: [
-                    {
-                        key: "user-123",
-                        value: JSON.stringify({
-                            orderId: "ORD-002",
-                            amount: 50,
-                        }),
-                    },
-                    {
-                        key: "user-456",
-                        value: JSON.stringify({
-                            orderId: "ORD-003",
-                            amount: 75,
-                        }),
-                    },
-                ],
-            },
-            {
-                topic: "notifications",
-                messages: [
-                    {
-                        value: JSON.stringify({
-                            type: "order_created",
-                            orderId: "ORD-002",
-                        }),
-                    },
-                ],
-            },
-        ],
-    });
-}
-
-// 3. CONSUMER — Reading Messages
-const consumer = kafka.consumer({
-    groupId: "order-service", // All instances with same groupId share the partitions
-    sessionTimeout: 30000, // 30s: if no heartbeat, Kafka assumes consumer died → rebalance
-    heartbeatInterval: 3000, // Every 3s: "I'm alive" signal to Kafka broker
-    maxWaitTimeInMs: 5000, // Long poll: wait up to 5s for new messages (saves CPU)
-});
-```
-
-### Consumer: `eachMessage` vs `eachBatch`
-
-This is a critical performance choice. `eachMessage` is simpler; `eachBatch` gives you much higher throughput.
-
-> 📖 **What these examples demonstrate:** Two ways to consume Kafka messages. `eachMessage` calls your handler once per message — simple but slow (one DB write per message). `eachBatch` gives you all messages arrived so far as an array — you can do bulk inserts, dramatically reducing round trips to the database.
->
-> 🔑 **Key terms:**
->
-> - **`heartbeat()`** — Long-running processing must periodically call this to tell Kafka: "I'm still alive, don't trigger a rebalance". Call it every few seconds inside a slow loop.
-> - **`isRunning()`** — Returns false when the consumer is shutting down. Check this in long loops to exit cleanly.
-> - **`isStale()`** — Returns true if a rebalance happened while you were processing. The batch belongs to a partition you no longer own. Stop processing and skip commit.
-> - **`resolveOffset(offset)`** — Marks this specific message's offset as processed (ready to commit). Like checking off items on a to-do list.
-> - **`commitOffsetsIfNecessary()`** — Sends the committed offsets to Kafka. "I've processed up to this message; if I restart, start from the next one."
-
-```js
-// ─── OPTION A: eachMessage (Simple, Lower Throughput) ───
-// Kafka calls your handler once PER message
-// Good for: low-volume topics, simple processing
-
-async function runConsumerSimple() {
-    await consumer.connect();
-    await consumer.subscribe({ topic: "orders", fromBeginning: false }); // Only new messages
-
-    await consumer.run({
-        // Called once per message (one DB write per message — can be slow)
-        eachMessage: async ({ topic, partition, message, heartbeat }) => {
-            const order = JSON.parse(message.value.toString()); // Deserialize bytes to object
-            console.log(
-                `Processing order ${order.orderId} from partition ${partition}`,
-            );
-
-            await processOrder(order); // Your business logic
-
-            // Call heartbeat() if processing takes > 3s to prevent Kafka rebalance
-            await heartbeat();
-        },
-    });
-}
-
-// ─── OPTION B: eachBatch (High Throughput, More Control) ───
-// Kafka gives you a BATCH of messages at once
-// Good for: high-volume topics, bulk DB inserts, analytics
-
-async function runConsumerBatch() {
-    await consumer.connect();
-    await consumer.subscribe({ topic: "orders", fromBeginning: false });
-
-    await consumer.run({
-        eachBatchAutoResolve: false, // WE control offset commits
-
-        eachBatch: async ({
-            batch,
-            resolveOffset,
-            heartbeat,
-            commitOffsetsIfNecessary,
-            isRunning,
-            isStale,
-        }) => {
-            const { topic, partition, messages } = batch;
-
-            console.log(
-                `Batch: ${messages.length} messages from ${topic}[${partition}]`,
-            );
-
-            for (const message of messages) {
-                // Check if consumer is still running (e.g., SIGTERM received)
-                if (!isRunning() || isStale()) break; // Stop processing if shutting down or rebalanced
-
-                const order = JSON.parse(message.value.toString());
-                await processOrder(order);
-
-                resolveOffset(message.offset); // Mark this message as processed
-
-                await heartbeat(); // Let Kafka know we're still alive (do this every few messages)
-            }
-
-            await commitOffsetsIfNecessary(); // Commit all resolved offsets at once (one network call)
-        },
-    });
-}
-```
-
-### eachBatch — Why It's Faster
-
-```mermaid
-sequenceDiagram
-    participant Broker as Kafka Broker
-    participant C as Consumer
-
-    Note over Broker,C: eachMessage (N network calls)
-    Broker->>C: message 1
-    C->>C: process
-    C->>Broker: commit offset 1
-    Broker->>C: message 2
-    C->>C: process
-    C->>Broker: commit offset 2
-    Note over Broker,C: (one by one — slow)
-
-    Note over Broker,C: eachBatch (1 network call for N messages)
-    Broker->>C: batch [msg 1, msg 2, ..., msg 100]
-    C->>C: process all
-    C->>Broker: commit offset 100
-    Note over Broker,C: (bulk — fast, fewer round trips)
-```
-
-### KafkaJS Configuration Tuning — Increasing Throughput
-
-```js
-// ─── PRODUCER TUNING ───
-const producer = kafka.producer({
-    idempotent: true,
-    // Allow more in-flight requests (parallelism)
-    maxInFlightRequests: 5, // default: null (unlimited in non-idempotent mode)
-    // Batch messages before sending (latency vs throughput tradeoff)
-    allowAutoTopicCreation: false, // Don't auto-create topics in production
-});
-
-// send() options for throughput
-await producer.send({
-    topic: "events",
-    // Compression reduces network I/O (CPU trade-off)
-    compression: 2, // 0=None, 1=Gzip, 2=Snappy, 3=LZ4, 4=ZSTD
-    // acks: 0=fire-and-forget, 1=leader-only, -1=all replicas (safest)
-    acks: -1, // Wait for ALL replicas (safest, slowest)
-    // acks: 1 → leader only (faster, small risk of data loss)
-    // acks: 0 → fire and forget (fastest, messages can be lost)
-    timeout: 30000,
-    messages: [{ key: "k1", value: "v1" }],
-});
-
-// ─── CONSUMER TUNING ───
-const consumer = kafka.consumer({
-    groupId: "my-group",
-    // How many bytes to fetch per request (larger = fewer requests = higher throughput)
-    maxBytes: 10485760, // 10MB per fetch (default: 1MB)
-    minBytes: 1, // Fetch immediately when any data available
-    maxWaitTimeInMs: 5000, // Max wait for minBytes (long poll)
-    // Read N messages from partition before moving to next
-    maxBytesPerPartition: 1048576, // 1MB per partition per fetch
-
-    // Session & rebalance
-    sessionTimeout: 30000, // 30s — increase for slow consumers
-    heartbeatInterval: 3000, // Must be < sessionTimeout / 3
-    rebalanceTimeout: 60000, // Time allowed for rebalance
-
-    // Retry
-    retry: {
-        retries: 5,
-        initialRetryTime: 300,
-    },
-});
-
-// ─── Subscribe to multiple topics ───
-await consumer.subscribe({
-    topics: ["orders", "payments"],
-    fromBeginning: false,
-});
-```
-
-### Throughput Optimization Checklist
-
-| Lever           | Setting                             | Effect                                      |
-| --------------- | ----------------------------------- | ------------------------------------------- |
-| **Compression** | `compression: 2` (Snappy)           | 50-80% less network I/O, slight CPU cost    |
-| **Batch size**  | `maxBytes: 10MB`                    | Fewer fetch requests, higher throughput     |
-| **acks**        | `acks: 1` (leader only)             | 2-3x faster writes, tiny durability risk    |
-| **Partitions**  | Increase partition count            | More parallelism (1 consumer per partition) |
-| **eachBatch**   | Use instead of eachMessage          | Bulk processing, fewer offset commits       |
-| **Concurrency** | `partitionsConsumedConcurrently: 3` | Process multiple partitions in parallel     |
-| **Idempotent**  | `idempotent: true`                  | Prevents duplicates on producer retry       |
-
-```js
-// Consume multiple partitions concurrently
-await consumer.run({
-    partitionsConsumedConcurrently: 3, // Process 3 partitions at the same time
-    eachMessage: async ({ topic, partition, message }) => {
-        await processMessage(message);
-    },
-});
-```
-
-### Consumer Offset Management
-
-```js
-// ─── AUTO COMMIT (Default) ───
-// Offsets committed every 5 seconds automatically
-// Risk: crash between process + commit = reprocessing
-const consumer = kafka.consumer({
-    groupId: "my-group",
-    // Auto-commit settings (default: enabled)
-    autoCommit: true,
-    autoCommitInterval: 5000, // Commit every 5s
-    autoCommitThreshold: 100, // Or every 100 messages
-});
-
-// ─── MANUAL COMMIT (Safer) ───
-// You decide when to commit — after successful processing
-const consumer2 = kafka.consumer({
-    groupId: "my-group",
-    autoCommit: false, // Disable auto-commit
-});
-
-await consumer2.run({
-    eachMessage: async ({ topic, partition, message }) => {
-        await processMessage(message);
-
-        // Commit AFTER successful processing
-        await consumer2.commitOffsets([
-            {
-                topic,
-                partition,
-                offset: (Number(message.offset) + 1).toString(), // +1 = next offset to read
-            },
-        ]);
-    },
-});
-
-// ─── SEEK: Reset consumer to specific offset ───
-// Useful for replaying events or skipping bad messages
-consumer.seek({ topic: "orders", partition: 0, offset: "0" }); // Replay from beginning
-consumer.seek({ topic: "orders", partition: 0, offset: "1000" }); // Skip to offset 1000
-```
-
-### Dead Letter Queue Pattern with KafkaJS
-
-```js
-const dlqProducer = kafka.producer();
-await dlqProducer.connect();
-
-await consumer.run({
-    eachMessage: async ({ topic, partition, message }) => {
-        try {
-            await processMessage(message);
-        } catch (err) {
-            // Send failed message to DLQ topic for manual inspection
-            await dlqProducer.send({
-                topic: `${topic}.dlq`,
-                messages: [
-                    {
-                        key: message.key,
-                        value: message.value,
-                        headers: {
-                            ...message.headers,
-                            "x-original-topic": topic,
-                            "x-original-partition": String(partition),
-                            "x-original-offset": message.offset,
-                            "x-error": err.message,
-                            "x-failed-at": new Date().toISOString(),
-                        },
-                    },
-                ],
-            });
-            console.error(`Message sent to DLQ: ${err.message}`);
-        }
-    },
-});
-```
-
-### Kafka Partition Key Strategy
-
-Choosing the right partition key determines **ordering and load distribution**:
-
-```js
-// SCENARIO 1: Order events — key by userId
-// All events for the same user go to the same partition → guaranteed order per user
-await producer.send({
-    topic: "orders",
-    messages: [
-        { key: "user-123", value: JSON.stringify({ event: "order_created" }) },
-        {
-            key: "user-123",
-            value: JSON.stringify({ event: "payment_received" }),
-        },
-        // Both go to same partition → processed in order
-    ],
-});
-
-// SCENARIO 2: Analytics events — no key (round-robin)
-// Events spread evenly across partitions → max throughput, no ordering
-await producer.send({
-    topic: "page-views",
-    messages: [
-        { value: JSON.stringify({ page: "/home", ts: Date.now() }) },
-        // No key → round-robin across partitions
-    ],
-});
-
-// SCENARIO 3: Hot partition problem — bad key choice
-// ❌ BAD: key = "country" → 90% of traffic goes to partition for "US"
-// ✅ FIX: Use more granular key (userId, sessionId) for even distribution
-```
-
-```mermaid
-graph LR
-    subgraph Keys["Partition Key Strategy"]
-        direction TB
-        K1["key: 'user-123'<br/>→ hash('user-123') % 4<br/>→ Partition 2"]
-        K2["key: 'user-456'<br/>→ hash('user-456') % 4<br/>→ Partition 0"]
-        K3["key: null<br/>→ Round Robin<br/>→ P0, P1, P2, P3..."]
-    end
-
-    subgraph Partitions["Topic: 'orders' (4 partitions)"]
-        P0["P0: user-456 events"]
-        P1["P1: ..."]
-        P2["P2: user-123 events"]
-        P3["P3: ..."]
-    end
-
-    K2 --> P0
-    K1 --> P2
-    K3 --> P0
-    K3 --> P1
-    K3 --> P2
-    K3 --> P3
-
-    style Keys fill:#42a5f5,color:#fff
-    style Partitions fill:#66bb6a,color:#fff
-```
-
-### Graceful Shutdown
-
-```js
-// Always disconnect producers & consumers on shutdown
-const shutdown = async () => {
-    console.log("Shutting down Kafka...");
-    await consumer.disconnect(); // Commits final offsets, leaves consumer group
-    await producer.disconnect();
-    process.exit(0);
-};
-
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
-```
-
-### Senior-Level Q&A
-
-**Q1: How do you identify a slow consumer?**
-
-A: Monitor **consumer lag** — the difference between the latest offset in the partition and the consumer's committed offset.
-
-```
-Consumer Lag = Latest Offset (log-end-offset) − Consumer Committed Offset
-```
-
-- **Lag = 0** → Consumer is caught up (healthy).
-- **Lag growing over time** → Consumer is slower than the producer (problem!).
-- **Lag spikes then recovers** → Temporary slowdown (GC pauses, slow DB query).
-
-**How to measure:**
-
-```bash
-# Kafka CLI (built-in)
-kafka-consumer-groups.sh --bootstrap-server broker:9092 \
-    --describe --group order-service
-
-# Output:
-# TOPIC     PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
-# orders    0          1000            1050            50    ← 50 messages behind
-# orders    1          2000            2000            0     ← caught up
-```
-
-```js
-// Programmatic lag monitoring with KafkaJS admin API
-const admin = kafka.admin();
-await admin.connect();
-
-// Get consumer group offsets
-const offsets = await admin.fetchOffsets({
-    groupId: "order-service",
-    topics: ["orders"],
-});
-
-// Get latest offsets (log-end)
-const topicOffsets = await admin.fetchTopicOffsets("orders");
-
-// Calculate lag per partition
-topicOffsets.forEach((partitionInfo) => {
-    const consumerOffset = offsets
-        .find((o) => o.topic === "orders")
-        ?.partitions.find((p) => p.partition === partitionInfo.partition);
-
-    const lag =
-        Number(partitionInfo.offset) - Number(consumerOffset?.offset || 0);
-    console.log(`Partition ${partitionInfo.partition}: lag = ${lag}`);
-
-    if (lag > 10000) {
-        console.warn(`⚠️ HIGH LAG on partition ${partitionInfo.partition}!`);
-    }
-});
-
-await admin.disconnect();
-```
-
-**Fixing a slow consumer:**
-
-1. **Scale out** — add more consumers to the group (max = number of partitions)
-2. **Use `eachBatch`** — bulk process instead of one-by-one
-3. **Optimize processing** — batch DB inserts, cache lookups, reduce I/O
-4. **Increase partitions** — more partitions = more parallelism
-5. **Check for blocking code** — sync DB calls, missing `await`, tight loops
-
-**Q2: What happens when a consumer crashes mid-batch?**
-
-A: It depends on your commit strategy:
-
-- **Auto-commit (default):** If the offset was auto-committed before the crash, the message is "lost" (skipped on restart). If not yet committed, the message is **reprocessed** on restart. Neither is exactly-once.
-- **Manual commit:** If you commit AFTER processing, the unprocessed messages are reprocessed on restart (at-least-once). Make your processing **idempotent** to handle duplicates.
-
-```js
-// Idempotent processing: safe to reprocess
-async function processOrder(order) {
-    // Use INSERT ... ON CONFLICT DO NOTHING (PostgreSQL)
-    await db.query(
-        `INSERT INTO processed_orders (order_id, amount)
-         VALUES ($1, $2)
-         ON CONFLICT (order_id) DO NOTHING`,
-        [order.orderId, order.amount],
-    );
-    // If reprocessed, the duplicate insert is silently ignored
-}
-```
-
-**Q3: How do you guarantee message ordering?**
-
-A: Kafka guarantees order **within a single partition only**. To ensure ordering for related events:
-
-1. Use the same **partition key** for related messages (e.g., `userId` for all events of that user).
-2. Set `maxInFlightRequests: 1` on the producer if you need strict ordering even during retries.
-3. Use a single partition (but this kills parallelism — only for low-volume topics).
-
-```js
-// All events for user-123 go to the same partition → guaranteed order
-await producer.send({
-    topic: "user-events",
-    messages: [
-        { key: "user-123", value: JSON.stringify({ event: "signup" }) },
-        { key: "user-123", value: JSON.stringify({ event: "email_verified" }) },
-        { key: "user-123", value: JSON.stringify({ event: "first_purchase" }) },
-    ],
-});
-// Consumer reading this partition sees: signup → email_verified → first_purchase (in order)
-```
-
-**Q4: Partition count — how to decide?**
-
-A: Rule of thumb:
-
-- **Partitions ≥ max consumers** in the group (each consumer gets at least 1 partition)
-- **More partitions = more parallelism** but more overhead (memory, file handles, rebalance time)
-- **Start with ~6-12 partitions** for most topics; scale when needed
-- **Upper limit:** ~thousands per broker; each partition uses ~10MB memory on the broker
-- **You can increase partitions but NEVER decrease** (would break key-based routing)
-
-**Q5: What is a rebalance and how do you minimize it?**
-
-A: A rebalance happens when Kafka reassigns partitions to consumers — triggered by a consumer joining, leaving, or crashing, or when partitions are added.
-
-**During rebalance, ALL consumers in the group PAUSE** — no messages are processed. This can last seconds to minutes.
-
-**Minimize rebalances:**
-
-1. **Increase `sessionTimeout`** (e.g., 60s) — gives slow consumers more time before being considered dead
-2. **Decrease `heartbeatInterval`** (e.g., 2s) — faster heartbeats = faster detection, fewer false positives
-3. **Use `CooperativeStickyAssigner`** — only reassigns affected partitions instead of all
-4. **Avoid short-lived consumers** — don't spin up/down consumers frequently
-5. **Call `heartbeat()` in long processing loops** — prevents the broker from thinking the consumer is dead
-
-```js
-const consumer = kafka.consumer({
-    groupId: "my-group",
-    sessionTimeout: 60000, // 60s (generous)
-    heartbeatInterval: 2000, // Every 2s
-    maxWaitTimeInMs: 5000,
-    // Use cooperative-sticky to minimize rebalance disruption
-    rebalanceTimeout: 60000,
-});
-```
-
-**Q6: How is Kafka different from a traditional message queue (RabbitMQ/BullMQ)?**
-
-A:
-
-| Aspect          | Kafka                                 | RabbitMQ / BullMQ                    |
-| --------------- | ------------------------------------- | ------------------------------------ |
-| Model           | **Distributed log** (append-only)     | Message queue (delete after consume) |
-| Replay          | ✅ Yes — seek to any offset           | ❌ No — message gone after ack       |
-| Ordering        | Per-partition guaranteed              | Per-queue (single consumer)          |
-| Throughput      | **~1M messages/sec**                  | ~10-50K messages/sec                 |
-| Consumer groups | ✅ Multiple groups read independently | Competing consumers share            |
-| Retention       | Time/size-based (keep 7 days, 100GB)  | Until consumed                       |
-| Use case        | Event streaming, analytics, CDC       | Task queues, job processing          |
-
-**Q7: Your producer is slow. How do you increase write throughput?**
-
-A:
-
-1. **Compression** — `compression: 2` (Snappy) or `4` (ZSTD) reduces message size
-2. **Batching** — Use `sendBatch()` to send many messages per API call
-3. **acks: 1** — Wait for leader only (instead of all replicas)
-4. **acks: 0** — Fire-and-forget (fastest, risk of loss — only for non-critical data like logs)
-5. **Increase partitions** — More partitions = producer distributes across more brokers
-6. **Idempotent producer** — `idempotent: true` allows safe retries without duplicates
-
-**Q8: How do you ensure exactly-once processing end-to-end?**
-
-A: Three pieces:
-
-1. **Idempotent producer** (`idempotent: true`) — prevents duplicate messages on retry
-2. **Transactional producer** (`transactionalId: 'xxx'`) — atomic writes across multiple topics
-3. **Consumer: read-process-commit atomically** — manual offset commit AFTER processing + idempotent processing (upsert/dedup in DB)
-
-```js
-// Transactional producer: atomic write to multiple topics
-const producer = kafka.producer({
-    idempotent: true,
-    transactionalId: "order-tx",
-});
-await producer.connect();
-
-const transaction = await producer.transaction();
-try {
-    await transaction.send({
-        topic: "orders",
-        messages: [{ value: orderData }],
-    });
-    await transaction.send({
-        topic: "notifications",
-        messages: [{ value: notifData }],
-    });
-    // Commit both sends atomically — either both succeed or both fail
-    await transaction.commit();
-} catch (err) {
-    await transaction.abort();
-    throw err;
-}
-```
-
-> **💡 Interview Tip — One-Liner Answers:**
->
-> - _"What is consumer lag?"_ → The difference between the latest offset in the partition and the consumer's committed offset. Growing lag = slow consumer.
-> - _"eachMessage vs eachBatch?"_ → `eachMessage` calls your handler per message (simple, slower). `eachBatch` gives you a batch (bulk processing, fewer commits, higher throughput).
-> - _"How does Kafka guarantee ordering?"_ → Within a single partition only. Use the same partition key for related messages.
-> - _"Kafka vs RabbitMQ?"_ → Kafka is a distributed log (replay, high throughput, event streaming). RabbitMQ is a message broker (routing, task queues, delete after consume).
-> - _"What triggers a rebalance?"_ → Consumer join/leave/crash, partition count change. During rebalance, ALL consumers pause. Minimize with cooperative-sticky assigner and generous session timeout.
-
-> **📝 Quick Revision — Kafka with KafkaJS:**
-> | Concept | Key Point |
-> |---|---|
-> | Broker | Server that stores messages; cluster = multiple brokers |
-> | Topic | Named channel; split into partitions |
-> | Partition | Ordered log; unit of parallelism |
-> | Consumer Group | Consumers sharing work; 1 partition → 1 consumer |
-> | Offset | Sequential message ID in partition; consumer tracks progress |
-> | `eachBatch` | Bulk consume; fewer commits; higher throughput |
-> | Consumer Lag | `log-end-offset − committed-offset`; monitor to detect slow consumers |
-> | Partition Key | Same key → same partition → ordered; null key → round-robin |
-> | Rebalance | Partition reassignment; all consumers pause; minimize disruption |
-> | Exactly-once | Idempotent producer + transactional writes + idempotent consumer |
-
-[↑ Back to Index](#table-of-contents)
-
----
-
-## Phase 7 — Testing, Performance & API Design
-
-### 7.1 Testing & CI/CD
-
-### Concepts
-
-Testing in Node.js isn't optional — it's what separates production-ready code from prototypes. **Unit tests** verify individual functions in isolation. **Integration tests** verify that modules work together (e.g., API + database). **End-to-end (e2e) tests** simulate real user flows.
-
-**Test runners:** Node.js 18+ includes a built-in test runner (`node:test`). Popular alternatives: **Jest** (batteries-included, mocking, coverage), **Vitest** (fast, ESM-native), **Mocha** (flexible, pairs with Chai/Sinon).
-
-**Mocking:** Replace real dependencies (database, HTTP calls, file system) with controlled fakes so tests are fast, reliable, and isolated. Jest has built-in `jest.mock()`. For manual mocking, use **Sinon.js** stubs/spies.
-
-**CI/CD:** Run tests automatically on every push/PR using GitHub Actions, GitLab CI, or Jenkins. A typical pipeline: install → lint → test → build → deploy.
-
-```mermaid
-flowchart LR
-    subgraph Dev ["Developer"]
-        Code[Write Code] --> Push[git push]
-    end
-    subgraph CI ["CI Pipeline"]
-        Install[npm install] --> Lint[ESLint]
-        Lint --> Test[Run Tests]
-        Test --> Coverage[Coverage Report]
-        Coverage --> Build[Build / Bundle]
-    end
-    subgraph CD ["CD Pipeline"]
-        Build --> Stage[Deploy Staging]
-        Stage --> E2E[E2E Tests]
-        E2E --> Prod[Deploy Production]
-    end
-    Push --> Install
-    style Test fill:#66bb6a,color:#fff
-    style Prod fill:#1565c0,color:#fff
-```
-
-### Key Patterns
-
-> 📖 **What this example demonstrates:** Three levels of testing in Node.js. Built-in `node:test` for pure unit tests (no dependencies). Jest for unit tests with mocking (replace the real DB with a fake). Supertest for integration tests (make real HTTP calls to your Express app without starting a real server).
->
-> 🔑 **Key terms:**
->
-> - **`jest.mock('./db')`** — Replaces the entire `./db` module with auto-generated mock functions. Any function in `db` becomes a Jest spy that returns `undefined` by default.
-> - **`mockResolvedValue(val)`** — Sets what the mock function returns when awaited. Simulates a DB returning a user.
-> - **`rejects.toThrow(msg)`** — Asserts that the promise rejects with an error containing `msg`. Tests error paths.
-> - **`supertest(app)`** — Creates an HTTP test client for your Express app. Doesn't need `app.listen()` — it binds an ephemeral port internally. No server cleanup needed.
-
-```js
-// --- Node.js built-in test runner (node:test) ---
-const { describe, it } = require("node:test");
-const assert = require("node:assert");
-
-describe("Math utils", () => {
-    it("should add two numbers", () => {
-        assert.strictEqual(1 + 2, 3); // strictEqual: checks value AND type (=== not ==)
-    });
-
-    it("should handle negative numbers", () => {
-        assert.strictEqual(-1 + -2, -3);
-    });
-});
-// Run: node --test math.test.js
-```
-
-```js
-// --- Jest example with mocking ---
-// userService.js
-const db = require("./db");
-
-async function getUser(id) {
-    const user = await db.findById(id);
-    if (!user) throw new Error("User not found");
-    return user;
-}
-module.exports = { getUser };
-
-// userService.test.js
-jest.mock("./db"); // Replace entire ./db module with mocks (all functions become jest fns)
-const db = require("./db");
-const { getUser } = require("./userService");
-
-test("returns user when found", async () => {
-    db.findById.mockResolvedValue({ id: 1, name: "Alice" }); // Mock DB: "return this user"
-    const user = await getUser(1);
-    expect(user.name).toBe("Alice"); // Asserts without ever touching a real database!
-});
-
-test("throws when user not found", async () => {
-    db.findById.mockResolvedValue(null); // Mock DB: "user doesn't exist"
-    await expect(getUser(999)).rejects.toThrow("User not found"); // Test the error path
-});
-```
-
-```js
-// --- Integration test (supertest + Express) ---
-// Tests the entire HTTP layer: routing, middleware, request parsing, response formatting
-const request = require("supertest");
-const app = require("./app"); // Your Express app (must NOT call app.listen!)
-
-describe("GET /api/users", () => {
-    it("returns 200 and array of users", async () => {
-        const res = await request(app).get("/api/users"); // Makes real HTTP request internally
-        expect(res.status).toBe(200);
-        expect(Array.isArray(res.body)).toBe(true); // Response body is auto-parsed JSON
-    });
-
-    it("returns 404 for unknown user", async () => {
-        const res = await request(app).get("/api/users/99999");
-        expect(res.status).toBe(404); // Verifies error handling works
-    });
-});
-```
-
-```yaml
-# --- GitHub Actions CI ---
-# .github/workflows/ci.yml
-name: CI
-on: [push, pull_request]
-jobs:
-    test:
-        runs-on: ubuntu-latest
-        steps:
-            - uses: actions/checkout@v4
-            - uses: actions/setup-node@v4
-              with: { node-version: 20 }
-            - run: npm ci
-            - run: npm run lint
-            - run: npm test -- --coverage
-```
-
-### Senior-Level Q&A
-
-**Q1: Unit vs integration vs e2e — when to use each?**
-
-A: Follow the **testing pyramid**: many unit tests (fast, cheap) → fewer integration tests → few e2e tests (slow, expensive). Unit tests catch logic bugs. Integration tests catch wiring bugs. E2e tests catch user-facing bugs.
-
-**Q2: How do you mock `fs` or `http` in tests?**
-
-A: Use `jest.mock('fs')` or inject dependencies. For HTTP, use **nock** or **msw** to intercept outgoing requests.
-
-```js
-const nock = require("nock");
-nock("https://api.example.com")
-    .get("/users/1")
-    .reply(200, { id: 1, name: "Alice" });
-// Now any HTTP call to that URL returns the mock
-```
-
-**Q3: What's a good code coverage target?**
-
-A: Aim for **80%+ line coverage** as a baseline. 100% is impractical and gives false confidence. Focus on testing **critical paths** (auth, payments, data mutations) rather than chasing numbers.
-
-> **💡 Interview Tip — One-Liner Answers:**
->
-> - _"Unit vs integration vs e2e tests?"_ → Unit = isolated function. Integration = modules together (API + DB). E2e = full user flow (browser/UI). Pyramid: many unit, some integration, few e2e.
-> - _"How do you mock external APIs in tests?"_ → Use `nock` to intercept HTTP calls and return controlled responses. For functions, use `jest.mock()` or sinon stubs.
-> - _"What's the testing pyramid?"_ → Many fast unit tests at the bottom, some integration tests in the middle, few slow e2e tests at the top. Invert it and your CI is slow and flaky.
-> - _"How do you test async code?"_ → Return the promise from the test, or use `async/await`. Jest auto-waits if test function returns a promise.
-
-> **📝 Quick Revision — Testing:**
-> | Test Type | Scope | Speed | Tools |
-> |---|---|---|---|
-> | Unit | Single function | Fast (~ms) | Jest, Vitest, node:test |
-> | Integration | Module + DB/API | Medium (~s) | Supertest, testcontainers |
-> | E2E | Full user flow | Slow (~10s+) | Playwright, Cypress |
-> | Mocking | Replace external deps | N/A | nock, jest.mock, sinon |
-
-[↑ Back to Index](#table-of-contents)
-
----
-
-### 7.2 Performance & Benchmarking
-
-### Concepts
-
-Performance in Node.js means keeping the event loop responsive and throughput high. The key metrics are: **requests/second**, **latency (p50/p95/p99)**, **event loop lag**, and **memory usage**.
-
-**Tools:**
-
-- **autocannon** — HTTP load testing tool for Node.js (like `ab` or `wrk`, but in JS)
-- **clinic.js** — Suite of profiling tools: Clinic Doctor (event loop), Clinic Flame (flamegraph), Clinic Bubbleprof (async)
-- **0x** — Flamegraph generator for CPU profiling
-- **perf_hooks** — Built-in module for performance measurement
-
-```mermaid
-flowchart TB
-    subgraph Metrics ["Key Performance Metrics"]
-        RPS["Requests/sec<br/>(throughput)"]
-        LAT["Latency p99<br/>(tail latency)"]
-        EL["Event Loop Lag<br/>(responsiveness)"]
-        MEM["Memory Usage<br/>(heap + RSS)"]
-    end
-    subgraph Tools ["Profiling Tools"]
-        AC[autocannon]
-        CL[clinic.js]
-        FL[0x / flamegraph]
-        PH[perf_hooks]
-    end
-    AC --> RPS
-    AC --> LAT
-    CL --> EL
-    CL --> MEM
-    FL --> EL
-    PH --> LAT
-    style RPS fill:#4caf50,color:#fff
-    style LAT fill:#ff9800,color:#fff
-```
-
-### Key Patterns
-
-> 📖 **What this example demonstrates:** Three performance measurement tools. The event loop delay monitor tracks how long Node's event loop is backed up (healthy: < 20ms). Performance marks let you time specific operations precisely. autocannon is a CLI load tester that simulates real traffic and shows you throughput and latency distribution.
->
-> 🔑 **Key terms:**
->
-> - **`monitorEventLoopDelay`** — Samples the gap between when a timer was supposed to fire and when it actually fired. High lag = something blocking the event loop (CPU work, sync I/O).
-> - **p50/p99 percentile** — p50 = 50% of requests are faster than this (the median). p99 = 99% are faster. p99 reveals your worst-case experience. Always optimize p99.
-> - **`performance.mark/measure`** — Same API as browser Performance API. Mark start/end points, then measure the duration between them.
-> - **`-c 100`** in autocannon — 100 concurrent HTTP connections hammering your server simultaneously. Simulates real load.
-
-```js
-// --- Measure event loop lag ---
-const { monitorEventLoopDelay } = require("perf_hooks");
-const h = monitorEventLoopDelay({ resolution: 10 }); // Sample every 10ms
-h.enable();
-
-setInterval(() => {
-    // percentile(50) = median lag; percentile(99) = worst 1% lag
-    // / 1e6 converts nanoseconds to milliseconds
-    console.log(
-        `Event loop lag — p50: ${(h.percentile(50) / 1e6).toFixed(2)}ms, p99: ${(h.percentile(99) / 1e6).toFixed(2)}ms`,
-    );
-    h.reset(); // Reset histogram for next interval
-}, 5000);
-// Healthy: p50 < 5ms, p99 < 20ms
-// Red flag: p99 > 100ms = something blocking the event loop
-```
-
-```js
-// --- Custom performance marks ---
-const { performance, PerformanceObserver } = require("perf_hooks");
-
-// Observer receives measurement results asynchronously
-const obs = new PerformanceObserver((list) => {
-    list.getEntries().forEach((e) => {
-        console.log(`${e.name}: ${e.duration.toFixed(2)}ms`);
-    });
-});
-obs.observe({ entryTypes: ["measure"] }); // Listen for 'measure' entries
-
-performance.mark("db-start"); // Timestamp: before query
-await db.query("SELECT * FROM users"); // The operation you want to time
-performance.mark("db-end"); // Timestamp: after query
-performance.measure("DB Query", "db-start", "db-end"); // Calculate duration
-// Observer logs: "DB Query: 12.45ms"
-```
-
-```bash
-# --- Load test with autocannon ---
-npx autocannon -c 100 -d 10 http://localhost:3000/api/users
-# -c 100 = 100 concurrent connections (simulates 100 simultaneous users)
-# -d 10  = run for 10 seconds
-# Output: req/sec, latency percentiles (p50, p97.5, p99), throughput (MB/s)
-```
-
-```bash
-# --- Flamegraph with clinic ---
-npx clinic flame -- node server.js
-# Runs your server with V8 profiling
-# After load testing, press Ctrl+C
-# Opens flamegraph in browser: wide bars = functions consuming most CPU time
-```
-
-### Senior-Level Q&A
-
-**Q1: Your API's p99 latency jumped from 50ms to 500ms. How do you diagnose?**
-
-A:
-
-1. Check event loop lag (perf_hooks) — if high, something is blocking
-2. Run clinic doctor to find the bottleneck
-3. Check if thread pool is saturated (`UV_THREADPOOL_SIZE`)
-4. Profile with flamegraph to find hot functions
-5. Check external dependencies (DB, Redis latency)
-
-**Q2: How do you benchmark properly? Common mistakes?**
-
-A: Use `autocannon` or `wrk` with realistic payloads. Warm up the server first (JIT, connection pools). Run for at least 30 seconds. Measure p99, not just average. Don't benchmark on the same machine as the server. Common mistake: testing with `curl` in a loop (no concurrency).
-
-> **💡 Interview Tip — One-Liner Answers:**
->
-> - _"How do you measure Node.js performance?"_ → Event loop lag (`perf_hooks`), throughput (`autocannon`), CPU profiling (`clinic flame`), memory (`process.memoryUsage()`), and p99 latency.
-> - _"What is p99 latency?"_ → The response time at the 99th percentile — 99% of requests are faster than this. More useful than average because it reveals tail latency.
-> - _"Your API is slow. How do you diagnose?"_ → Check event loop lag → clinic doctor → thread pool saturation → flamegraph for hot functions → external deps (DB, Redis latency).
-> - _"autocannon vs wrk?"_ → Both are load testers. `autocannon` is Node-native (npm install). `wrk` is C-based (faster, but needs compilation). Both measure throughput, latency distribution.
-
-> **📝 Quick Revision — Performance:**
-> | Metric | How to Measure | Healthy Value |
-> |---|---|---|
-> | Event loop lag | `monitorEventLoopDelay()` | < 20ms |
-> | Throughput (req/s) | `autocannon -c 100 -d 10` | Depends on app |
-> | p99 latency | autocannon/wrk output | < 200ms for APIs |
-> | Memory (RSS) | `process.memoryUsage().rss` | Stable, not growing |
-> | CPU profiling | `clinic flame` | No single function > 30% |
-
-[↑ Back to Index](#table-of-contents)
-
----
-
-### 7.3 API Design & Versioning
-
-### Concepts
-
-Good API design makes your backend usable, maintainable, and scalable. **REST** and **GraphQL** are the two dominant paradigms for Node.js APIs.
-
-**REST** organizes resources around URLs (`/users/123/posts`) with HTTP verbs (GET, POST, PUT, DELETE). It's simple, cacheable, and well-understood. Use it when your data model maps well to resources.
-
-**GraphQL** lets clients request exactly the data they need in a single query. It avoids over-fetching and under-fetching. Use it when you have complex relationships or mobile clients that need bandwidth efficiency.
-
-**Versioning** keeps old clients working when you change the API. Common strategies: URL path (`/v1/users`), header (`Accept: application/vnd.api.v2+json`), or query param (`?version=2`).
-
-**Idempotency** ensures that retrying a request produces the same result. Critical for payment APIs — if the client retries a charge, use an **idempotency key** so the server doesn't charge twice.
-
-```mermaid
-flowchart TB
-    subgraph REST ["REST API"]
-        R1["GET /users"] --> R2["GET /users/123"]
-        R2 --> R3["GET /users/123/posts"]
-    end
-    subgraph GQL ["GraphQL"]
-        G1["POST /graphql"] --> G2["query { user(id:123) { name posts { title } } }"]
-    end
-    subgraph Choice ["Decision"]
-        D{"Simple resources?"}
-        D -->|Yes| REST
-        D -->|Complex queries| GQL
-    end
-    style REST fill:#e3f2fd
-    style GQL fill:#fce4ec
-```
-
-### Key Patterns
-
-> 📖 **What this example demonstrates:** Three core REST API design patterns. Cursor-based pagination is more efficient than offset for large tables. Rate limiting protects against abuse. Idempotency keys prevent duplicate charges when payment requests are retried.
->
-> 🔑 **Key terms:**
->
-> - **Cursor-based pagination** — Instead of `OFFSET 1000`, use `WHERE id > lastId`. Much faster for PostgreSQL: offset scans skip rows, cursor jumps directly to the index.
-> - **`Math.min(parseInt(limit), 100)`** — Input validation and capping. Prevents a client from requesting 10,000 rows in one call.
-> - **`windowMs: 15 * 60 * 1000`** — 15 minutes in milliseconds. Rate limiting window: max 100 requests per IP per 15 minutes.
-> - **Idempotency key** — A UUID the client generates per request. If the same key is sent twice, the server returns the SAME response instead of charging again. Essential for payment retries.
-
-```js
-// --- REST best practices ---
-// Resource naming: plural nouns, predictable hierarchy
-// GET    /api/v1/users        → list all users
-// GET    /api/v1/users/:id    → get one user
-// POST   /api/v1/users        → create user
-// PUT    /api/v1/users/:id    → full update (replace)
-// PATCH  /api/v1/users/:id    → partial update (only changed fields)
-// DELETE /api/v1/users/:id    → delete
-
-// Pagination (cursor-based, better than offset for large datasets)
-app.get("/api/v1/users", async (req, res) => {
-    const { cursor, limit = 20 } = req.query;
-    const safeLimit = Math.min(parseInt(limit) || 20, 100); // Cap at 100 (prevent abuse)
-    const users = await db.query(
-        "SELECT * FROM users WHERE id > $1 ORDER BY id LIMIT $2",
-        [cursor || 0, safeLimit], // Cursor = last seen ID; fetch the next page from there
-    );
-    res.json({
-        data: users,
-        nextCursor: users.length ? users[users.length - 1].id : null, // Null = no more pages
-    });
-});
-```
-
-```js
-// --- Rate limiting ---
-const rateLimit = require("express-rate-limit");
-
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15-minute window
-    max: 100, // Max 100 requests per IP in that window
-    standardHeaders: true, // Include rate limit info in response headers (X-RateLimit-*)
-    message: { error: "Too many requests, try again later" },
-});
-
-app.use("/api/", limiter); // Apply to all API routes
-```
-
-```js
-// --- Idempotency for payments ---
-app.post("/api/v1/charges", async (req, res) => {
-    const idempotencyKey = req.headers["idempotency-key"]; // Client-generated UUID
-    if (!idempotencyKey)
-        return res
-            .status(400)
-            .json({ error: "Idempotency-Key header required" });
-
-    // Check if this request was already processed (don't charge twice!)
-    const existing = await db.query(
-        "SELECT * FROM charges WHERE idempotency_key = $1",
-        [idempotencyKey],
-    );
-    if (existing.rows.length) return res.json(existing.rows[0]); // Return same result
-
-    // First time seeing this key — process the payment
-    const charge = await processPayment(req.body);
-    await db.query(
-        "INSERT INTO charges (idempotency_key, data) VALUES ($1, $2)",
-        [idempotencyKey, charge], // Store so future retries return this same result
-    );
-    res.status(201).json(charge);
-});
-```
-
-### Senior-Level Q&A
-
-**Q1: REST vs GraphQL — tradeoffs?**
-
-|                | REST                | GraphQL                |
-| -------------- | ------------------- | ---------------------- |
-| Caching        | Easy (HTTP caching) | Hard (single endpoint) |
-| Over-fetching  | Common              | Eliminated             |
-| Learning curve | Low                 | Medium                 |
-| Tooling        | Mature              | Growing                |
-| File uploads   | Simple              | Complex                |
-| **Best for**   | CRUD apps           | Complex data graphs    |
-
-**Q2: How do you version a REST API without breaking clients?**
-
-A: Use URL versioning (`/v1/`, `/v2/`) for simplicity. Support the old version for a deprecation period. Use feature flags internally to avoid duplicating code.
-
-**Q3: How do you prevent abuse of your API?**
-
-A: Layer defenses: rate limiting (per IP, per API key), input validation (Joi/Zod), request size limits, authentication, and monitoring for anomalies.
-
-> **💡 Interview Tip — One-Liner Answers:**
->
-> - _"REST vs GraphQL?"_ → REST = resource-based URLs, fixed response shape, cacheable. GraphQL = single endpoint, client specifies fields, avoids over/under-fetching. REST for CRUD, GraphQL for complex data graphs.
-> - _"How do you handle pagination?"_ → Cursor-based (better for real-time data, no skipping issues) or offset-based (simpler, but slow for deep pages). Return `nextCursor` or `totalPages`.
-> - _"What is idempotency in APIs?"_ → Repeating the same request produces the same result. Use idempotency keys (client-generated UUID) to prevent duplicate side effects on retries.
-> - _"How do you version an API?"_ → URL versioning (`/v1/`, `/v2/`) is simplest. Header versioning (`Accept: application/vnd.api+json;version=2`) is cleaner but harder to test.
-
-> **📝 Quick Revision — API Design:**
-> | Concept | REST | GraphQL |
-> |---|---|---|
-> | Endpoints | Multiple (`/users`, `/posts`) | Single (`/graphql`) |
-> | Data fetching | Fixed response shape | Client specifies fields |
-> | Over-fetching | Common problem | Solved by design |
-> | Caching | Built-in (HTTP cache) | Needs Apollo/Relay |
-> | Versioning | URL (`/v1/`) or header | Schema evolution |
-> | Best for | CRUD APIs | Complex nested data |
-
-[↑ Back to Index](#table-of-contents)
-
----
-
-## Phase 8 — Deployment, Security & Operations
-
-### 8.1 Deployment & Operations
-
-### Concepts
-
-Getting Node.js code from your laptop to production involves **containerization**, **process management**, **health checks**, and **deployment strategies**.
-
-**Docker** packages your app with its exact Node version and dependencies into a portable container. It eliminates "works on my machine" problems.
-
-**Process managers** (PM2, systemd) keep your app running, restart on crash, and manage logs. PM2 also supports cluster mode (multiple processes per server).
-
-**Health checks** let load balancers and orchestrators know if your app is alive and ready to serve traffic. A liveness check confirms the process is running; a readiness check confirms it can handle requests (DB connected, caches warm).
-
-**Deployment strategies:**
-
-- **Rolling update** — replace instances one at a time (zero downtime)
-- **Blue-green** — run two identical environments; swap traffic instantly
-- **Canary** — route a small % of traffic to the new version first
-
-```mermaid
-flowchart TB
-    subgraph Build ["Build"]
-        Code[Source Code] --> Docker[Docker Image]
-        Docker --> Registry[Container Registry]
-    end
-    subgraph Deploy ["Deploy"]
-        Registry --> K8s[Kubernetes / ECS]
-        K8s --> Pod1[Pod 1]
-        K8s --> Pod2[Pod 2]
-        K8s --> Pod3[Pod 3]
-    end
-    subgraph Monitor ["Monitor"]
-        Pod1 --> Health[Health Checks]
-        Pod2 --> Health
-        Pod3 --> Health
-        Health --> LB[Load Balancer]
-    end
-    style Docker fill:#2196f3,color:#fff
-    style LB fill:#4caf50,color:#fff
-```
-
-### Key Patterns
-
-> 📖 **What this Dockerfile demonstrates:** Multi-stage build — the `builder` stage installs dependencies and compiles, then the `production` stage copies only the final artifacts. The image runs as a non-root user (`appuser`) for security. A built-in HEALTHCHECK tells Docker/Kubernetes whether the container is healthy.
->
-> 🔑 **Key terms:**
->
-> - **`node:20-alpine`** — Alpine Linux variant (~60MB) instead of Debian (~900MB). Dramatically smaller images.
-> - **`npm ci`** — "Clean Install" — strictly follows `package-lock.json`. Faster and more reproducible than `npm install` (fails if lock file is inconsistent).
-> - **`--only=production`** — Skip `devDependencies` (Jest, TypeScript, etc.) in the final image. Reduces size and attack surface.
-> - **Multi-stage** — The `builder` stage has compiler tools. The final stage has only what's needed at runtime. Final image ~5-10x smaller.
-> - **`HEALTHCHECK`** — Docker pings this command every 30s. If it fails 3 times, Docker marks the container unhealthy. Load balancer stops routing traffic to it.
-
-```dockerfile
-# --- Optimized Dockerfile for Node.js ---
-FROM node:20-alpine AS builder          # Stage 1: install deps (Alpine = small Linux)
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci --only=production           # Install only production deps (no Jest, TypeScript, etc.)
-COPY . .                               # Copy source code AFTER npm install (better Docker layer caching)
-
-FROM node:20-alpine                    # Stage 2: production image (starts fresh, no build tools)
-WORKDIR /app
-# Security: never run as root (if app is compromised, attacker has limited permissions)
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
-COPY --from=builder /app .            # Copy only the built artifacts from Stage 1
-USER appuser                          # Switch to non-root user
-EXPOSE 3000                           # Documentation: this container listens on port 3000
-# Health check: Docker/K8s runs this every 30s; exit 1 = unhealthy
-HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://localhost:3000/health || exit 1
-CMD ["node", "server.js"]             # Start the app
-```
-
-> 📖 **What this example demonstrates:** Combined graceful shutdown + health check endpoints. The `/health` endpoint tells the load balancer the service is up. The `/ready` endpoint checks all dependencies (DB, Redis) before accepting traffic. `gracefulShutdown` ensures no requests are dropped during deployment.
-
-```js
-// --- Graceful shutdown ---
-const server = app.listen(3000);
-
-async function gracefulShutdown(signal) {
-    console.log(`${signal} received. Shutting down gracefully...`);
-
-    server.close(() => {
-        // Stop accepting new connections; existing finish naturally
-        console.log("HTTP server closed");
-    });
-
-    await db.end(); // Close all database connections cleanly (finish pending queries)
-    await logger.flush(); // Flush buffered logs to disk/network
-
-    setTimeout(() => {
-        console.error("Forced shutdown"); // Stuck? Kill after 10s
-        process.exit(1);
-    }, 10000);
-}
-
-process.on("SIGTERM", () => gracefulShutdown("SIGTERM")); // K8s/PM2 sends this
-process.on("SIGINT", () => gracefulShutdown("SIGINT")); // Ctrl+C during development
-```
-
-```js
-// --- Health check endpoints ---
-// /health = liveness: "is the process alive?" - K8s restarts if this fails
-app.get("/health", (req, res) => {
-    res.status(200).json({ status: "ok", uptime: process.uptime() }); // uptime in seconds
-});
-
-// /ready = readiness: "is the app ready to serve traffic?" - K8s stops routing if this fails
-app.get("/ready", async (req, res) => {
-    try {
-        await db.query("SELECT 1"); // Verify DB connection (throws if DB is down)
-        await redis.ping(); // Verify Redis connection (throws if Redis is down)
-        res.status(200).json({ status: "ready" });
-    } catch (err) {
-        // Return 503 (Service Unavailable) — load balancer stops sending traffic until ready
-        res.status(503).json({ status: "not ready", error: err.message });
-    }
-});
-```
-
-```bash
-# --- PM2 commands ---
-pm2 start server.js -i max       # Cluster mode: fork one worker per CPU core
-pm2 reload server                # Zero-downtime restart: replace workers one by one
-pm2 logs                         # View logs (all workers combined)
-pm2 monit                        # Live monitoring dashboard (CPU, RAM per worker)
-pm2 save                         # Save current process list
-pm2 startup                      # Generate and configure auto-start on server reboot
-```
-
-### Senior-Level Q&A
-
-**Q1: Docker multi-stage build — why is it important?**
-
-A: Reduces final image size. The builder stage installs dev dependencies and compiles; the production stage copies only what's needed. A typical Node.js image drops from ~900MB to ~150MB.
-
-**Q2: How do you implement zero-downtime deploys?**
-
-A: Use rolling updates (Kubernetes) or PM2 reload. The old process keeps handling in-flight requests while new processes start. Graceful shutdown ensures no requests are dropped.
-
-**Q3: SIGTERM vs SIGKILL — what's the difference?**
-
-A: `SIGTERM` is a polite "please shut down" — your process can catch it and clean up. `SIGKILL` is an immediate kill — no cleanup, no catch. Kubernetes sends `SIGTERM` first, waits 30s (configurable), then sends `SIGKILL`.
-
-> **💡 Interview Tip — One-Liner Answers:**
->
-> - _"Docker multi-stage build?"_ → First stage installs all deps + compiles; second stage copies only production artifacts. Image drops from ~900MB to ~150MB.
-> - _"What is a health check?"_ → An endpoint (`/health`) that returns 200 if the service is operational. K8s/LB uses it to route traffic only to healthy instances. Check DB, Redis, disk space.
-> - _"PM2 vs Docker for process management?"_ → PM2 = Node-specific (cluster mode, log management, reload). Docker/K8s = container orchestration (language-agnostic, scaling, self-healing). Use both: PM2 inside container for cluster, K8s outside for orchestration.
-> - _"What goes in .dockerignore?"_ → `node_modules`, `.git`, `*.md`, test files, `.env` — anything not needed at runtime. Smaller context = faster builds.
-
-> **📝 Quick Revision — Deployment:**
-> | Concept | Key Point |
-> |---|---|
-> | Multi-stage Docker | Separate build stage from production; smaller images |
-> | Health checks | `/health` endpoint; LB/K8s routes only to healthy |
-> | Graceful shutdown | SIGTERM → drain → close connections → exit 0 |
-> | Rolling update | Replace instances one by one; zero downtime |
-> | PM2 cluster | `pm2 start app.js -i max` — all CPU cores |
-> | SIGTERM vs SIGKILL | SIGTERM = catchable. SIGKILL = instant death |
-
-[↑ Back to Index](#table-of-contents)
-
----
-
-### 8.2 Security Checklist & Hardening
-
-### Concepts
-
-Security isn't a feature — it's a requirement. Node.js apps face the same web vulnerabilities as any server, plus some unique risks around dependency management and prototype pollution.
-
-**OWASP Top 10 for Node.js:**
-
-1. **Injection** (SQL, NoSQL, command) — always parameterize queries
-2. **Broken authentication** — use bcrypt, JWT with short expiry, rate limit login
-3. **Sensitive data exposure** — encrypt at rest and in transit (TLS)
-4. **Broken access control** — check permissions on every request
-5. **Security misconfiguration** — use helmet, disable `X-Powered-By`
-6. **XSS** — sanitize output, use CSP headers
-7. **Insecure deserialization** — validate JSON schemas (Zod/Joi)
-8. **Using components with known vulns** — `npm audit`, Snyk
-9. **Insufficient logging** — log auth failures, suspicious patterns
-10. **SSRF** — validate/restrict outgoing URLs
-
-```mermaid
-flowchart TB
-    subgraph Input ["Input Layer"]
-        V[Validate Input<br/>Zod / Joi]
-        RL[Rate Limit<br/>express-rate-limit]
-        CORS2[CORS Headers]
-    end
-    subgraph App ["Application Layer"]
-        Auth[Authentication<br/>bcrypt + JWT]
-        AuthZ[Authorization<br/>RBAC / ABAC]
-        San[Sanitize Output<br/>DOMPurify]
-    end
-    subgraph Infra ["Infrastructure Layer"]
-        TLS2[TLS 1.2+]
-        Helm[Helmet Headers]
-        Dep[Dependency Audit<br/>npm audit / Snyk]
-    end
-    Input --> App --> Infra
-    style V fill:#4caf50,color:#fff
-    style Auth fill:#2196f3,color:#fff
-    style TLS2 fill:#ff9800,color:#fff
-```
-
-### Security Checklist
-
-> 📖 **What this example demonstrates:** Seven layered security practices. Each one prevents a specific attack. Together they address the OWASP Node.js Top 10. Input validation stops garbage data before it reaches the DB. Parameterized queries stop SQL injection. bcrypt makes stolen passwords useless. JWT with short expiry limits damage from token theft.
->
-> 🔑 **Key terms:**
->
-> - **Zod** — A TypeScript schema validation library. `.safeParse()` returns `{ success, data, error }` instead of throwing — great for request validation.
-> - **bcrypt salt rounds** — The `12` in `bcrypt.hash(password, 12)` is the cost factor. Higher = more CPU per hash = harder to brute force. 12 rounds ≈ 250ms per hash on modern CPU.
-> - **`jwt.sign({ expiresIn: '15m' })`** — Token expires in 15 minutes. Stolen token becomes useless after 15 min. Use refresh tokens for longer sessions.
-> - **`app.disable('x-powered-by')`** — Removes the `X-Powered-By: Express` header that tells attackers what framework you use.
-
-```js
-// 1. Input validation (Zod example)
-const { z } = require("zod");
-const UserSchema = z.object({
-    email: z.string().email(), // Must be a valid email format
-    password: z.string().min(8).max(128), // 8-128 chars (max prevents bcrypt DoS)
-    age: z.number().int().min(13).max(150).optional(), // Optional, bounded
-});
-
-app.post("/register", (req, res) => {
-    const result = UserSchema.safeParse(req.body); // Validate without throwing
-    if (!result.success)
-        return res.status(400).json({ errors: result.error.issues }); // Return what's wrong
-    // Use result.data which is type-safe and validated
-});
-
-// 2. SQL injection prevention (parameterized queries)
-// ❌ BAD: String concatenation — attacker can inject SQL
-// db.query(`SELECT * FROM users WHERE id = ${req.params.id}`);
-// ✅ GOOD: Parameterized — DB treats the value as data, NEVER as SQL
-const user = await db.query("SELECT * FROM users WHERE id = $1", [
-    req.params.id,
-]);
-
-// 3. Password hashing (bcrypt)
-const bcrypt = require("bcrypt");
-const hash = await bcrypt.hash(password, 12); // 12 rounds ≈ 250ms — resistant to brute force
-const match = await bcrypt.compare(inputPassword, storedHash); // Returns true/false
-
-// 4. JWT with short expiry
-const jwt = require("jsonwebtoken");
-const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, {
-    expiresIn: "15m", // Token valid for 15 minutes only
-    // Combined with refresh tokens: short access token + long refresh token
-});
-
-// 5. Helmet (security headers)
-app.use(helmet()); // Sets: CSP, HSTS, X-Frame-Options, X-Content-Type-Options, etc.
-app.disable("x-powered-by"); // Remove "X-Powered-By: Express" to avoid fingerprinting
-
-// 6. Dependency scanning
-// npm audit              (built-in, free)
-// npx snyk test          (deeper, can check reachability)
-// npm audit fix --force  (auto-fix, careful — may break APIs)
-
-// 7. Environment variables (never hardcode secrets)
-// ❌ const secret = 'my-secret-key'; // Exposed in source control!
-// ✅ const secret = process.env.JWT_SECRET; // From environment or secret manager
-```
-
-### Senior-Level Q&A
-
-**Q1: How do you prevent prototype pollution in Node.js?**
-
-A: Prototype pollution occurs when an attacker sets `__proto__` or `constructor.prototype` via user input. Freeze prototypes, validate input keys, or use `Object.create(null)` for lookup maps.
-
-```js
-// ❌ Vulnerable to prototype pollution
-function merge(target, source) {
-    for (const key in source) {
-        target[key] = source[key]; // __proto__ can be set!
-    }
-}
-
-// ✅ Safe merge
-function safeMerge(target, source) {
-    for (const key of Object.keys(source)) {
-        if (key === "__proto__" || key === "constructor" || key === "prototype")
-            continue;
-        target[key] = source[key];
-    }
-}
-```
-
-**Q2: Your `npm audit` shows 15 high vulnerabilities. How do you prioritize?**
-
-A:
-
-1. Check if the vulnerable package is a **direct** dependency (fix first) or transitive
-2. Check if the vulnerability is **reachable** in your code path
-3. Use `npm audit fix` for non-breaking fixes
-4. For breaking changes, evaluate if upgrading is worth the effort
-5. Use `npm overrides` or `resolutions` to force a safe version of transitive deps
-
-> **💡 Interview Tip — One-Liner Answers:**
->
-> - _"Top 3 Node.js security risks?"_ → (1) Prototype pollution via JSON input. (2) Dependency vulnerabilities (supply chain). (3) Injection (SQL, command, ReDoS).
-> - _"How do you manage secrets?"_ → Never hardcode. Use environment variables + secret manager (AWS Secrets Manager, Vault). `.env` files for development only (never commit).
-> - _"What is CSP?"_ → Content Security Policy — HTTP header that restricts which resources (scripts, images, styles) can load. Prevents XSS by blocking inline scripts and untrusted sources.
-> - _"How to handle npm audit vulnerabilities?"_ → Direct deps: upgrade. Transitive: use `npm overrides` or `resolutions`. Check if vulnerability is reachable in your code path.
-
-> **📝 Quick Revision — Security:**
-> | Threat | Prevention |
-> |---|---|
-> | Prototype pollution | Input validation (Joi/Zod), `Object.create(null)` |
-> | SQL injection | Parameterized queries, ORMs |
-> | XSS | CSP headers, output encoding |
-> | Command injection | `execFile` not `exec`; never pass user input to shell |
-> | Dependency vulns | `npm audit`, Snyk, Dependabot, lock files |
-> | Secrets leakage | Env vars + secret manager; never commit `.env` |
-
-[↑ Back to Index](#table-of-contents)
-
----
-
-### 8.3 Observability: Tracing & APM
-
-### Concepts
-
-**Observability** is the ability to understand your system's internal state from its external outputs. The three pillars are **logs**, **metrics**, and **traces**.
-
-- **Logs** — structured events (use pino or winston; JSON format for machine parsing)
-- **Metrics** — numbers over time (request rate, error rate, latency histograms)
-- **Traces** — the journey of a single request across services (distributed tracing)
-
-**OpenTelemetry** is the industry standard for instrumenting Node.js apps. It collects traces, metrics, and logs and exports them to backends like Jaeger, Grafana Tempo, Datadog, or New Relic.
-
-**Correlation IDs** tie all logs and traces from a single request together. Generate a unique ID at the edge (API gateway or first service) and pass it in headers (`X-Request-ID`).
-
-```mermaid
-flowchart LR
-    subgraph App ["Node.js App"]
-        OT[OpenTelemetry SDK]
-        Log[Structured Logs<br/>pino]
-        Met[Metrics<br/>prom-client]
-    end
-    subgraph Backends ["Observability Backends"]
-        Jaeger[Jaeger / Tempo<br/>Traces]
-        Grafana[Grafana<br/>Dashboards]
-        Loki[Loki / ELK<br/>Logs]
-    end
-    OT --> Jaeger
-    Met --> Grafana
-    Log --> Loki
-    Jaeger --> Grafana
-    Loki --> Grafana
-    style OT fill:#ff9800,color:#fff
-    style Grafana fill:#4caf50,color:#fff
-```
-
-### Key Patterns
-
-> 📖 **What this example demonstrates:** Structured logging with request correlation. Instead of `console.log('user fetched')`, each log line is a JSON object with `requestId`, method, path, and any other context. This makes it searchable in Loki/ELK: find all logs for a specific request ID across all servers.
->
-> 🔑 **Key terms:**
->
-> - **`pino`** — The fastest Node.js logging library. Outputs JSON lines. Very low overhead (~3x faster than Winston).
-> - **`logger.child({ requestId })`** — Creates a new logger that includes the `requestId` field in every log line automatically. You don't have to pass it manually each time.
-> - **Correlation ID / Request ID** — A unique UUID per request. Passed as `X-Request-ID` header. All logs and traces for that request share this ID. Makes debugging distributed systems possible.
-> - **`process.LOG_LEVEL || 'info'`** — Control log verbosity via environment variable. `info` in production, `debug` locally.
-
-```js
-// --- Structured logging with pino ---
-const pino = require("pino");
-const logger = pino({
-    level: process.env.LOG_LEVEL || "info", // 'debug' locally, 'info'/'warn' in production
-    // JSON output: each line is parseable JSON for log management tools (Loki, ELK, Datadog)
-});
-
-// Add request context (correlation ID)
-app.use((req, res, next) => {
-    // Create a child logger with request-specific context attached to every log line
-    req.log = logger.child({
-        requestId: req.headers["x-request-id"] || crypto.randomUUID(), // Use provided or generate
-        method: req.method,
-        path: req.url,
-    });
-    next();
-});
-
-app.get("/api/users", async (req, res) => {
-    req.log.info("Fetching users"); // Outputs: {"requestId":"abc","method":"GET",...,"msg":"Fetching users"}
-    const users = await db.query("SELECT * FROM users");
-    req.log.info({ count: users.length }, "Users fetched"); // Add structured data to the log line
-    res.json(users);
-});
-```
-
-> 📖 **What this example demonstrates:** Exposing Prometheus metrics from a Node.js app. A Histogram records the duration of HTTP requests, labeled by method/route/status. Prometheus scrapes `/metrics` every 15s, and Grafana visualizes it as dashboards and alerts.
->
-> 🔑 **Key terms:**
->
-> - **Histogram** — Records distribution of values (e.g., request durations) in buckets. `buckets: [0.01, 0.05, 0.1, 0.5, 1, 5]` means: how many requests took <10ms, <50ms, <100ms, etc.
-> - **`labels`** — Dimensions for filtering. In Grafana you can query: "show p99 latency for method=GET route=/api/users".
-> - **Prometheus scrape** — Prometheus regularly calls `/metrics` endpoint and records the current metrics values. Your app doesn't push; Prometheus pulls.
-> - **`collectDefaultMetrics()`** — Auto-collects Node.js runtime metrics: event loop lag, heap usage, GC duration, active handles, etc.
-
-```js
-// --- Prometheus metrics (prom-client) ---
-const client = require("prom-client");
-const collectDefaultMetrics = client.collectDefaultMetrics;
-collectDefaultMetrics(); // Auto-collect: CPU, heap, event loop lag, GC, HTTP connections
-
-const httpRequestDuration = new client.Histogram({
-    name: "http_request_duration_seconds",
-    help: "Duration of HTTP requests in seconds",
-    labelNames: ["method", "route", "status"], // Dimensions for filtering in Grafana
-    buckets: [0.01, 0.05, 0.1, 0.5, 1, 5], // Bucket boundaries in seconds
-});
-
-app.use((req, res, next) => {
-    const end = httpRequestDuration.startTimer(); // Start timer for this request
-    res.on("finish", () =>
-        end({
-            method: req.method,
-            route: req.route?.path || req.url, // Use route pattern (/users/:id not /users/123)
-            status: res.statusCode,
-        }),
-    );
-    next();
-});
-
-// Prometheus scrapes this endpoint every 15s
-app.get("/metrics", async (req, res) => {
-    res.set("Content-Type", client.register.contentType); // Special content type prometheus expects
-    res.end(await client.register.metrics()); // All registered metrics as text
-});
-```
-
-> 📖 **What this example demonstrates:** Auto-instrumentation with OpenTelemetry. By loading `tracing.js` before your app starts, OTel automatically instruments Express routes, pg queries, Redis calls, HTTP outgoing requests, and more — with zero code changes to your business logic.
->
-> 🔑 **Key terms:**
->
-> - **Trace** — The complete journey of one request through your system. Consists of spans.
-> - **Span** — One operation within a trace ("DB query took 15ms", "Redis lookup 2ms", "total request 20ms").
-> - **OTLP (OpenTelemetry Protocol)** — Standard protocol for sending telemetry data to backends (Jaeger, Tempo, Datadog).
-> - **`-r ./tracing.js`** — Node.js `require` flag: load this module before anything else. OTel must be initialized before your imports.
-
-```js
-// --- OpenTelemetry auto-instrumentation ---
-// tracing.js (load BEFORE app code)
-const { NodeSDK } = require("@opentelemetry/sdk-node");
-const {
-    getNodeAutoInstrumentations,
-} = require("@opentelemetry/auto-instrumentations-node");
-const {
-    OTLPTraceExporter,
-} = require("@opentelemetry/exporter-trace-otlp-http");
-
-const sdk = new NodeSDK({
-    traceExporter: new OTLPTraceExporter({
-        url: "http://localhost:4318/v1/traces", // Send spans to local Jaeger/Tempo collector
-    }),
-    instrumentations: [getNodeAutoInstrumentations()], // Auto-instrument everything
-});
-
-sdk.start();
-// Auto-instruments: HTTP (req/res), Express (routes), pg (queries), redis (commands), fs, dns
-
-// Start app: node -r ./tracing.js server.js
-// Traces are automatically created for every incoming request
-// Grafana Tempo shows: GET /api/users -> SELECT * FROM users (12ms) -> Redis GET (1ms)
-```
-
-### Senior-Level Q&A
-
-**Q1: How do you trace a request across 5 microservices?**
-
-A: Use OpenTelemetry with distributed tracing. The first service creates a **trace ID** and **span**. Each subsequent service receives the trace context via HTTP headers (`traceparent`) and creates child spans. The trace backend (Jaeger) assembles the full request waterfall.
-
-**Q2: What's the difference between logs, metrics, and traces?**
-
-|              | Logs                    | Metrics                       | Traces                          |
-| ------------ | ----------------------- | ----------------------------- | ------------------------------- |
-| Format       | Text/JSON events        | Numbers + labels              | Span trees                      |
-| Cardinality  | High                    | Low                           | Medium                          |
-| Use for      | Debugging, audit        | Alerting, dashboards          | Performance, dependencies       |
-| Storage cost | High                    | Low                           | Medium                          |
-| Example      | "User 123 login failed" | `http_errors_total{code=500}` | Request → DB → Cache → Response |
-
-**Q3: Your dashboard shows high p99 latency but low average. What does this mean?**
-
-A: A small percentage of requests are very slow (tail latency). Common causes: garbage collection pauses, slow DB queries, thread pool exhaustion. Investigate with p99 flamegraphs and correlate with GC metrics.
-
-> **💡 Interview Tip — One-Liner Answers:**
->
-> - _"What is OpenTelemetry?"_ → Vendor-neutral framework for collecting traces, metrics, and logs. Instrument once, export to any backend (Jaeger, Datadog, Grafana).
-> - _"What is a distributed trace?"_ → A tree of spans showing the entire request journey across microservices. Each span has: service name, duration, status, parent span ID.
-> - _"Logs vs metrics vs traces?"_ → Logs = what happened (debug). Metrics = how much (alert). Traces = how long, where (performance). Use all three together.
-> - _"What is a correlation ID?"_ → A unique ID (UUID) attached to every log and trace for a single request — lets you follow one request across all microservices.
-
-> **📝 Quick Revision — Observability:**
-> | Signal | Format | Use For | Tool |
-> |---|---|---|---|
-> | Logs | JSON events | Debugging, audit trail | pino, winston, ELK |
-> | Metrics | Numbers + labels | Alerting, dashboards | Prometheus, Grafana |
-> | Traces | Span trees | Latency, service dependencies | Jaeger, Datadog, Tempo |
-> | Correlation ID | UUID per request | Cross-service debugging | Custom middleware |
-
-[↑ Back to Index](#table-of-contents)
 
 ---
 
