@@ -6937,18 +6937,56 @@ sequenceDiagram
 #### Lock Lifecycle
 
 ```mermaid
-stateDiagram-v2
-    [*] --> Available: Redis key doesn't exist
+flowchart TD
+    START(["Process wants\nto acquire lock"])
 
-    Available --> Locked: SETNX returns OK
-    Note right of Locked: Owner holds UUID<br/>TTL = 30 seconds
+    SETNX{"SETNX lock:order:123\n+ TTL 30s"}
 
-    Locked --> Available: Owner calls DEL (normal release)
-    Locked --> Available: TTL expires (owner crashed)
+    LOCKED["🔒 LOCKED\nOwner holds unique UUID\nTTL = 30s auto-expiry"]
 
-    Locked --> Rejected: Another process tries SETNX
-    Rejected --> Retry: Wait with exponential backoff
-    Retry --> Available: Try again
+    WORK["Owner does critical work\n— read DB\n— update record\n— write DB"]
+
+    RELEASE{"How is\nlock released?"}
+
+    NORMAL["Owner calls DEL\nnormal release"]
+    CRASH["Owner crashed\nTTL expires automatically"]
+
+    FREE(["🔓 AVAILABLE\nRedis key gone\nNext process can acquire"])
+
+    FAIL["SETNX returned FAIL\nLock already exists"]
+
+    BACKOFF["Wait with\nexponential backoff\n100ms → 200ms → 400ms..."]
+
+    MAXRETRY{"Max retries\nreached?"}
+
+    TIMEOUT(["❌ Lock Timeout\nReturn error\nto caller"])
+
+    START --> SETNX
+    SETNX -->|"OK — key set\nno one else held it"| LOCKED
+    SETNX -->|"FAIL — key exists\nsomeone else holds it"| FAIL
+
+    LOCKED --> WORK
+    WORK --> RELEASE
+    RELEASE -->|"success path"| NORMAL
+    RELEASE -->|"crash / hang"| CRASH
+    NORMAL --> FREE
+    CRASH --> FREE
+
+    FAIL --> BACKOFF
+    BACKOFF --> MAXRETRY
+    MAXRETRY -->|"No — retry"| SETNX
+    MAXRETRY -->|"Yes — give up"| TIMEOUT
+
+    FREE -.->|"lock available again\nwaiting retries can now succeed"| SETNX
+
+    style LOCKED fill:#ff9800,color:#fff
+    style FREE fill:#66bb6a,color:#fff
+    style FAIL fill:#ef5350,color:#fff
+    style TIMEOUT fill:#ef5350,color:#fff
+    style WORK fill:#42a5f5,color:#fff
+    style BACKOFF fill:#fff9c4,color:#f57f17
+    style NORMAL fill:#c8e6c9,color:#1b5e20
+    style CRASH fill:#ffcdd2,color:#c62828
 ```
 
 ```js
