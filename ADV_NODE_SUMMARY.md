@@ -6052,13 +6052,13 @@ A publicly accessible proxy that forwards requests for anyone. Generally unsafe 
 
 #### Forward Proxy vs Reverse Proxy — Side by Side
 
-| Feature | Forward Proxy | Reverse Proxy |
-|---|---|---|
-| Sits in front of | **Client** | **Server** |
-| Protects / hides | Client identity | Backend servers |
-| Who configures it | Client (explicit) | Server owner |
-| Common tool | Squid, corporate firewall | nginx, HAProxy, Traefik |
-| Common use | Outbound traffic control | Load balancing, TLS, routing |
+| Feature           | Forward Proxy             | Reverse Proxy                |
+| ----------------- | ------------------------- | ---------------------------- |
+| Sits in front of  | **Client**                | **Server**                   |
+| Protects / hides  | Client identity           | Backend servers              |
+| Who configures it | Client (explicit)         | Server owner                 |
+| Common tool       | Squid, corporate firewall | nginx, HAProxy, Traefik      |
+| Common use        | Outbound traffic control  | Load balancing, TLS, routing |
 
 ```mermaid
 flowchart TB
@@ -6185,9 +6185,9 @@ Frequently requested responses can be cached at the reverse proxy layer. Identic
 
 These two terms are often used interchangeably, but they are not identical.
 
-| Term | Definition |
-|---|---|
-| **Reverse Proxy** | Forwards requests from clients to backend servers. May have one or many backends. |
+| Term              | Definition                                                                                                                               |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| **Reverse Proxy** | Forwards requests from clients to backend servers. May have one or many backends.                                                        |
 | **Load Balancer** | A reverse proxy that also distributes traffic across **multiple** backends using an algorithm (round-robin, least-connections, IP hash). |
 
 **Conclusion:** Every load balancer is a reverse proxy. Not every reverse proxy is a load balancer.
@@ -6235,14 +6235,14 @@ sequenceDiagram
 
 #### Common Reverse Proxy Tools in Node.js Ecosystems
 
-| Tool | Type | Common Use |
-|---|---|---|
-| **nginx** | Open source | Most popular — static files + reverse proxy + TLS |
-| **HAProxy** | Open source | High-performance TCP/HTTP load balancer |
-| **Traefik** | Open source | Cloud-native, auto-discovers Docker/K8s services |
-| **AWS ALB** | Cloud (AWS) | Application load balancer |
-| **AWS NLB** | Cloud (AWS) | Network load balancer (TCP level) |
-| **Cloudflare** | CDN + Proxy | Edge caching, DDoS protection, TLS |
+| Tool           | Type        | Common Use                                        |
+| -------------- | ----------- | ------------------------------------------------- |
+| **nginx**      | Open source | Most popular — static files + reverse proxy + TLS |
+| **HAProxy**    | Open source | High-performance TCP/HTTP load balancer           |
+| **Traefik**    | Open source | Cloud-native, auto-discovers Docker/K8s services  |
+| **AWS ALB**    | Cloud (AWS) | Application load balancer                         |
+| **AWS NLB**    | Cloud (AWS) | Network load balancer (TCP level)                 |
+| **Cloudflare** | CDN + Proxy | Edge caching, DDoS protection, TLS                |
 
 ---
 

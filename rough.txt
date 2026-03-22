@@ -31,5 +31,5 @@
             - 4000
         - Server 3
             - 4000
-    - redis server to maintain session state
+    - Redis server to maintain session state
     - Database to store state 
