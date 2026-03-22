@@ -89,18 +89,21 @@ graph TD
     A["require('express')"] --> B{"Is it a built-in module?<br/>fs, http, path, etc."}
     B -->|Yes| C["Return built-in module"]
     B -->|No| D{"Is it a relative path?<br/>./utils or ../lib"}
-    D -->|Yes| E["Resolve file path:<br/>./utils.js → .json → .node<br/>→ ./utils/index.js"]
+    D -->|Yes| E["Resolve absolute file path:<br/>./utils.js → .json → .node<br/>→ ./utils/index.js"]
     D -->|No| F{"Already in require.cache?"}
-    F -->|Yes| G["Return cached module<br/>(same object every time)"]
+    E --> ER{"Already in<br/>require.cache?"}
+    ER -->|Yes| G["Return cached module<br/>(same object every time)"]
+    ER -->|"No — load file directly"| I
+    F -->|Yes| G
     F -->|No| H["Search node_modules/<br/>current dir → parent → root"]
     H --> I["Load, compile & execute<br/>the module file"]
     I --> J["Store in require.cache"]
     J --> G
-    E --> F
 
     style C fill:#4caf50,color:#fff
     style G fill:#2196f3,color:#fff
     style I fill:#ff9800,color:#fff
+    style ER fill:#fff9c4,color:#f57f17
 ```
 
 ### CommonJS vs ES Modules
@@ -6211,24 +6214,29 @@ sequenceDiagram
     U->>DNS: Resolve api.myapp.com
     DNS-->>U: IP address
 
-    U->>CF: HTTPS request (TLS terminated at edge)
-    CF-->>U: Cache HIT? Serve immediately
+    U->>CF: HTTPS GET /api/data (TLS terminated at edge)
 
-    CF->>LB: Forward to origin (plain HTTP)
-    LB->>LB: Health check backends
-    LB->>N: Forward to available Node instance
+    alt CDN Cache HIT
+        CF-->>U: 200 OK — cached response served at edge
+    else CDN Cache MISS
+        CF->>LB: Forward to origin (plain HTTP)
+        LB->>LB: Health check — select available backend
+        LB->>N: Forward request to Node instance
 
-    N->>R: Check cache
-    R-->>N: Cache HIT — return data
-    R-->>N: Cache MISS — query DB
+        N->>R: Check Redis cache
 
-    N->>DB: SQL query
-    DB-->>N: Result rows
+        alt Redis Cache HIT
+            R-->>N: Cached data returned
+        else Redis Cache MISS
+            N->>DB: SQL query
+            DB-->>N: Result rows
+            N->>R: Store result in cache (TTL 3600s)
+        end
 
-    N->>R: Store in cache (TTL 3600s)
-    N-->>LB: HTTP response
-    LB-->>CF: Response
-    CF-->>U: HTTPS response
+        N-->>LB: HTTP response
+        LB-->>CF: Forward response
+        CF-->>U: HTTPS response to client
+    end
 ```
 
 ---

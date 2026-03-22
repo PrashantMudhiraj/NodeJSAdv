@@ -33,3 +33,27 @@
             - 4000
     - Redis server to maintain session state
     - Database to store state 
+    
+- Reverse proxy
+    - Load Balancing
+    - TLS/SSL Termination
+    - Request Routing
+    - Caching the response
+    - Serving static files
+    - Hides the backend servers
+
+- no of cpus
+    - const numsWorker = require("os").cpus().length;
+    - if (cluster.isMaster) {
+        for(let i = 0 ; i < numsWorker.length ; i++) cluster.fork();           
+    } else {
+        http.createServer((req, res) => {
+            if(req.url === knf) {
+
+            }
+        })
+
+    }
+
+- Connection Pool
+    - 
