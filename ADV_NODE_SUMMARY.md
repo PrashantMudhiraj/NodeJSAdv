@@ -1,4 +1,4 @@
-﻿# Advanced Node.js — In-depth Notes
+# Advanced Node.js — In-depth Notes
 
 ## Overview
 
@@ -78,6 +78,17 @@ This document expands the workspace summary into practical, in-depth notes for e
 - S15 [Large File Upload to S3](#scenario-15-stream-a-large-file-upload-directly-to-s3-without-buffering-in-memory) — pipe stream, multipart upload, never buffer
 - S16 [Correlation IDs / Request Tracing](#scenario-16-debug-a-request-that-fails-in-production-but-not-locally--correlation-ids) — AsyncLocalStorage, X-Request-ID, structured logs
 - S17 [Race Conditions in Node.js](#scenario-17-race-condition-in-nodejs--two-requests-read-then-write-the-same-record) — atomic SQL, SELECT FOR UPDATE, optimistic locking
+
+**Phase 10 — Distributed Systems**
+
+- 10.1 [Distributed Systems Fundamentals](#101-distributed-systems-fundamentals) — CAP theorem, consistency models, network partitions
+- 10.2 [Service Discovery & Load Balancing](#102-service-discovery--load-balancing) — DNS-SD, consul, client-side vs server-side LB
+- 10.3 [Distributed Consensus & Coordination](#103-distributed-consensus--coordination) — leader election, Raft, ZooKeeper, distributed locks
+- 10.4 [Event-Driven Architecture & CQRS](#104-event-driven-architecture--cqrs) — event sourcing, CQRS, saga pattern, outbox pattern
+- 10.5 [Distributed Transactions & Data Consistency](#105-distributed-transactions--data-consistency) — 2PC, saga, eventual consistency, idempotency
+- 10.6 [Distributed Caching & Data Partitioning](#106-distributed-caching--data-partitioning) — consistent hashing, Redis cluster, sharding strategies
+- 10.7 [Observability in Distributed Systems](#107-observability-in-distributed-systems) — distributed tracing, correlation IDs, span propagation
+- 10.8 [Resilience Patterns](#108-resilience-patterns) — circuit breaker, bulkhead, retry with backoff, timeout chaining
 
 **Appendix**
 
@@ -12128,6 +12139,993 @@ async function bookSeat(eventId, userId, retries = 3) {
 8. How do you implement graceful shutdown in a production Node.js server?
 9. What's prototype pollution and how do you prevent it?
 10. Design a real-time chat system for 100K concurrent users
+
+---
+
+---
+
+## Phase 10 — Distributed Systems
+
+### 10.1 Distributed Systems Fundamentals
+
+### Concepts
+
+A **distributed system** is a collection of independent computers that appear to the user as a single coherent system. Instead of one powerful server, you have many nodes collaborating over a network. Node.js services in microservices architectures are distributed systems — each service runs on separate machines, communicates via HTTP or message queues, and can fail independently.
+
+**Why is this hard?** In a single process, you call a function and either get a result or an exception. Over a network, you have a third outcome: **no response at all** (the network timed out, the server crashed, or the message was lost). This fundamental uncertainty drives almost every pattern in distributed systems design.
+
+**The Fallacies of Distributed Computing** (Peter Deutsch, 1994) — 8 common wrong assumptions developers make:
+
+1. The network is reliable
+2. Latency is zero
+3. Bandwidth is infinite
+4. The network is secure
+5. Topology doesn't change
+6. There is one administrator
+7. Transport cost is zero
+8. The network is homogeneous
+
+**CAP Theorem** — In the presence of a network **P**artition (split-brain), a distributed system can guarantee at most one of:
+- **C**onsistency — every node returns the same, most recent data
+- **A**vailability — every request gets a response (not an error)
+
+Real systems pick **CP** (e.g., HBase, ZooKeeper, etcd — prefer returning an error over stale data) or **AP** (e.g., Cassandra, DynamoDB, CouchDB — prefer returning possibly-stale data over rejecting the request).
+
+**PACELC** extends CAP: even when there is no partition (normal operation), there's a tradeoff between **L**atency and **C**onsistency. Choosing synchronous replication gives consistency but increases latency; asynchronous replication reduces latency but risks stale reads.
+
+```mermaid
+graph TD
+    subgraph CAP ["CAP Theorem — Pick 2 of 3 (in a partition you only get 1)"]
+        C["Consistency<br/>Every read returns the<br/>latest write or an error"]
+        A["Availability<br/>Every request gets<br/>a response (no error)"]
+        P["Partition Tolerance<br/>System works even when<br/>network splits nodes"]
+    end
+
+    CP["CP Systems<br/>HBase, ZooKeeper, etcd<br/>MongoDB (strong mode)"] --> C
+    CP --> P
+    AP["AP Systems<br/>Cassandra, DynamoDB<br/>CouchDB, Redis (async repl)"] --> A
+    AP --> P
+    CA["CA Systems<br/>Single-node RDBMS<br/>(not truly distributed)"] --> C
+    CA --> A
+
+    style C fill:#42a5f5,color:#fff
+    style A fill:#66bb6a,color:#fff
+    style P fill:#ff7043,color:#fff
+    style CP fill:#e3f2fd,color:#01579b
+    style AP fill:#e8f5e9,color:#1b5e20
+    style CA fill:#fff9c4,color:#f57f17
+```
+
+### Consistency Models (weakest → strongest)
+
+| Model | Description | Example |
+|---|---|---|
+| **Eventual consistency** | All replicas converge given no new writes | DynamoDB default, DNS |
+| **Monotonic reads** | Once you read a value, you never read an older one | Sticky session reads |
+| **Read-your-writes** | After writing, you always read your own write | Session-pinned reads |
+| **Causal consistency** | Causally related ops are seen in order by all | Vector clocks |
+| **Sequential consistency** | All nodes see operations in the same global order | — |
+| **Linearizability (strong)** | Reads/writes appear instantaneous and globally ordered | etcd, Spanner |
+
+### Senior-Level Q&A
+
+**Q1: You have a Node.js service reading from a replicated database. A user writes data, then immediately reads it back and gets the old value. What's happening?**
+
+A: The read is hitting a **read replica** that hasn't received the write yet (replication lag). Solutions:
+- **Read-your-writes consistency:** Route writes and the subsequent reads for the same session to the primary (sticky reads).
+- **Async invalidation:** After a write, cache-bust the replica result in Redis with a short TTL.
+- **Synchronous replication:** Force the write to propagate to at least one replica before acknowledging. Impacts write latency.
+
+```js
+// Read-your-writes: track whether this session has recent writes
+async function getUserProfile(userId, session) {
+    // If this session just wrote, read from primary to avoid replica lag
+    const usePrimary = session.recentWrites?.has(userId);
+    const db = usePrimary ? primaryDb : replicaDb;
+    const user = await db.findById(userId);
+    return user;
+}
+
+async function updateUserProfile(userId, data, session) {
+    await primaryDb.update(userId, data);
+    // Mark this userId as recently written for this session (TTL: 5 seconds)
+    if (!session.recentWrites) session.recentWrites = new Set();
+    session.recentWrites.add(userId);
+    setTimeout(() => session.recentWrites.delete(userId), 5000);
+}
+```
+
+**Q2: Explain the difference between CP and AP systems with a concrete example.**
+
+A: Imagine a bank balance replicated across two data centers. A network partition splits them:
+- **CP (choose consistency):** Both data centers stop accepting writes until the partition heals. No stale reads, but the service is temporarily **unavailable**. Correct for financial systems.
+- **AP (choose availability):** Both data centers keep accepting writes independently. The service stays **up**, but after the partition heals, you may have two conflicting balances that need reconciliation. Acceptable for a shopping cart (merge the two carts), not for a bank account.
+
+> **💡 Interview Tip:** When asked about CAP, always anchor it to a real failure scenario: "In a network partition between DC-east and DC-west, do we reject writes (CP) or accept them and reconcile later (AP)?"
+
+[↑ Back to Index](#table-of-contents)
+
+---
+
+### 10.2 Service Discovery & Load Balancing
+
+### Concepts
+
+In a distributed system, services scale up and down dynamically — containers start and stop, nodes crash and recover. **Service discovery** is how services find each other without hard-coded IPs.
+
+**Two models:**
+
+- **Client-side discovery:** The client queries a service registry (e.g., Consul, Eureka), gets a list of healthy instances, and picks one using a load-balancing algorithm (round-robin, least-connections). The client library handles all this. Pros: no extra hop; Cons: more client complexity, each language needs an SDK.
+
+- **Server-side discovery:** The client talks to a single endpoint (a load balancer or service mesh proxy like Envoy/NGINX). The LB queries the registry and routes to a healthy instance. Pros: clients are simple; Cons: extra network hop, LB can become a bottleneck.
+
+**DNS-based discovery:** Services register with a DNS server. Each service name (`user-service.internal`) resolves to a list of IPs. Simple but slow to propagate updates (TTL-based). Works well with Kubernetes `Services`.
+
+**Health checks:** Service registries require services to report their health periodically. If a heartbeat is missed, the instance is removed from the routing pool. Node.js services expose `/health` or `/ready` endpoints for this.
+
+```mermaid
+sequenceDiagram
+    participant C as Client (Node.js)
+    participant R as Registry (Consul/etcd)
+    participant A as Service A — Instance 1
+    participant B as Service A — Instance 2
+
+    A->>R: Register: {name: "user-svc", ip: "10.0.1.1", port: 3001}
+    B->>R: Register: {name: "user-svc", ip: "10.0.1.2", port: 3001}
+    A->>R: Heartbeat every 10s (healthy ✓)
+    B->>R: Heartbeat every 10s (healthy ✓)
+
+    C->>R: Discover: "user-svc" — which instances are healthy?
+    R-->>C: [10.0.1.1:3001, 10.0.1.2:3001]
+    C->>A: Request → round-robin picks Instance 1
+    A-->>C: Response
+
+    Note over B,R: Instance 2 crashes — misses 3 heartbeats
+    R->>R: Remove 10.0.1.2 from healthy pool
+    C->>R: Discover: "user-svc"
+    R-->>C: [10.0.1.1:3001]  ← Instance 2 excluded
+```
+
+### Key Implementation: Health Check Endpoint
+
+```js
+const http = require('http');
+
+// Readiness vs Liveness — two different checks:
+// Liveness  (/health/live)  → Is the process alive? (if not, restart it)
+// Readiness (/health/ready) → Is the service ready to accept traffic? (if not, remove from LB pool)
+
+let isReady = false; // Set to true after DB connections and cache warm-up complete
+
+async function startServer() {
+    // Warm-up phase: establish connections before accepting traffic
+    await db.connect();
+    await redisClient.connect();
+    isReady = true; // Only now are we ready to serve requests
+
+    const server = http.createServer((req, res) => {
+        if (req.url === '/health/live') {
+            // Liveness: process is alive if it can respond at all
+            res.writeHead(200);
+            res.end(JSON.stringify({ status: 'alive' }));
+            return;
+        }
+
+        if (req.url === '/health/ready') {
+            // Readiness: only return 200 if fully initialised
+            const status = isReady ? 200 : 503;
+            res.writeHead(status);
+            res.end(JSON.stringify({
+                status: isReady ? 'ready' : 'starting',
+                uptime: process.uptime(),
+                memory: process.memoryUsage().heapUsed,
+            }));
+            return;
+        }
+
+        // Normal request handling
+        handleRequest(req, res);
+    });
+
+    server.listen(3000);
+}
+```
+
+### Load Balancing Algorithms
+
+| Algorithm | How it works | Best for |
+|---|---|---|
+| **Round-robin** | Rotate through instances in order | Homogeneous instances, uniform request cost |
+| **Weighted round-robin** | Rotate with bias toward higher-capacity nodes | Heterogeneous hardware |
+| **Least connections** | Route to instance with fewest active connections | Long-lived connections (WebSocket, gRPC) |
+| **IP hash** | Hash client IP → always same backend | Stateful sessions without shared store |
+| **Consistent hashing** | Hash request key → minimal reshuffling on scale | Cache routing, stateful sharding |
+
+> **💡 Interview Tip:** "IP hash breaks fairness if clients are behind a corporate NAT — all traffic funnels to one instance. Prefer a shared session store (Redis) with round-robin instead."
+
+[↑ Back to Index](#table-of-contents)
+
+---
+
+### 10.3 Distributed Consensus & Coordination
+
+### Concepts
+
+**Consensus** is the problem of getting multiple nodes in a distributed system to agree on a single value — even if some nodes crash or messages are delayed. This sounds simple but is provably hard: the **FLP impossibility theorem** proves that no deterministic consensus algorithm can guarantee progress in an asynchronous system if even one process can crash.
+
+Practical systems work around FLP with **timeouts and leader election**. The most widely-used algorithm today is **Raft** (used in etcd, Consul, CockroachDB).
+
+**Raft in three sentences:** Every node is a Follower, Candidate, or Leader. A Leader is elected by majority vote; only the Leader accepts writes. If followers don't hear from the Leader within a random timeout, they start a new election. Writes are committed only after a majority of nodes have replicated the entry — so a network partition can't cause split-brain writes.
+
+**Distributed locks** are built on top of consensus. Redis's `SET key value NX PX 30000` (set if not exists, expire in 30s) is a single-node distributed lock. For multi-node safety, use **Redlock** (acquire a lock on N/2+1 Redis nodes) or etcd leases.
+
+```js
+// ── Distributed lock with Redis (single-node, production-grade for most use cases) ──
+const redis = require('ioredis');
+const client = new redis();
+const crypto = require('crypto');
+
+async function withDistributedLock(lockKey, ttlMs, fn) {
+    // Generate a unique token so only THIS process can release its own lock
+    // Without a unique token, Process A could accidentally release Process B's lock
+    const token = crypto.randomBytes(16).toString('hex');
+
+    // SET key token NX PX ttlMs
+    // NX = only set if key does NOT exist (atomic acquire)
+    // PX = expire in ttlMs milliseconds (auto-release if process crashes)
+    const acquired = await client.set(lockKey, token, 'NX', 'PX', ttlMs);
+
+    if (!acquired) {
+        throw new Error(`Could not acquire lock: ${lockKey}`);
+    }
+
+    try {
+        return await fn(); // Execute the critical section
+    } finally {
+        // Release lock ONLY if the token matches — prevents releasing another process's lock
+        // This Lua script runs atomically on the Redis server (no race between GET and DEL)
+        const releaseScript = `
+            if redis.call("GET", KEYS[1]) == ARGV[1] then
+                return redis.call("DEL", KEYS[1])
+            else
+                return 0
+            end
+        `;
+        await client.eval(releaseScript, 1, lockKey, token);
+    }
+}
+
+// Usage: Prevent double-processing an order
+async function processOrder(orderId) {
+    await withDistributedLock(`order:lock:${orderId}`, 30000, async () => {
+        const order = await db.findOrder(orderId);
+        if (order.status === 'processed') return; // Idempotency check inside the lock
+        await chargeCard(order);
+        await db.updateOrder(orderId, { status: 'processed' });
+    });
+}
+```
+
+### Leader Election Pattern
+
+```js
+// Simplified leader election using Redis (real systems use etcd or ZooKeeper)
+class LeaderElection {
+    constructor(serviceId, redisClient) {
+        this.serviceId = serviceId;
+        this.redis = redisClient;
+        this.isLeader = false;
+        this.leaderKey = 'service:leader';
+        this.ttl = 10000; // 10 second lease
+    }
+
+    async start() {
+        await this.tryElect();
+        // Try to renew/acquire leadership every 4 seconds (well within the 10s TTL)
+        this.interval = setInterval(() => this.tryElect(), 4000);
+    }
+
+    async tryElect() {
+        const acquired = await this.redis.set(
+            this.leaderKey, this.serviceId, 'NX', 'PX', this.ttl
+        );
+
+        if (acquired) {
+            if (!this.isLeader) {
+                this.isLeader = true;
+                this.onBecomeLeader();
+            } else {
+                // Renew the lease to stay leader
+                await this.redis.pexpire(this.leaderKey, this.ttl);
+            }
+        } else {
+            if (this.isLeader) {
+                this.isLeader = false;
+                this.onLoseLeadership();
+            }
+        }
+    }
+
+    onBecomeLeader() {
+        console.log(`[${this.serviceId}] Became leader — starting scheduled jobs`);
+        // Only the leader runs cron jobs, sends daily digests, processes scheduled tasks
+    }
+
+    onLoseLeadership() {
+        console.log(`[${this.serviceId}] Lost leadership — stopping scheduled jobs`);
+    }
+
+    stop() {
+        clearInterval(this.interval);
+    }
+}
+```
+
+### Senior-Level Q&A
+
+**Q: What is split-brain and how do you prevent it?**
+
+A: **Split-brain** happens when a network partition causes two groups of nodes to each elect their own leader, resulting in two "brains" accepting writes independently. When the partition heals, you have conflicting state.
+
+Prevention strategies:
+- **Quorum writes:** Only accept writes when a majority (N/2+1) of nodes confirm — a minority partition can never form a quorum, so writes are rejected rather than diverging.
+- **Fencing tokens:** The leader includes a monotonically-increasing token in every write. Storage systems reject writes with an old token, even if a deposed leader tries to write after its lease expires.
+- **STONITH (Shoot The Other Node In The Head):** Forcibly power-cycle the node that lost the election before the new leader starts accepting writes. Used in high-availability database clusters.
+
+> **💡 Interview Tip:** "Redlock is controversial — Martin Kleppmann's analysis shows it's not safe under process pauses (GC, VM suspension). For critical locks, use etcd leases with fencing tokens."
+
+[↑ Back to Index](#table-of-contents)
+
+---
+
+### 10.4 Event-Driven Architecture & CQRS
+
+### Concepts
+
+**Event-Driven Architecture (EDA)** decouples services by having them communicate through **events** rather than direct calls. Instead of Service A calling Service B's API and waiting, A publishes an event (`OrderPlaced`) to a message bus. B, C, and D can all react to that event independently, without A knowing they exist.
+
+**Benefits:** Independent scaling, loose coupling, natural audit trail, easy to add new consumers without changing producers.
+
+**Tradeoffs:** Eventual consistency, harder to debug (no synchronous call stack), duplicate event delivery, ordering guarantees vary by broker.
+
+**CQRS (Command Query Responsibility Segregation):** Separate the model you use for writing (**Commands** — mutate state) from the model you use for reading (**Queries** — project state). Commands go through business logic and emit events. Queries read from a denormalised read model optimised for your UI.
+
+**Event Sourcing:** Instead of storing current state, store the **sequence of events** that led to it. The current state is derived by replaying events. Enables time-travel debugging, audit logs by default, and easy projection rebuilds.
+
+```mermaid
+graph LR
+    subgraph Write Side
+        CMD["Command<br/>PlaceOrder"] --> CH["Command Handler<br/>(validates, enforces rules)"]
+        CH --> ES["Event Store<br/>(append-only log)"]
+        ES --> EB["Event Bus<br/>(Kafka / RabbitMQ)"]
+    end
+
+    subgraph Read Side
+        EB --> P1["Projector: Orders View<br/>(denormalised SQL table)"]
+        EB --> P2["Projector: Analytics<br/>(time-series DB)"]
+        EB --> P3["Projector: Notifications<br/>(email queue)"]
+        P1 --> Q["Query Handler"]
+        Q --> UI["Client / UI"]
+    end
+
+    style CMD fill:#42a5f5,color:#fff
+    style ES fill:#ff7043,color:#fff
+    style EB fill:#ffee58,color:#000
+    style Q fill:#66bb6a,color:#fff
+```
+
+### Outbox Pattern — Guaranteed Event Delivery
+
+The hardest problem in EDA: how do you atomically update your database **and** publish an event, without a distributed transaction?
+
+**Wrong approach:** Update DB, then publish to Kafka. If the process crashes between the two, the DB is updated but the event is never sent → silent data inconsistency.
+
+**Outbox pattern:** Write the event to an `outbox` table **in the same DB transaction** as your domain update. A separate relay process (or Change Data Capture via Debezium) reads from the outbox and publishes to Kafka. If the relay crashes, it re-reads and retries — events are published **at least once** (consumers must be idempotent).
+
+```js
+// Atomic: update order AND write outbox event in ONE database transaction
+async function placeOrder(orderData) {
+    await db.transaction(async (trx) => {
+        // 1. Write domain state
+        const order = await trx('orders').insert({
+            id: orderData.id,
+            userId: orderData.userId,
+            total: orderData.total,
+            status: 'pending',
+        }).returning('*');
+
+        // 2. Write outbox entry in the SAME transaction
+        // If the transaction rolls back, both writes are rolled back atomically
+        await trx('outbox').insert({
+            id: crypto.randomUUID(),
+            aggregateId: order[0].id,
+            eventType: 'OrderPlaced',
+            payload: JSON.stringify(order[0]),
+            createdAt: new Date(),
+            published: false,
+        });
+    });
+    // No Kafka call here — the relay process handles publishing
+}
+
+// Outbox relay: runs as a separate process / interval
+async function relayOutboxEvents() {
+    const events = await db('outbox')
+        .where({ published: false })
+        .orderBy('createdAt', 'asc')
+        .limit(100);
+
+    for (const event of events) {
+        await kafka.produce(event.eventType, event.payload);
+        await db('outbox').where({ id: event.id }).update({ published: true });
+    }
+}
+```
+
+### Saga Pattern — Distributed Long-Running Transactions
+
+When a business operation spans multiple services (e.g., "place order" involves inventory, payment, and shipping services), you can't use a database transaction. The **Saga pattern** breaks it into a sequence of local transactions, each publishing an event that triggers the next step. If any step fails, **compensating transactions** undo the previous steps.
+
+```
+PlaceOrder Saga:
+  1. ReserveInventory   → success → emit InventoryReserved
+  2. ChargePayment      → success → emit PaymentCharged
+  3. CreateShipment     → SUCCESS → emit ShipmentCreated
+                        → FAIL    → emit ShipmentFailed
+                                       → compensate: RefundPayment
+                                       → compensate: ReleaseInventory
+```
+
+| Choreography | Orchestration |
+|---|---|
+| Services react to events directly | A central Saga orchestrator drives the steps |
+| Decoupled, no single point of failure | Easier to visualise and debug the flow |
+| Hard to track overall saga state | Orchestrator can become a bottleneck |
+| Best for simple linear flows | Best for complex branching logic |
+
+> **💡 Interview Tip:** "Sagas give you ACD without the I of ACID — Atomicity (via compensations), Consistency, Durability, but NOT Isolation. Other sagas can observe intermediate state. Design UIs to show 'processing' states."
+
+[↑ Back to Index](#table-of-contents)
+
+---
+
+### 10.5 Distributed Transactions & Data Consistency
+
+### Concepts
+
+**Two-Phase Commit (2PC)** is the classical protocol for distributed transactions:
+- **Phase 1 (Prepare):** Coordinator asks all participants "can you commit?" Each locks resources and votes Yes/No.
+- **Phase 2 (Commit/Abort):** If all voted Yes, coordinator sends Commit; otherwise sends Abort.
+
+**Problems with 2PC:** If the coordinator crashes after Phase 1 but before Phase 2, participants hold locks indefinitely (blocking). 2PC is synchronous — all participants must be available simultaneously. Not suitable for high-throughput microservices.
+
+**Idempotency** is the foundation of safe retries. An operation is idempotent if calling it multiple times has the same effect as calling it once. `GET /users/1` is idempotent; `POST /orders` is not by default. Make it idempotent by accepting an `Idempotency-Key` header and storing results by key.
+
+```js
+// Idempotent API handler with Redis-backed deduplication
+async function createOrderHandler(req, res) {
+    const idempotencyKey = req.headers['idempotency-key'];
+
+    if (!idempotencyKey) {
+        return res.status(400).json({ error: 'Idempotency-Key header required' });
+    }
+
+    const cacheKey = `idempotency:${idempotencyKey}`;
+
+    // Check if we've already processed this exact request
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+        // Return the exact same response as the first call
+        return res.status(200).json(JSON.parse(cached));
+    }
+
+    try {
+        const order = await orderService.create(req.body);
+        const response = { orderId: order.id, status: 'created' };
+
+        // Cache the response for 24 hours (clients can safely retry within this window)
+        await redis.setex(cacheKey, 86400, JSON.stringify(response));
+
+        return res.status(201).json(response);
+    } catch (err) {
+        // Do NOT cache errors — allow the client to retry with the same key
+        throw err;
+    }
+}
+```
+
+### Optimistic vs Pessimistic Concurrency
+
+| Strategy | Mechanism | Best for |
+|---|---|---|
+| **Pessimistic** | Lock the row before reading (`SELECT FOR UPDATE`) | High contention, critical sections |
+| **Optimistic** | Add a `version` column; reject if version changed at write time | Low contention, read-heavy workloads |
+| **MVCC** | Database keeps multiple versions; readers never block writers | PostgreSQL, MySQL InnoDB default |
+
+```js
+// Optimistic locking with version field — prevents lost updates
+async function transferFunds(fromId, toId, amount) {
+    const maxRetries = 3;
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        const account = await db.query(
+            'SELECT id, balance, version FROM accounts WHERE id = $1',
+            [fromId]
+        );
+
+        if (account.balance < amount) throw new Error('Insufficient funds');
+
+        // Update ONLY if the version hasn't changed since we read it
+        // If another process updated the account concurrently, version changed → rowsUpdated = 0
+        const result = await db.query(
+            `UPDATE accounts SET balance = balance - $1, version = version + 1
+             WHERE id = $2 AND version = $3`,
+            [amount, fromId, account.version]
+        );
+
+        if (result.rowCount === 1) {
+            // Our update succeeded — no concurrent modification
+            await db.query(
+                'UPDATE accounts SET balance = balance + $1 WHERE id = $2',
+                [amount, toId]
+            );
+            return; // Success
+        }
+        // rowCount = 0 → concurrent update detected → retry
+        await new Promise(r => setTimeout(r, Math.random() * 100)); // jitter before retry
+    }
+    throw new Error('Transaction failed after max retries — too much contention');
+}
+```
+
+> **📝 Quick Revision — Consistency Patterns:**
+>
+> | Pattern | Guarantee | Cost |
+> | --- | --- | --- |
+> | 2PC | ACID across services | Blocking, coordinator SPOF |
+> | Saga | ACD (no Isolation) | Compensating logic complexity |
+> | Outbox | At-least-once delivery | Consumers must be idempotent |
+> | Optimistic locking | No lost updates | Retry overhead on contention |
+
+[↑ Back to Index](#table-of-contents)
+
+---
+
+### 10.6 Distributed Caching & Data Partitioning
+
+### Concepts
+
+When a single cache node can't hold all data or handle all traffic, you need to distribute data across multiple nodes. The core challenge is **routing**: given a key, which node owns it?
+
+**Naive modulo hashing:** `node = hash(key) % N`. Simple, but when N changes (a node is added or removed), almost every key remaps to a different node — mass cache misses.
+
+**Consistent hashing** solves this: imagine all nodes arranged on a circle (hash ring). A key is assigned to the first node clockwise from its hash position on the ring. When a node is added or removed, only the keys between it and its predecessor/successor remaps — typically `1/N` of total keys.
+
+**Virtual nodes (vnodes):** Each physical node owns multiple positions on the ring. This improves load balancing (no hot spots) and makes weight adjustment easy. Redis Cluster uses 16,384 hash slots distributed across nodes.
+
+```mermaid
+graph TB
+    subgraph Ring ["Consistent Hash Ring — 3 Nodes, 6 Virtual Nodes"]
+        N1A["Node A (vnode 1)"] -->|"clockwise"| N2A["Node B (vnode 1)"]
+        N2A --> N3A["Node C (vnode 1)"]
+        N3A --> N1B["Node A (vnode 2)"]
+        N1B --> N2B["Node B (vnode 2)"]
+        N2B --> N3B["Node C (vnode 2)"]
+        N3B --> N1A
+    end
+
+    K1["key: 'user:42'<br/>hash → lands here"] -.->|"assigned to next clockwise node"| N2A
+    K2["key: 'session:xyz'<br/>hash → lands here"] -.-> N3A
+
+    Note["Adding Node D: only keys between<br/>D and its predecessor remaps.<br/>~25% of keys move (not 100%)"]
+
+    style N1A fill:#42a5f5,color:#fff
+    style N2A fill:#66bb6a,color:#fff
+    style N3A fill:#ff7043,color:#fff
+```
+
+### Redis Cluster — Sharding in Practice
+
+```js
+const { Cluster } = require('ioredis');
+
+// Redis Cluster: 16,384 hash slots distributed across N master nodes
+// Key routing is automatic — the client library handles it
+const cluster = new Cluster([
+    { host: '127.0.0.1', port: 7000 },
+    { host: '127.0.0.1', port: 7001 },
+    { host: '127.0.0.1', port: 7002 },
+], {
+    scaleReads: 'slave', // Read from replicas to distribute read load
+    redisOptions: { password: process.env.REDIS_PASSWORD },
+    clusterRetryStrategy: (times) => Math.min(times * 100, 3000), // Exponential backoff
+});
+
+// Hash tags: {userId} forces related keys to the same slot (same node)
+// Needed when you use MGET or transactions across multiple keys
+async function getUserData(userId) {
+    const pipeline = cluster.pipeline();
+    // All three keys share the {userId} hash tag → guaranteed same slot → same node
+    pipeline.get(`{${userId}}:profile`);
+    pipeline.get(`{${userId}}:preferences`);
+    pipeline.get(`{${userId}}:permissions`);
+    const results = await pipeline.exec();
+    return results.map(([err, val]) => val ? JSON.parse(val) : null);
+}
+```
+
+### Cache Stampede (Thundering Herd) Prevention
+
+```js
+// Problem: Key expires → 1000 concurrent requests all miss → all hit DB simultaneously
+// Solution: Probabilistic early expiration + lock-based recompute
+
+const CACHE_TTL = 3600; // 1 hour
+
+async function getWithStampedeProtection(key, fetchFn) {
+    const cached = await redis.get(key);
+
+    if (cached) {
+        const { value, expiresAt } = JSON.parse(cached);
+        const remaining = expiresAt - Date.now();
+
+        // Probabilistic early recompute: as expiry approaches, randomly recompute early
+        // Probability increases as TTL decreases — prevents the cliff-edge miss
+        const recomputeProbability = 1 - (remaining / (CACHE_TTL * 1000));
+        if (Math.random() > recomputeProbability) {
+            return value; // Serve from cache
+        }
+        // Fall through to recompute (only ~1 request at a time does this)
+    }
+
+    // Distributed lock: only one process recomputes, others wait
+    const lockKey = `lock:${key}`;
+    const lockToken = crypto.randomBytes(8).toString('hex');
+    const lockAcquired = await redis.set(lockKey, lockToken, 'NX', 'PX', 5000);
+
+    if (!lockAcquired) {
+        // Another process is recomputing — wait and retry from cache
+        await new Promise(r => setTimeout(r, 100));
+        return getWithStampedeProtection(key, fetchFn);
+    }
+
+    try {
+        const fresh = await fetchFn();
+        await redis.setex(key, CACHE_TTL, JSON.stringify({
+            value: fresh,
+            expiresAt: Date.now() + CACHE_TTL * 1000,
+        }));
+        return fresh;
+    } finally {
+        // Release lock (only if we still own it)
+        const script = `if redis.call("GET",KEYS[1])==ARGV[1] then return redis.call("DEL",KEYS[1]) else return 0 end`;
+        await redis.eval(script, 1, lockKey, lockToken);
+    }
+}
+```
+
+> **💡 Interview Tip:** "Cache-aside vs write-through: cache-aside is lazy (populate on miss) and tolerates stale reads. Write-through populates on every write — great consistency but doubles write latency. Use write-through for reference data, cache-aside for user-specific data."
+
+[↑ Back to Index](#table-of-contents)
+
+---
+
+### 10.7 Observability in Distributed Systems
+
+### Concepts
+
+In a monolith, a stack trace tells you exactly what happened. In a distributed system, a single user request may touch 10 services. A stack trace from one service is meaningless in isolation. You need **distributed tracing** — the ability to follow a request across service boundaries.
+
+**The three pillars of observability:**
+
+1. **Logs** — discrete events with timestamps (what happened)
+2. **Metrics** — numeric time-series aggregations (how many / how fast / how often)
+3. **Traces** — end-to-end request journeys across services (why it was slow / where it failed)
+
+**OpenTelemetry** is the industry standard for instrumenting distributed systems. It provides vendor-neutral SDKs that emit traces, metrics, and logs to any backend (Jaeger, Zipkin, Datadog, Honeycomb).
+
+**Key concepts:**
+
+- **Trace:** A single end-to-end request journey. Contains a tree of spans.
+- **Span:** A single operation within a trace (e.g., one DB query, one HTTP call). Has a start time, duration, service name, and optional attributes.
+- **Trace context propagation:** The `traceparent` HTTP header carries the trace ID and span ID across service calls. Every downstream service reads it and creates a child span.
+- **Baggage:** Key-value pairs propagated across service boundaries alongside trace context (e.g., `userId`, `tenantId`).
+
+```js
+const { NodeSDK } = require('@opentelemetry/sdk-node');
+const { getNodeAutoInstrumentations } = require('@opentelemetry/auto-instrumentations-node');
+const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-http');
+const { Resource } = require('@opentelemetry/resources');
+const { SemanticResourceAttributes } = require('@opentelemetry/semantic-conventions');
+
+// Initialize OpenTelemetry — must happen BEFORE requiring http, express, pg, etc.
+const sdk = new NodeSDK({
+    resource: new Resource({
+        [SemanticResourceAttributes.SERVICE_NAME]: 'order-service',
+        [SemanticResourceAttributes.SERVICE_VERSION]: '1.0.0',
+    }),
+    traceExporter: new OTLPTraceExporter({
+        url: 'http://otel-collector:4318/v1/traces',
+    }),
+    // Auto-instruments: HTTP, Express, pg, Redis, gRPC, MongoDB, etc.
+    instrumentations: [getNodeAutoInstrumentations()],
+});
+sdk.start();
+
+// Manual span for custom business operations
+const { trace, context, propagation } = require('@opentelemetry/api');
+const tracer = trace.getTracer('order-service');
+
+async function processOrder(orderId) {
+    // Create a custom span for this business operation
+    return tracer.startActiveSpan('processOrder', async (span) => {
+        span.setAttributes({
+            'order.id': orderId,
+            'order.source': 'api',
+        });
+
+        try {
+            const order = await db.findOrder(orderId); // auto-instrumented DB span created
+            await paymentService.charge(order);        // auto-instrumented HTTP span created
+            span.setStatus({ code: SpanStatusCode.OK });
+            return order;
+        } catch (err) {
+            span.recordException(err);
+            span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+            throw err;
+        } finally {
+            span.end(); // Always end spans — unclosed spans leak memory
+        }
+    });
+}
+```
+
+### Correlation ID Pattern with AsyncLocalStorage
+
+```js
+const { AsyncLocalStorage } = require('async_hooks');
+const crypto = require('crypto');
+
+// AsyncLocalStorage provides request-scoped storage that propagates through async calls
+// No need to thread a 'requestId' parameter through every function
+const requestContext = new AsyncLocalStorage();
+
+// Middleware: extract or generate correlation ID, store in async context
+function correlationMiddleware(req, res, next) {
+    const correlationId = req.headers['x-correlation-id'] || crypto.randomUUID();
+    const traceId = req.headers['x-trace-id'] || crypto.randomUUID();
+
+    // Every async operation spawned from this request automatically inherits this store
+    requestContext.run({ correlationId, traceId, startTime: Date.now() }, () => {
+        res.setHeader('x-correlation-id', correlationId);
+        next();
+    });
+}
+
+// Logger automatically picks up the current request context — no parameter passing needed
+const logger = {
+    info: (msg, data = {}) => {
+        const ctx = requestContext.getStore() ?? {};
+        console.log(JSON.stringify({
+            level: 'info', msg,
+            correlationId: ctx.correlationId,
+            traceId: ctx.traceId,
+            ...data,
+            timestamp: new Date().toISOString(),
+        }));
+    },
+};
+
+// Deep in the call stack — no 'req' object needed to get the correlation ID
+async function chargePayment(amount) {
+    logger.info('Charging payment', { amount }); // Automatically includes correlationId
+    // ... payment logic
+}
+```
+
+> **📝 Quick Revision — Observability:**
+>
+> | Signal | What it answers | Tool |
+> | --- | --- | --- |
+> | Logs | What happened in this service? | Winston, Pino, CloudWatch |
+> | Metrics | How is the system behaving over time? | Prometheus, Datadog |
+> | Traces | Why was this request slow / where did it fail? | Jaeger, Zipkin, Honeycomb |
+
+[↑ Back to Index](#table-of-contents)
+
+---
+
+### 10.8 Resilience Patterns
+
+### Concepts
+
+Distributed systems fail partially — one service degrades while others continue. **Resilience patterns** prevent cascading failures from bringing the entire system down.
+
+**Cascading failure example:** Service A calls Service B (with a 5-second timeout). Service B is slow. 1000 requests/second hit A. Each request holds a thread for 5 seconds → 5000 threads blocked waiting for B → A runs out of threads → A starts timing out too → Service C (which calls A) also starts failing. One slow service has killed the entire system.
+
+**Four core resilience patterns:**
+
+1. **Circuit Breaker** — Stop calling a failing service and return a fast fallback. (Covered in Scenario 5.)
+2. **Bulkhead** — Isolate failures. Use separate thread pools / connection pools per downstream service so one slow service can't exhaust shared resources.
+3. **Retry with exponential backoff + jitter** — Retry transient failures, but back off exponentially to avoid thundering-herd retries amplifying load on an already struggling service.
+4. **Timeout chaining** — Each service call has a deadline. Pass a shortened deadline downstream so the entire call chain completes before the user-facing timeout.
+
+```js
+// ── Retry with exponential backoff and jitter ─────────────────────────────────
+async function withRetry(fn, options = {}) {
+    const {
+        maxAttempts = 3,
+        baseDelayMs = 100,
+        maxDelayMs = 10000,
+        retryableErrors = ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED'],
+    } = options;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            return await fn();
+        } catch (err) {
+            const isRetryable = retryableErrors.includes(err.code) || err.status >= 500;
+            const isLastAttempt = attempt === maxAttempts;
+
+            if (!isRetryable || isLastAttempt) throw err;
+
+            // Exponential backoff: 100ms, 200ms, 400ms... capped at maxDelayMs
+            const exponential = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
+            // Jitter: randomise ±50% to prevent all retries hitting at the same time
+            const jitter = exponential * (0.5 + Math.random() * 0.5);
+
+            console.warn(`Attempt ${attempt} failed (${err.message}). Retrying in ${Math.round(jitter)}ms`);
+            await new Promise(r => setTimeout(r, jitter));
+        }
+    }
+}
+
+// ── Bulkhead: separate connection pools per service ───────────────────────────
+// Without bulkhead: one slow service exhausts the single shared HTTP agent
+// With bulkhead: each downstream service has its own connection pool limit
+const http = require('http');
+
+const paymentServiceAgent = new http.Agent({ maxSockets: 10 }); // max 10 concurrent connections to payment
+const inventoryServiceAgent = new http.Agent({ maxSockets: 20 }); // separate pool for inventory
+
+async function callPaymentService(data) {
+    // Even if inventory is slow and its 20 connections are all busy,
+    // payment service still has its own 10 connections available
+    return fetch('http://payment-service/charge', {
+        method: 'POST',
+        body: JSON.stringify(data),
+        agent: paymentServiceAgent, // Isolated pool
+    });
+}
+
+// ── Timeout chaining with AbortController ─────────────────────────────────────
+async function handleRequest(req, res) {
+    // User-facing SLA: respond within 3 seconds
+    const userDeadline = Date.now() + 3000;
+
+    // Leave 500ms buffer for our own processing, give downstream 2.5s
+    const downstreamTimeout = userDeadline - Date.now() - 500;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), downstreamTimeout);
+
+    try {
+        const result = await fetch('http://downstream-service/data', {
+            signal: controller.signal, // Downstream call cancelled if it takes too long
+        });
+        res.json(await result.json());
+    } catch (err) {
+        if (err.name === 'AbortError') {
+            res.status(504).json({ error: 'Upstream timeout' });
+        } else {
+            throw err;
+        }
+    } finally {
+        clearTimeout(timer);
+    }
+}
+```
+
+### Full Circuit Breaker Implementation
+
+```js
+// States: CLOSED (normal) → OPEN (blocking calls) → HALF-OPEN (testing recovery)
+class CircuitBreaker {
+    constructor(fn, options = {}) {
+        this.fn = fn;
+        this.failureThreshold = options.failureThreshold ?? 5;  // Open after 5 failures
+        this.successThreshold = options.successThreshold ?? 2;  // Close after 2 successes
+        this.timeout = options.timeout ?? 60000;                 // Stay open for 60s
+        this.state = 'CLOSED';
+        this.failureCount = 0;
+        this.successCount = 0;
+        this.nextAttempt = Date.now();
+    }
+
+    async call(...args) {
+        if (this.state === 'OPEN') {
+            if (Date.now() < this.nextAttempt) {
+                throw new Error('Circuit breaker is OPEN — request rejected (fast fail)');
+            }
+            // Timeout elapsed — try one request to probe recovery
+            this.state = 'HALF-OPEN';
+        }
+
+        try {
+            const result = await this.fn(...args);
+            this.onSuccess();
+            return result;
+        } catch (err) {
+            this.onFailure();
+            throw err;
+        }
+    }
+
+    onSuccess() {
+        this.failureCount = 0;
+        if (this.state === 'HALF-OPEN') {
+            this.successCount++;
+            if (this.successCount >= this.successThreshold) {
+                this.state = 'CLOSED'; // Downstream recovered — resume normal traffic
+                this.successCount = 0;
+                console.log('Circuit CLOSED — service recovered');
+            }
+        }
+    }
+
+    onFailure() {
+        this.failureCount++;
+        this.successCount = 0;
+        if (this.failureCount >= this.failureThreshold || this.state === 'HALF-OPEN') {
+            this.state = 'OPEN';
+            this.nextAttempt = Date.now() + this.timeout;
+            console.warn(`Circuit OPEN — blocking calls for ${this.timeout}ms`);
+        }
+    }
+}
+
+// Usage
+const paymentBreaker = new CircuitBreaker(callPaymentService, {
+    failureThreshold: 3,
+    timeout: 30000,
+});
+
+async function processPayment(data) {
+    try {
+        return await paymentBreaker.call(data);
+    } catch (err) {
+        if (err.message.includes('OPEN')) {
+            // Return a cached result or a graceful degraded response
+            return { status: 'queued', message: 'Payment will be processed shortly' };
+        }
+        throw err;
+    }
+}
+```
+
+### Senior-Level Q&A
+
+**Q: How do you design a distributed system to survive the failure of one of its services?**
+
+A structured answer (use this framework in interviews):
+
+1. **Fail fast:** Set aggressive timeouts. Never let a slow service hold your threads.
+2. **Circuit breakers:** Detect repeated failures and stop hammering a struggling service. Return cached/default data.
+3. **Bulkheads:** Isolate downstream dependencies into separate thread/connection pools. One failed service can't exhaust shared resources.
+4. **Retry with jitter:** Retry transient failures, but back off with randomised delays to avoid synchronized retry storms.
+5. **Graceful degradation:** Design fallbacks. If the recommendation service is down, show popular items. If payment is unavailable, queue the order.
+6. **Idempotent operations:** Make retries safe. Accept `Idempotency-Key` headers. Use the outbox pattern for event publishing.
+7. **Health checks + automatic removal:** Remove unhealthy instances from the LB pool immediately. Use liveness vs readiness distinction.
+8. **Chaos engineering:** Deliberately inject failures (Netflix Chaos Monkey) to validate that resilience patterns actually work in production.
+
+> **💡 Interview Tip — Distributed Systems One-Liners:**
+>
+> - _"CAP theorem?"_ → In a network partition, choose C (consistency, reject requests) or A (availability, serve possibly stale data). You can't have both.
+> - _"How do you avoid distributed transaction problems?"_ → Saga pattern (compensating transactions) + outbox pattern (at-least-once delivery) + idempotent consumers.
+> - _"What's split-brain?"_ → Two nodes both think they're the leader. Prevent with quorum writes (N/2+1 majority required).
+> - _"Thundering herd?"_ → Key expires → all requests hit DB simultaneously. Fix with probabilistic early expiry + lock-based recompute.
+> - _"Why not 2PC in microservices?"_ → Blocking protocol, coordinator SPOF, not fault-tolerant under network partitions. Use sagas instead.
+
+[↑ Back to Index](#table-of-contents)
 
 ---
 
