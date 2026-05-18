@@ -8,6 +8,7 @@ This document expands the workspace summary into practical, in-depth notes for e
 
 **Phase 1 — Node.js Fundamentals & Internals**
 
+- 1.0 [Why V8? Node.js Engine & Architecture](#10-why-v8-nodejs-engine--architecture) — engine choice, JIT compilation, JS engines comparison, interview Q&A
 - 1.1 [Module System](#11-module-system) — CommonJS vs ESM, require resolution, circular deps
 - 1.2 [Event Loop](#12-event-loop) — phases, timers, microtasks, senior Q&A
 - 1.3 [libuv Thread Pool](#13-libuv-thread-pool) — UV_THREADPOOL_SIZE, which APIs use it, tuning
@@ -98,6 +99,169 @@ This document expands the workspace summary into practical, in-depth notes for e
 ---
 
 ## Phase 1 — Node.js Fundamentals & Internals
+
+### 1.0 Why V8? Node.js Engine & Architecture
+
+### Concepts
+
+When people hear "V8" in the context of Node.js, they sometimes wonder — is this a version number? Is there a V6 or V7? **No.** V8 is the name of **Google's JavaScript engine** — the same engine that powers the Chrome browser. It has nothing to do with version numbers. The name comes from its origins as a high-performance engine, not a version sequence.
+
+**What is a JavaScript engine?** A JS engine is a program that reads JavaScript source code and executes it. Every runtime that runs JavaScript — browsers, Node.js, Deno, server-side runtimes — has a JS engine at its core. The engine is responsible for:
+
+1. **Parsing** — reading your `.js` source text and building an Abstract Syntax Tree (AST)
+2. **Compiling** — converting the AST to machine code (via JIT compilation)
+3. **Executing** — running the machine code on the CPU
+4. **Garbage collecting** — automatically freeing memory that is no longer reachable
+
+**Other JavaScript engines (not V8):**
+
+| Engine | Maintained by | Used in |
+|---|---|---|
+| **V8** | Google | Chrome, Node.js, Deno, Edge (Chromium) |
+| **SpiderMonkey** | Mozilla | Firefox |
+| **JavaScriptCore (Nitro)** | Apple | Safari, WebKit, Bun |
+| **Hermes** | Meta (Facebook) | React Native (mobile) |
+| **Chakra** | Microsoft | Old Edge (pre-Chromium), discontinued |
+
+**Why did Node.js choose V8 specifically?**
+
+Ryan Dahl created Node.js in **2009**. At that time he evaluated all available JS engines and chose V8 for four concrete reasons:
+
+1. **Raw performance** — In 2008, Google released V8 alongside Chrome. It was dramatically faster than SpiderMonkey and JavaScriptCore because it introduced **JIT (Just-In-Time) compilation** — compiling JavaScript directly to native machine code instead of interpreting it line by line. Benchmarks showed it running JavaScript 10–100× faster than the then-current alternatives.
+2. **Open source & embeddable** — V8 is written in C++ and released under the BSD licence. This allowed Ryan Dahl to embed it into his own runtime (Node.js) and call into it from C++. SpiderMonkey was LGPL at the time and harder to embed cleanly.
+3. **Designed for standalone use** — V8 was explicitly designed to be used outside a browser. It has a clean C++ API that lets the embedder (Node.js) register custom built-in functions — which is exactly how `fs`, `http`, `crypto`, etc. are exposed to JavaScript.
+4. **Active development** — Google was investing heavily in V8 to win the browser performance wars. Node.js effectively got a world-class engine maintained by a large team, for free.
+
+### How V8 Compiles JavaScript (JIT Pipeline)
+
+```mermaid
+graph LR
+    SRC["JS Source Code<br/>'function add(a,b){return a+b}'"] --> PARSE["Parser<br/>Reads tokens, builds AST"]
+    PARSE --> AST["Abstract Syntax Tree (AST)<br/>Tree of language constructs"]
+    AST --> IG["Ignition (Interpreter)<br/>Generates bytecode<br/>Starts executing immediately"]
+    IG --> BC["Bytecode<br/>Platform-neutral instructions"]
+    BC --> EXEC["Execute (interpreted)"]
+
+    BC --> PROF["Profiler<br/>Tracks 'hot' functions<br/>(called many times)"]
+    PROF --> TF["TurboFan (Optimising Compiler)<br/>Compiles hot bytecode → native machine code"]
+    TF --> MC["Native Machine Code<br/>Runs directly on CPU — no interpretation overhead"]
+    MC --> FAST["Fast Execution"]
+
+    MC --> DEOPT["Deoptimisation<br/>If assumption breaks (e.g., type changes)<br/>falls back to bytecode"]
+    DEOPT --> BC
+
+    style SRC fill:#42a5f5,color:#fff
+    style MC fill:#66bb6a,color:#fff
+    style TF fill:#ff7043,color:#fff
+    style DEOPT fill:#fce4ec,color:#880e4f
+```
+
+**Ignition + TurboFan** — V8's two-stage compilation pipeline (introduced ~2017, still in use):
+
+- **Ignition** — a bytecode interpreter. Starts executing your code immediately (fast startup). Collects profiling data: which functions are called frequently, what types the arguments are.
+- **TurboFan** — an optimising JIT compiler. Takes "hot" functions (called many times) and compiles them to highly optimised native machine code based on the observed types. This is why JavaScript can approach C++ speeds for hot paths.
+- **Deoptimisation** — If TurboFan assumed `add(a, b)` always receives numbers, but you suddenly pass a string, the optimised code is thrown away and falls back to bytecode. This is called **deopt** and is a hidden performance trap.
+
+### What Node.js Adds on Top of V8
+
+V8 alone can only run JavaScript — it has no concept of files, networks, or operating systems. Node.js wraps V8 and adds:
+
+| Layer | What it provides |
+|---|---|
+| **V8** | JavaScript execution, garbage collection, JIT compilation |
+| **libuv** | Event loop, thread pool, async I/O (fs, dns, crypto) |
+| **Node.js core bindings** | `fs`, `http`, `net`, `crypto`, `stream`, `path`, `os` etc. |
+| **npm ecosystem** | Third-party packages |
+
+```mermaid
+graph TB
+    JS["Your JavaScript code"] --> V8["V8 Engine<br/>(parses, compiles, executes JS)"]
+    V8 --> BIND["Node.js C++ Bindings<br/>(bridge between JS and OS)"]
+    BIND --> LIBUV["libuv<br/>(event loop + thread pool)"]
+    BIND --> OS_API["OS APIs<br/>(sockets, file system, signals)"]
+    LIBUV --> OS_API
+    OS_API --> HW["Hardware / Kernel"]
+
+    style V8 fill:#42a5f5,color:#fff
+    style LIBUV fill:#ff7043,color:#fff
+    style BIND fill:#66bb6a,color:#fff
+```
+
+### Senior-Level Q&A
+
+**Q1: Why does Node.js use V8 and not SpiderMonkey or JavaScriptCore?**
+
+A (structured answer):
+
+- **2009 context:** V8 was the fastest JS engine available when Ryan Dahl created Node.js, due to its JIT compilation pipeline.
+- **Embeddability:** V8 is written in C++ with a clean embedding API. Node.js registers built-in modules (`fs`, `http`) as C++ functions exposed to V8's JS environment.
+- **Open source (BSD):** No licence restrictions on embedding or distribution.
+- **Ecosystem momentum:** Google's continuous investment means V8 gets faster with every Chrome release — Node.js gets these improvements for free.
+- **Alternative today:** Bun uses JavaScriptCore (Safari's engine). Deno still uses V8. The choice matters less now than in 2009, but V8's ecosystem tooling (heap snapshots, `--inspect`, DevTools protocol) is unmatched.
+
+**Q2: What is JIT compilation and why does it make V8 fast?**
+
+A: **JIT (Just-In-Time) compilation** is a hybrid strategy between interpretation and ahead-of-time compilation:
+
+- **Pure interpretation (old way):** Read one instruction at a time, execute it, repeat. Flexible but slow — each instruction is decoded on every execution.
+- **Ahead-of-time (AOT) compilation (C/Go):** Compile the entire program to machine code before running. Fast execution, but the compiler must handle all possible types statically.
+- **JIT:** Start executing via an interpreter (fast startup), profile which code runs frequently, then compile only those hot paths to native machine code at runtime — using the observed types as hints. Best of both worlds.
+
+```js
+// TurboFan optimisation example — type consistency matters
+function add(a, b) { return a + b; }
+
+// ✅ TurboFan can optimise this — always called with numbers
+for (let i = 0; i < 1_000_000; i++) add(1, 2);
+
+// ❌ This causes a deoptimisation — suddenly a string breaks the type assumption
+add('hello', 'world'); // V8 discards the native machine code, falls back to bytecode
+// Subsequent calls are slower until TurboFan recompiles with relaxed type assumptions
+
+// Practical rule: keep function argument types CONSISTENT for performance-critical code
+```
+
+**Q3: What does `--max-old-space-size` control, and why is V8's heap limited?**
+
+A: V8 manages JavaScript objects in a **heap** divided into "young generation" (short-lived objects, collected frequently) and "old generation" (long-lived objects). By default, the old generation heap is capped at ~1.5GB on 64-bit systems (historically 512MB on 32-bit).
+
+The limit exists because V8's garbage collector was originally designed for browsers — tabs don't need gigabytes of heap. For Node.js server workloads you can raise it:
+
+```bash
+# Increase old-generation heap to 4GB
+node --max-old-space-size=4096 app.js
+
+# Or via environment variable (useful in Docker)
+NODE_OPTIONS="--max-old-space-size=4096" node app.js
+```
+
+> ⚠️ Raising the heap limit doesn't fix memory leaks — it just delays the crash. Profile first with `--inspect` + Chrome DevTools heap snapshots.
+
+**Q4: Can Node.js ever switch away from V8?**
+
+A: Theoretically yes — the node-chakracore project once ran Node.js on Microsoft's Chakra engine. In practice, the Node.js ecosystem (native addons via N-API, `--inspect` DevTools protocol, heap snapshot tooling) is so deeply integrated with V8's APIs that switching would be an enormous undertaking. Bun and Deno exist as separate runtimes precisely because starting fresh was easier than changing Node.js's engine.
+
+> **💡 Interview Tip — One-Liner Answers:**
+>
+> - _"Is V8 a version number?"_ → No. V8 is the name of Google's JavaScript engine used in Chrome and Node.js. There is no V6 or V7 engine — those don't exist.
+> - _"Why V8 over SpiderMonkey?"_ → Speed (JIT compilation in 2009), clean C++ embedding API, open-source BSD licence, Google's continuous investment.
+> - _"What is JIT compilation?"_ → Start with an interpreter for fast startup, profile hot functions, compile them to native machine code at runtime using observed types as hints.
+> - _"What is deoptimisation?"_ → When V8's type assumptions break (e.g., a numeric function receives a string), TurboFan discards optimised code and falls back to bytecode. Keep types consistent in hot paths.
+
+> **📝 Quick Revision — V8 & Engine Choice:**
+>
+> | Fact | Detail |
+> | --- | --- |
+> | V8 author | Google (Chrome team, 2008) |
+> | Why chosen | Fastest JIT engine in 2009, embeddable, BSD licence |
+> | Pipeline | Ignition (bytecode interpreter) → TurboFan (optimising JIT compiler) |
+> | Heap limit | ~1.5GB default; raise with `--max-old-space-size=N` |
+> | Alternatives | SpiderMonkey (Firefox), JavaScriptCore (Safari/Bun), Hermes (React Native) |
+> | Deopt trap | Inconsistent argument types in hot functions → JIT discards optimised code |
+
+[↑ Back to Index](#table-of-contents)
+
+---
 
 ### 1.1 Module System
 
