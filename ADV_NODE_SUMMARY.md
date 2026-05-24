@@ -1,4 +1,4 @@
-# Advanced Node.js — In-depth Notes
+﻿# Advanced Node.js — In-depth Notes
 
 ## Overview
 
@@ -9,6 +9,7 @@ This document expands the workspace summary into practical, in-depth notes for e
 **Phase 1 — Node.js Fundamentals & Internals**
 
 - 1.0 [Why V8? Node.js Engine & Architecture](#10-why-v8-nodejs-engine--architecture) — engine choice, JIT compilation, JS engines comparison, interview Q&A
+- 1.0.1 [How JavaScript Code Is Executed](#101-how-javascript-code-is-executed) — lexical analysis, tokenisation, AST, bytecode, JIT, execution context, call stack
 - 1.1 [Module System](#11-module-system) — CommonJS vs ESM, require resolution, circular deps
 - 1.2 [Event Loop](#12-event-loop) — phases, timers, microtasks, senior Q&A
 - 1.3 [libuv Thread Pool](#13-libuv-thread-pool) — UV_THREADPOOL_SIZE, which APIs use it, tuning
@@ -115,13 +116,13 @@ When people hear "V8" in the context of Node.js, they sometimes wonder — is th
 
 **Other JavaScript engines (not V8):**
 
-| Engine | Maintained by | Used in |
-|---|---|---|
-| **V8** | Google | Chrome, Node.js, Deno, Edge (Chromium) |
-| **SpiderMonkey** | Mozilla | Firefox |
-| **JavaScriptCore (Nitro)** | Apple | Safari, WebKit, Bun |
-| **Hermes** | Meta (Facebook) | React Native (mobile) |
-| **Chakra** | Microsoft | Old Edge (pre-Chromium), discontinued |
+| Engine                     | Maintained by   | Used in                                |
+| -------------------------- | --------------- | -------------------------------------- |
+| **V8**                     | Google          | Chrome, Node.js, Deno, Edge (Chromium) |
+| **SpiderMonkey**           | Mozilla         | Firefox                                |
+| **JavaScriptCore (Nitro)** | Apple           | Safari, WebKit, Bun                    |
+| **Hermes**                 | Meta (Facebook) | React Native (mobile)                  |
+| **Chakra**                 | Microsoft       | Old Edge (pre-Chromium), discontinued  |
 
 **Why did Node.js choose V8 specifically?**
 
@@ -166,12 +167,12 @@ graph LR
 
 V8 alone can only run JavaScript — it has no concept of files, networks, or operating systems. Node.js wraps V8 and adds:
 
-| Layer | What it provides |
-|---|---|
-| **V8** | JavaScript execution, garbage collection, JIT compilation |
-| **libuv** | Event loop, thread pool, async I/O (fs, dns, crypto) |
+| Layer                     | What it provides                                           |
+| ------------------------- | ---------------------------------------------------------- |
+| **V8**                    | JavaScript execution, garbage collection, JIT compilation  |
+| **libuv**                 | Event loop, thread pool, async I/O (fs, dns, crypto)       |
 | **Node.js core bindings** | `fs`, `http`, `net`, `crypto`, `stream`, `path`, `os` etc. |
-| **npm ecosystem** | Third-party packages |
+| **npm ecosystem**         | Third-party packages                                       |
 
 ```mermaid
 graph TB
@@ -209,13 +210,15 @@ A: **JIT (Just-In-Time) compilation** is a hybrid strategy between interpretatio
 
 ```js
 // TurboFan optimisation example — type consistency matters
-function add(a, b) { return a + b; }
+function add(a, b) {
+    return a + b;
+}
 
 // ✅ TurboFan can optimise this — always called with numbers
 for (let i = 0; i < 1_000_000; i++) add(1, 2);
 
 // ❌ This causes a deoptimisation — suddenly a string breaks the type assumption
-add('hello', 'world'); // V8 discards the native machine code, falls back to bytecode
+add("hello", "world"); // V8 discards the native machine code, falls back to bytecode
 // Subsequent calls are slower until TurboFan recompiles with relaxed type assumptions
 
 // Practical rule: keep function argument types CONSISTENT for performance-critical code
@@ -250,14 +253,481 @@ A: Theoretically yes — the node-chakracore project once ran Node.js on Microso
 
 > **📝 Quick Revision — V8 & Engine Choice:**
 >
-> | Fact | Detail |
-> | --- | --- |
-> | V8 author | Google (Chrome team, 2008) |
-> | Why chosen | Fastest JIT engine in 2009, embeddable, BSD licence |
-> | Pipeline | Ignition (bytecode interpreter) → TurboFan (optimising JIT compiler) |
-> | Heap limit | ~1.5GB default; raise with `--max-old-space-size=N` |
+> | Fact         | Detail                                                                     |
+> | ------------ | -------------------------------------------------------------------------- |
+> | V8 author    | Google (Chrome team, 2008)                                                 |
+> | Why chosen   | Fastest JIT engine in 2009, embeddable, BSD licence                        |
+> | Pipeline     | Ignition (bytecode interpreter) → TurboFan (optimising JIT compiler)       |
+> | Heap limit   | ~1.5GB default; raise with `--max-old-space-size=N`                        |
 > | Alternatives | SpiderMonkey (Firefox), JavaScriptCore (Safari/Bun), Hermes (React Native) |
-> | Deopt trap | Inconsistent argument types in hot functions → JIT discards optimised code |
+> | Deopt trap   | Inconsistent argument types in hot functions → JIT discards optimised code |
+
+[↑ Back to Index](#table-of-contents)
+
+---
+
+### 1.0.1 How JavaScript Code Is Executed
+
+### Concepts
+
+When you write JavaScript and hit "Run", your code goes through a **pipeline of stages** before anything actually happens on the CPU. Understanding this pipeline is essential for senior interviews — it explains why some code is fast, why type consistency matters, and what V8 is really doing behind the scenes.
+
+**The journey in one sentence:** Your source code is **read as text → broken into tokens → assembled into a tree (AST) → converted to bytecode → executed → hot paths compiled to machine code**.
+
+Let's break down every stage in simple English.
+
+---
+
+#### Stage 1: Source Code (What You Write)
+
+This is just the `.js` file you typed. To the engine, it's a **plain text string** — no different from a novel or a shopping list. The engine doesn't understand JavaScript yet; it only sees characters.
+
+```js
+// This is what V8 receives — just a string of characters:
+"function add(a, b) { return a + b; }";
+// V8's job: turn this text into something the CPU can execute
+```
+
+---
+
+#### Stage 2: Lexical Analysis (Tokenisation)
+
+**Simple English:** The engine reads your code **character by character** and groups them into meaningful chunks called **tokens** — like how your brain reads "H-e-l-l-o" and groups it into the word "Hello".
+
+**What is a token?** A token is the smallest meaningful unit of code. Each keyword, variable name, operator, and symbol becomes one token.
+
+**What is a Lexer/Tokeniser/Scanner?** These three words mean the same thing — the program that does this character-to-token grouping. V8's lexer is called the **Scanner**.
+
+```js
+// Input source code:
+function add(a, b) {
+    return a + b;
+}
+
+// After lexical analysis, the Scanner produces this stream of tokens:
+// ┌──────────────┬────────────────┐
+// │ Token Type   │ Token Value    │
+// ├──────────────┼────────────────┤
+// │ Keyword      │ "function"     │  ← reserved word
+// │ Identifier   │ "add"          │  ← name you chose
+// │ Punctuator   │ "("            │  ← opening parenthesis
+// │ Identifier   │ "a"            │  ← parameter name
+// │ Punctuator   │ ","            │  ← comma separator
+// │ Identifier   │ "b"            │  ← parameter name
+// │ Punctuator   │ ")"            │  ← closing parenthesis
+// │ Punctuator   │ "{"            │  ← block start
+// │ Keyword      │ "return"       │  ← reserved word
+// │ Identifier   │ "a"            │  ← variable reference
+// │ Punctuator   │ "+"            │  ← operator
+// │ Identifier   │ "b"            │  ← variable reference
+// │ Punctuator   │ ";"            │  ← statement end
+// │ Punctuator   │ "}"            │  ← block end
+// └──────────────┴────────────────┘
+
+// Whitespace and comments are DISCARDED — they're not tokens.
+// If you have a syntax error like a stray `@` character, the Scanner
+// throws a SyntaxError HERE — before parsing even begins.
+```
+
+**Key points:**
+
+- Whitespace and comments are stripped out (they're not meaningful to execution)
+- Invalid characters (like `@` outside a string) cause a **SyntaxError** at this stage
+- The output is a **flat list** of tokens — no structure yet, just chunks in order
+
+---
+
+#### Stage 3: Syntax Analysis (Parsing)
+
+**Simple English:** The parser reads the flat list of tokens and **builds a tree structure** that represents the grammar of your program. It's like diagramming a sentence in English class — "The cat sat on the mat" becomes Subject → Verb → Prepositional Phrase.
+
+**What is a Parser?** The program that checks whether your tokens follow JavaScript's grammar rules. If you write `function (a b)` (missing comma), the parser catches it here.
+
+**What does the Parser produce?** An **Abstract Syntax Tree (AST)** — see the next stage.
+
+**Lazy parsing (pre-parsing):** V8 is smart — it doesn't fully parse functions that haven't been called yet. It does a quick "pre-parse" (checks syntax is valid, skips generating AST nodes) and only fully parses a function when it's actually invoked. This speeds up startup for large files.
+
+```js
+// The parser takes the token stream and checks grammar:
+// ✅ function add(a, b) { return a + b; }  → valid grammar
+// ❌ function (a b) { return a + b; }      → SyntaxError: missing comma
+// ❌ function 123() {}                     → SyntaxError: unexpected number
+// ❌ return a + b;                         → SyntaxError (at top level in a module)
+
+// V8's parser is called the "Parser" (internally: parser.cc)
+// It implements the full ECMAScript specification grammar
+```
+
+---
+
+#### Stage 4: Abstract Syntax Tree (AST)
+
+**Simple English:** The AST is a **tree-shaped map** of your code's structure. Every operation, function, variable, and expression becomes a **node** in the tree. Parent nodes contain child nodes — like a family tree, but for code.
+
+**Why "Abstract"?** Because it throws away cosmetic details — parentheses, semicolons, whitespace, comments. It only keeps the **meaning**. `(a + b)` and `a + b` produce the same AST node.
+
+**Why a tree?** Because code is **nested**. A function contains statements. A statement contains expressions. An expression contains operators and operands. Trees naturally represent this nesting.
+
+```mermaid
+graph TD
+    P["Program"] --> FD["FunctionDeclaration<br/>name: 'add'"]
+    FD --> PARAMS["Parameters"]
+    PARAMS --> PA["Identifier: 'a'"]
+    PARAMS --> PB["Identifier: 'b'"]
+    FD --> BODY["BlockStatement (function body)"]
+    BODY --> RET["ReturnStatement"]
+    RET --> BIN["BinaryExpression<br/>operator: '+'"]
+    BIN --> LEFT["Identifier: 'a'"]
+    BIN --> RIGHT["Identifier: 'b'"]
+
+    style P fill:#42a5f5,color:#fff
+    style FD fill:#66bb6a,color:#fff
+    style BIN fill:#ff7043,color:#fff
+    style RET fill:#ab47bc,color:#fff
+```
+
+**You can inspect any AST yourself** at [astexplorer.net](https://astexplorer.net) — paste JavaScript code and see the tree in real time.
+
+**Real-world uses of AST:**
+
+- **ESLint** reads the AST to find code problems (it doesn't execute your code!)
+- **Babel** reads the AST, modifies it (e.g., converts `?.` to older syntax), and generates new code
+- **Webpack/Rollup** reads the AST to find `import` statements for tree shaking
+- **Prettier** reads the AST and prints it back with consistent formatting
+
+---
+
+#### Stage 5: Bytecode Generation (Ignition)
+
+**Simple English:** V8's interpreter called **Ignition** walks the AST and produces **bytecode** — a set of simple instructions that are portable (not tied to Intel vs ARM) and compact. Think of bytecode as a recipe written in a universal shorthand that any kitchen (CPU) can follow.
+
+**What is bytecode?** It's an intermediate language — simpler than JavaScript but not yet native machine code. Each instruction does one small thing: load a variable, add two numbers, call a function. Ignition executes these instructions one by one.
+
+**Why not compile directly to machine code?** Because that's slow for startup. Bytecode generation is **fast** — your code starts running almost immediately. Only "hot" functions get compiled to machine code later (Stage 7).
+
+```js
+// You can actually SEE V8's bytecode for any function!
+// Run with: node --print-bytecode --print-bytecode-filter=add app.js
+
+function add(a, b) {
+    return a + b;
+}
+add(1, 2); // Must call it for V8 to compile it
+
+// V8 outputs something like:
+//   Parameter count 3  (implicit 'this' + a + b)
+//   Bytecode:
+//     Ldar a1          ← Load argument 'a' into the accumulator register
+//     Add a2, [0]      ← Add argument 'b' to the accumulator
+//     Return            ← Return the accumulator value
+//
+// That's it — 3 instructions. Ignition executes these one at a time.
+// Each bytecode instruction is 1-4 bytes (very compact).
+```
+
+---
+
+#### Stage 6: Execution + Profiling
+
+**Simple English:** Ignition starts running your bytecode immediately. At the same time, it acts like a **spy** — it watches which functions are called frequently ("hot" functions) and what types the arguments are. This profiling data is passed to TurboFan (the optimising compiler) in the next stage.
+
+**What makes a function "hot"?** V8 counts how many times each function is called. After a threshold (roughly a few hundred to a few thousand calls), V8 considers it hot and sends it to TurboFan. Functions inside loops become hot very quickly.
+
+**What does the profiler track?**
+
+- How many times the function was called
+- What **types** the arguments were (always numbers? always strings? mixed?)
+- Which branches (if/else) are taken most often
+- Which object shapes (hidden classes) are used
+
+---
+
+#### Stage 7: JIT Compilation (TurboFan)
+
+**Simple English:** TurboFan takes a hot function's bytecode and compiles it to **native machine code** — the raw instructions your CPU (Intel x86, Apple M-series ARM, etc.) understands directly. No interpreter overhead. This is like translating a recipe from shorthand into your native language so you can cook without thinking.
+
+**Why is it called JIT (Just-In-Time)?** Because the compilation happens **while your program is already running** — not before (like C/Go) and not never (like pure interpreters). It compiles "just in time" for when the function is needed at full speed.
+
+**Type specialisation — the secret weapon:** If TurboFan sees that `add(a, b)` has always been called with two numbers, it generates machine code that assumes `a` and `b` are always numbers. This code is **much faster** than generic code that must check types at every operation.
+
+```js
+// TurboFan sees this pattern and generates FAST number-only machine code:
+function add(a, b) {
+    return a + b;
+}
+for (let i = 0; i < 1_000_000; i++) {
+    add(1, 2); // Always numbers → TurboFan generates optimised ADD instruction
+}
+// After ~1000 calls, TurboFan compiles add() to native machine code:
+//   mov eax, [arg_a]    ; load a into CPU register
+//   add eax, [arg_b]    ; CPU addition (single clock cycle!)
+//   ret                  ; return result
+// This is IDENTICAL to what a C compiler would produce — no JS overhead
+```
+
+---
+
+#### Stage 8: Deoptimisation (Falling Back)
+
+**Simple English:** If TurboFan made **assumptions** that turn out to be wrong (e.g., "this function always receives numbers" but then you pass a string), V8 **throws away** the optimised machine code and falls back to the slower bytecode interpreter. This is called **deoptimisation** (or "deopt").
+
+**Why is this bad?** The optimised code is discarded, and V8 must re-profile and potentially recompile with more relaxed assumptions. During this time, performance drops. Frequent deopts cause **"performance cliffs"** — code that's fast 99% of the time but suddenly gets 10× slower.
+
+**The #1 rule for V8 performance:** Keep your function argument types **consistent**. Don't pass numbers 999 times and then a string once.
+
+```js
+// ✅ GOOD — consistent types, TurboFan stays happy:
+function multiply(a, b) {
+    return a * b;
+}
+for (let i = 0; i < 1_000_000; i++) {
+    multiply(i, 2); // Always number × number → stays optimised
+}
+
+// ❌ BAD — type change causes deoptimisation:
+function multiply(a, b) {
+    return a * b;
+}
+for (let i = 0; i < 1_000_000; i++) {
+    multiply(i, 2); // TurboFan optimises for numbers...
+}
+multiply("hello", 2); // 💥 DEOPT! String breaks the assumption
+// V8 discards the fast machine code, falls back to bytecode
+// Must re-profile and recompile — performance drops temporarily
+
+// You can SEE deopts happen:
+// node --trace-deopt app.js
+// Output: [deoptimize] multiply ... reason: not a Number
+```
+
+---
+
+#### Execution Context & Call Stack
+
+**What is an Execution Context?** Every time JavaScript runs a piece of code, V8 creates an **execution context** — a container that holds everything needed to run that code:
+
+- **Variable Environment** — all `let`, `const`, `var` declarations in this scope
+- **Lexical Environment** — the scope chain (how inner functions access outer variables)
+- **`this` binding** — what `this` refers to in this context
+
+**Three types of execution contexts:**
+
+| Context                              | Created when          | `this` value                 |
+| ------------------------------------ | --------------------- | ---------------------------- |
+| **Global Execution Context (GEC)**   | Script starts running | `globalThis` (window/global) |
+| **Function Execution Context (FEC)** | A function is called  | Depends on how called        |
+| **Eval Execution Context**           | `eval()` is called    | Inherited from caller        |
+
+**What is the Call Stack?** A **stack** (last-in, first-out) of execution contexts. When you call a function, its context is **pushed** onto the stack. When it returns, it's **popped** off. If the stack grows too deep (infinite recursion), you get `RangeError: Maximum call stack size exceeded`.
+
+```js
+// Trace through the call stack:
+function greet(name) {
+    return hello(name); // Step 2: push hello() context
+}
+function hello(name) {
+    return `Hello, ${name}!`; // Step 3: execute, then pop hello() context
+}
+greet("Alice"); // Step 1: push greet() context
+
+// Call Stack at Step 2 (deepest point):
+// ┌────────────────────────┐
+// │ hello("Alice")         │  ← top (currently executing)
+// ├────────────────────────┤
+// │ greet("Alice")         │  ← waiting for hello() to return
+// ├────────────────────────┤
+// │ Global Execution Ctx   │  ← always at the bottom
+// └────────────────────────┘
+// After hello() returns: pop hello → pop greet → back to global
+
+// Stack overflow:
+function infinite() {
+    return infinite();
+} // Each call pushes a new context
+infinite(); // RangeError: Maximum call stack size exceeded (~10,000-15,000 frames)
+```
+
+---
+
+#### Hoisting — A Side Effect of How V8 Creates Execution Contexts
+
+**Simple English:** When V8 creates an execution context, it does a **two-pass** process:
+
+1. **Creation phase** — scans all declarations (`var`, `function`, `let`, `const`) and allocates memory for them _before_ running any code
+2. **Execution phase** — runs the code line by line
+
+This is why you can call a function _above_ where it's defined — the function declaration was already registered in the creation phase. This behaviour is called **hoisting**.
+
+```js
+// ✅ Works — function declarations are fully hoisted:
+console.log(add(2, 3)); // 5 — works even though add() is defined below!
+function add(a, b) {
+    return a + b;
+} // Hoisted: entire function is available from line 1
+
+// ⚠️ var is hoisted but NOT initialised (value is undefined until assignment):
+console.log(x); // undefined — hoisted but not yet assigned
+var x = 10;
+console.log(x); // 10 — now assigned
+
+// ❌ let/const are hoisted but in the "Temporal Dead Zone" (TDZ):
+console.log(y); // ReferenceError: Cannot access 'y' before initialization
+let y = 20;
+// V8 knows 'y' exists (it was registered in creation phase)
+// but accessing it before its declaration line is an error — this is the TDZ
+```
+
+---
+
+### The Complete Pipeline — All Stages Together
+
+```mermaid
+graph TD
+    SRC["📄 Source Code<br/>'function add(a,b){return a+b}'"] --> LEX["🔍 Lexical Analysis<br/>(Scanner/Tokeniser)<br/>Characters → Tokens"]
+    LEX --> TOKENS["📋 Token Stream<br/>[Keyword:function] [Id:add]<br/>[Punct:(] [Id:a] [Punct:,] ..."]
+    TOKENS --> PARSE["🌳 Syntax Analysis<br/>(Parser)<br/>Tokens → AST"]
+    PARSE --> AST["🌲 Abstract Syntax Tree<br/>Tree of nodes representing<br/>code structure"]
+    AST --> IG["⚙️ Ignition (Interpreter)<br/>AST → Bytecode<br/>Starts executing immediately"]
+    IG --> BC["📦 Bytecode<br/>Ldar a1 / Add a2 / Return"]
+    BC --> EXEC["▶️ Execute + Profile<br/>Run bytecode, track types<br/>Count function calls"]
+    EXEC --> HOT{"🔥 Is function hot?<br/>(called many times)"}
+    HOT -->|"No — keep interpreting"| EXEC
+    HOT -->|"Yes — optimise!"| TF["🚀 TurboFan (JIT Compiler)<br/>Bytecode → Native Machine Code<br/>Type-specialised"]
+    TF --> MC["💻 Machine Code<br/>mov eax, [a] / add eax, [b]<br/>Runs at near-C speed"]
+    MC --> FAST["⚡ Fast Execution"]
+    MC --> CHECK{"Types still match<br/>assumptions?"}
+    CHECK -->|"Yes"| FAST
+    CHECK -->|"No — type changed!"| DEOPT["🔄 Deoptimisation<br/>Discard machine code<br/>Fall back to bytecode"]
+    DEOPT --> BC
+
+    style SRC fill:#42a5f5,color:#fff
+    style LEX fill:#7e57c2,color:#fff
+    style PARSE fill:#7e57c2,color:#fff
+    style AST fill:#ff7043,color:#fff
+    style IG fill:#26a69a,color:#fff
+    style TF fill:#ef5350,color:#fff
+    style MC fill:#66bb6a,color:#fff
+    style DEOPT fill:#fce4ec,color:#880e4f
+    style FAST fill:#1b5e20,color:#fff
+```
+
+---
+
+### Glossary — Every Term in Simple English
+
+| Term                            | Simple English Meaning                                                                                     |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| **Source Code**                 | The `.js` text file you wrote — just characters in a file                                                  |
+| **Lexical Analysis**            | Reading code character by character and grouping into tokens (words)                                       |
+| **Token**                       | The smallest meaningful chunk: a keyword (`function`), a name (`add`), an operator (`+`)                   |
+| **Tokeniser / Scanner / Lexer** | The program that does lexical analysis — three names for the same thing                                    |
+| **Syntax Analysis**             | Checking that tokens follow JavaScript grammar rules (like spell-check for code structure)                 |
+| **Parser**                      | The program that does syntax analysis and builds the AST                                                   |
+| **AST (Abstract Syntax Tree)**  | A tree-shaped map of your code's structure — every expression, statement, function is a node               |
+| **"Abstract"**                  | The tree drops cosmetic details (semicolons, parens, whitespace) and keeps only meaning                    |
+| **Bytecode**                    | A compact, portable set of simple instructions — not machine code, not source code, in between             |
+| **Ignition**                    | V8's bytecode interpreter — converts AST to bytecode and starts executing immediately                      |
+| **Interpreter**                 | A program that reads instructions one at a time and executes them — slower but starts instantly            |
+| **Compiler**                    | A program that translates code to machine code before executing — slower to start but runs faster          |
+| **JIT (Just-In-Time)**          | Compile to machine code **while the program is already running**, not before                               |
+| **TurboFan**                    | V8's optimising JIT compiler — compiles hot bytecode into fast native machine code                         |
+| **Hot Function**                | A function called many times — V8 decides it's worth optimising                                            |
+| **Profiler**                    | A spy inside Ignition that counts function calls and tracks argument types                                 |
+| **Machine Code**                | Raw CPU instructions (binary) — no interpretation needed, fastest possible execution                       |
+| **Type Specialisation**         | Generating machine code that assumes specific types (e.g., "a is always a number")                         |
+| **Deoptimisation (Deopt)**      | V8 discards optimised machine code because a type assumption broke — falls back to bytecode                |
+| **Execution Context**           | A container V8 creates when code runs — holds variables, scope chain, `this` binding                       |
+| **Call Stack**                  | A stack of execution contexts — grows when functions are called, shrinks when they return                  |
+| **Hoisting**                    | V8 registers declarations before executing code — so functions can be called above their definition        |
+| **Temporal Dead Zone (TDZ)**    | The gap between a `let`/`const` being hoisted and its declaration line — accessing it throws an error      |
+| **Scope Chain**                 | How inner functions find variables: check own scope → parent scope → grandparent → … → global              |
+| **Hidden Class (Map)**          | V8's internal structure for tracking object shapes — objects with the same properties share a hidden class |
+| **Inline Cache (IC)**           | V8 remembers where to find a property on an object so it doesn't have to search every time                 |
+
+---
+
+### Senior-Level Q&A
+
+**Q1: Walk me through what happens when V8 executes `const result = add(2, 3);`**
+
+A (structured answer for interviews):
+
+1. **Lexical analysis:** Scanner reads characters and produces tokens: `const`, `result`, `=`, `add`, `(`, `2`, `,`, `3`, `)`, `;`
+2. **Parsing:** Parser builds AST nodes — a `VariableDeclaration` containing a `CallExpression` with `Identifier: add` and `Literal` arguments `2`, `3`
+3. **Bytecode:** Ignition generates bytecode: `LdaNamedProperty` (load `add`), `Ldar` (load args), `CallUndefinedReceiver2` (call with 2 args), `Star` (store result)
+4. **Execute:** Ignition runs bytecode, pushes a new execution context for `add()` onto the call stack, executes the function body, pops the context, stores the return value in `result`
+5. **Optimise (if hot):** If `add` has been called hundreds of times with numbers, TurboFan compiles it to a single native `ADD` instruction
+6. **Deopt (if types change):** If `add` is later called with strings, V8 discards the optimised code and falls back to bytecode
+
+**Q2: What's the difference between a compiler and an interpreter? Where does V8 fit?**
+
+A:
+
+- **Interpreter:** Reads and executes code **one instruction at a time**. Fast startup, slower execution. Like reading a foreign recipe and translating each step as you cook.
+- **Compiler:** Translates **all code** to machine code before running. Slow startup, fast execution. Like translating the entire recipe first, then cooking from the translation.
+- **V8 is both:** Ignition is an interpreter (fast startup). TurboFan is a compiler (fast execution for hot code). This hybrid approach is called **JIT compilation**.
+
+**Q3: Why does V8 use an AST instead of compiling directly from tokens?**
+
+A: Tokens are a flat list — they don't capture nesting or precedence. Is `a + b * c` equal to `(a + b) * c` or `a + (b * c)`? The AST resolves this by building a tree where `*` is a child of `+` (multiplication happens first). Without the AST, the compiler would need to re-solve precedence at every stage.
+
+**Q4: How can you detect deoptimisations in your Node.js app?**
+
+A:
+
+```bash
+# See all deoptimisations:
+node --trace-deopt app.js
+
+# See which functions got optimised:
+node --trace-opt app.js
+
+# See generated bytecode for a specific function:
+node --print-bytecode --print-bytecode-filter=functionName app.js
+
+# Full V8 tracing (verbose):
+node --trace-turbo app.js
+```
+
+**Q5: What is lazy parsing and why does V8 do it?**
+
+A: V8 doesn't fully parse functions until they're called. On first load, it does a "pre-parse" — checks for syntax errors and finds function boundaries, but skips building AST nodes. When the function is actually invoked, V8 does a full parse. This speeds up startup because most files define many functions but only call a few immediately.
+
+```js
+// V8 pre-parses this (syntax check only, no AST):
+function rarelyUsed() {
+    // 500 lines of code...
+    // V8 skips full parsing until someone calls rarelyUsed()
+}
+
+// V8 fully parses this immediately (it's called at load time):
+function init() {
+    /* ... */
+}
+init(); // ← triggers full parse + bytecode generation
+```
+
+> **💡 Interview Tip — One-Liner Answers:**
+>
+> - _"How is JavaScript executed?"_ → Source → Scanner (tokens) → Parser (AST) → Ignition (bytecode, executes immediately) → TurboFan (compiles hot functions to machine code) → Deopt if type assumptions break.
+> - _"What is an AST?"_ → A tree-shaped representation of your code's structure. Every tool (ESLint, Babel, Webpack) reads the AST, not your source text directly.
+> - _"What is the call stack?"_ → A stack of execution contexts. Push on function call, pop on return. Too deep = stack overflow.
+> - _"What is hoisting?"_ → V8's creation phase registers all declarations before execution. `function` decls are fully available; `var` is `undefined`; `let`/`const` are in the Temporal Dead Zone.
+> - _"Why keep types consistent?"_ → TurboFan generates type-specialised machine code. Changing types causes deoptimisation — the fast code is thrown away and V8 falls back to slow bytecode.
+
+> **📝 Quick Revision — JS Execution Pipeline:**
+>
+> | Stage                | Component | Input → Output                  | Speed           |
+> | -------------------- | --------- | ------------------------------- | --------------- |
+> | 1. Lexical Analysis  | Scanner   | Characters → Tokens             | Fast            |
+> | 2. Syntax Analysis   | Parser    | Tokens → AST                    | Fast            |
+> | 3. Bytecode Gen      | Ignition  | AST → Bytecode                  | Fast            |
+> | 4. Interpret         | Ignition  | Bytecode → Result               | Medium          |
+> | 5. JIT Compile       | TurboFan  | Bytecode → Machine Code         | Slow (one-time) |
+> | 6. Optimised Run     | CPU       | Machine Code → Result           | Fastest         |
+> | 7. Deopt (if needed) | V8        | Machine Code → back to Bytecode | —               |
+>
+> **Key rule:** Consistent types in hot functions → TurboFan stays optimised → near-C speed.
 
 [↑ Back to Index](#table-of-contents)
 
@@ -12330,6 +12800,7 @@ A **distributed system** is a collection of independent computers that appear to
 8. The network is homogeneous
 
 **CAP Theorem** — In the presence of a network **P**artition (split-brain), a distributed system can guarantee at most one of:
+
 - **C**onsistency — every node returns the same, most recent data
 - **A**vailability — every request gets a response (not an error)
 
@@ -12362,20 +12833,21 @@ graph TD
 
 ### Consistency Models (weakest → strongest)
 
-| Model | Description | Example |
-|---|---|---|
-| **Eventual consistency** | All replicas converge given no new writes | DynamoDB default, DNS |
-| **Monotonic reads** | Once you read a value, you never read an older one | Sticky session reads |
-| **Read-your-writes** | After writing, you always read your own write | Session-pinned reads |
-| **Causal consistency** | Causally related ops are seen in order by all | Vector clocks |
-| **Sequential consistency** | All nodes see operations in the same global order | — |
-| **Linearizability (strong)** | Reads/writes appear instantaneous and globally ordered | etcd, Spanner |
+| Model                        | Description                                            | Example               |
+| ---------------------------- | ------------------------------------------------------ | --------------------- |
+| **Eventual consistency**     | All replicas converge given no new writes              | DynamoDB default, DNS |
+| **Monotonic reads**          | Once you read a value, you never read an older one     | Sticky session reads  |
+| **Read-your-writes**         | After writing, you always read your own write          | Session-pinned reads  |
+| **Causal consistency**       | Causally related ops are seen in order by all          | Vector clocks         |
+| **Sequential consistency**   | All nodes see operations in the same global order      | —                     |
+| **Linearizability (strong)** | Reads/writes appear instantaneous and globally ordered | etcd, Spanner         |
 
 ### Senior-Level Q&A
 
 **Q1: You have a Node.js service reading from a replicated database. A user writes data, then immediately reads it back and gets the old value. What's happening?**
 
 A: The read is hitting a **read replica** that hasn't received the write yet (replication lag). Solutions:
+
 - **Read-your-writes consistency:** Route writes and the subsequent reads for the same session to the primary (sticky reads).
 - **Async invalidation:** After a write, cache-bust the replica result in Redis with a short TTL.
 - **Synchronous replication:** Force the write to propagate to at least one replica before acknowledging. Impacts write latency.
@@ -12402,6 +12874,7 @@ async function updateUserProfile(userId, data, session) {
 **Q2: Explain the difference between CP and AP systems with a concrete example.**
 
 A: Imagine a bank balance replicated across two data centers. A network partition splits them:
+
 - **CP (choose consistency):** Both data centers stop accepting writes until the partition heals. No stale reads, but the service is temporarily **unavailable**. Correct for financial systems.
 - **AP (choose availability):** Both data centers keep accepting writes independently. The service stays **up**, but after the partition heals, you may have two conflicting balances that need reconciliation. Acceptable for a shopping cart (merge the two carts), not for a bank account.
 
@@ -12453,7 +12926,7 @@ sequenceDiagram
 ### Key Implementation: Health Check Endpoint
 
 ```js
-const http = require('http');
+const http = require("http");
 
 // Readiness vs Liveness — two different checks:
 // Liveness  (/health/live)  → Is the process alive? (if not, restart it)
@@ -12468,22 +12941,24 @@ async function startServer() {
     isReady = true; // Only now are we ready to serve requests
 
     const server = http.createServer((req, res) => {
-        if (req.url === '/health/live') {
+        if (req.url === "/health/live") {
             // Liveness: process is alive if it can respond at all
             res.writeHead(200);
-            res.end(JSON.stringify({ status: 'alive' }));
+            res.end(JSON.stringify({ status: "alive" }));
             return;
         }
 
-        if (req.url === '/health/ready') {
+        if (req.url === "/health/ready") {
             // Readiness: only return 200 if fully initialised
             const status = isReady ? 200 : 503;
             res.writeHead(status);
-            res.end(JSON.stringify({
-                status: isReady ? 'ready' : 'starting',
-                uptime: process.uptime(),
-                memory: process.memoryUsage().heapUsed,
-            }));
+            res.end(
+                JSON.stringify({
+                    status: isReady ? "ready" : "starting",
+                    uptime: process.uptime(),
+                    memory: process.memoryUsage().heapUsed,
+                }),
+            );
             return;
         }
 
@@ -12497,13 +12972,13 @@ async function startServer() {
 
 ### Load Balancing Algorithms
 
-| Algorithm | How it works | Best for |
-|---|---|---|
-| **Round-robin** | Rotate through instances in order | Homogeneous instances, uniform request cost |
-| **Weighted round-robin** | Rotate with bias toward higher-capacity nodes | Heterogeneous hardware |
-| **Least connections** | Route to instance with fewest active connections | Long-lived connections (WebSocket, gRPC) |
-| **IP hash** | Hash client IP → always same backend | Stateful sessions without shared store |
-| **Consistent hashing** | Hash request key → minimal reshuffling on scale | Cache routing, stateful sharding |
+| Algorithm                | How it works                                     | Best for                                    |
+| ------------------------ | ------------------------------------------------ | ------------------------------------------- |
+| **Round-robin**          | Rotate through instances in order                | Homogeneous instances, uniform request cost |
+| **Weighted round-robin** | Rotate with bias toward higher-capacity nodes    | Heterogeneous hardware                      |
+| **Least connections**    | Route to instance with fewest active connections | Long-lived connections (WebSocket, gRPC)    |
+| **IP hash**              | Hash client IP → always same backend             | Stateful sessions without shared store      |
+| **Consistent hashing**   | Hash request key → minimal reshuffling on scale  | Cache routing, stateful sharding            |
 
 > **💡 Interview Tip:** "IP hash breaks fairness if clients are behind a corporate NAT — all traffic funnels to one instance. Prefer a shared session store (Redis) with round-robin instead."
 
@@ -12525,19 +13000,19 @@ Practical systems work around FLP with **timeouts and leader election**. The mos
 
 ```js
 // ── Distributed lock with Redis (single-node, production-grade for most use cases) ──
-const redis = require('ioredis');
+const redis = require("ioredis");
 const client = new redis();
-const crypto = require('crypto');
+const crypto = require("crypto");
 
 async function withDistributedLock(lockKey, ttlMs, fn) {
     // Generate a unique token so only THIS process can release its own lock
     // Without a unique token, Process A could accidentally release Process B's lock
-    const token = crypto.randomBytes(16).toString('hex');
+    const token = crypto.randomBytes(16).toString("hex");
 
     // SET key token NX PX ttlMs
     // NX = only set if key does NOT exist (atomic acquire)
     // PX = expire in ttlMs milliseconds (auto-release if process crashes)
-    const acquired = await client.set(lockKey, token, 'NX', 'PX', ttlMs);
+    const acquired = await client.set(lockKey, token, "NX", "PX", ttlMs);
 
     if (!acquired) {
         throw new Error(`Could not acquire lock: ${lockKey}`);
@@ -12563,9 +13038,9 @@ async function withDistributedLock(lockKey, ttlMs, fn) {
 async function processOrder(orderId) {
     await withDistributedLock(`order:lock:${orderId}`, 30000, async () => {
         const order = await db.findOrder(orderId);
-        if (order.status === 'processed') return; // Idempotency check inside the lock
+        if (order.status === "processed") return; // Idempotency check inside the lock
         await chargeCard(order);
-        await db.updateOrder(orderId, { status: 'processed' });
+        await db.updateOrder(orderId, { status: "processed" });
     });
 }
 ```
@@ -12579,7 +13054,7 @@ class LeaderElection {
         this.serviceId = serviceId;
         this.redis = redisClient;
         this.isLeader = false;
-        this.leaderKey = 'service:leader';
+        this.leaderKey = "service:leader";
         this.ttl = 10000; // 10 second lease
     }
 
@@ -12591,7 +13066,11 @@ class LeaderElection {
 
     async tryElect() {
         const acquired = await this.redis.set(
-            this.leaderKey, this.serviceId, 'NX', 'PX', this.ttl
+            this.leaderKey,
+            this.serviceId,
+            "NX",
+            "PX",
+            this.ttl,
         );
 
         if (acquired) {
@@ -12611,12 +13090,16 @@ class LeaderElection {
     }
 
     onBecomeLeader() {
-        console.log(`[${this.serviceId}] Became leader — starting scheduled jobs`);
+        console.log(
+            `[${this.serviceId}] Became leader — starting scheduled jobs`,
+        );
         // Only the leader runs cron jobs, sends daily digests, processes scheduled tasks
     }
 
     onLoseLeadership() {
-        console.log(`[${this.serviceId}] Lost leadership — stopping scheduled jobs`);
+        console.log(
+            `[${this.serviceId}] Lost leadership — stopping scheduled jobs`,
+        );
     }
 
     stop() {
@@ -12632,6 +13115,7 @@ class LeaderElection {
 A: **Split-brain** happens when a network partition causes two groups of nodes to each elect their own leader, resulting in two "brains" accepting writes independently. When the partition heals, you have conflicting state.
 
 Prevention strategies:
+
 - **Quorum writes:** Only accept writes when a majority (N/2+1) of nodes confirm — a minority partition can never form a quorum, so writes are rejected rather than diverging.
 - **Fencing tokens:** The leader includes a monotonically-increasing token in every write. Storage systems reject writes with an old token, even if a deposed leader tries to write after its lease expires.
 - **STONITH (Shoot The Other Node In The Head):** Forcibly power-cycle the node that lost the election before the new leader starts accepting writes. Used in high-availability database clusters.
@@ -12691,19 +13175,21 @@ The hardest problem in EDA: how do you atomically update your database **and** p
 async function placeOrder(orderData) {
     await db.transaction(async (trx) => {
         // 1. Write domain state
-        const order = await trx('orders').insert({
-            id: orderData.id,
-            userId: orderData.userId,
-            total: orderData.total,
-            status: 'pending',
-        }).returning('*');
+        const order = await trx("orders")
+            .insert({
+                id: orderData.id,
+                userId: orderData.userId,
+                total: orderData.total,
+                status: "pending",
+            })
+            .returning("*");
 
         // 2. Write outbox entry in the SAME transaction
         // If the transaction rolls back, both writes are rolled back atomically
-        await trx('outbox').insert({
+        await trx("outbox").insert({
             id: crypto.randomUUID(),
             aggregateId: order[0].id,
-            eventType: 'OrderPlaced',
+            eventType: "OrderPlaced",
             payload: JSON.stringify(order[0]),
             createdAt: new Date(),
             published: false,
@@ -12714,14 +13200,14 @@ async function placeOrder(orderData) {
 
 // Outbox relay: runs as a separate process / interval
 async function relayOutboxEvents() {
-    const events = await db('outbox')
+    const events = await db("outbox")
         .where({ published: false })
-        .orderBy('createdAt', 'asc')
+        .orderBy("createdAt", "asc")
         .limit(100);
 
     for (const event of events) {
         await kafka.produce(event.eventType, event.payload);
-        await db('outbox').where({ id: event.id }).update({ published: true });
+        await db("outbox").where({ id: event.id }).update({ published: true });
     }
 }
 ```
@@ -12740,12 +13226,12 @@ PlaceOrder Saga:
                                        → compensate: ReleaseInventory
 ```
 
-| Choreography | Orchestration |
-|---|---|
-| Services react to events directly | A central Saga orchestrator drives the steps |
-| Decoupled, no single point of failure | Easier to visualise and debug the flow |
-| Hard to track overall saga state | Orchestrator can become a bottleneck |
-| Best for simple linear flows | Best for complex branching logic |
+| Choreography                          | Orchestration                                |
+| ------------------------------------- | -------------------------------------------- |
+| Services react to events directly     | A central Saga orchestrator drives the steps |
+| Decoupled, no single point of failure | Easier to visualise and debug the flow       |
+| Hard to track overall saga state      | Orchestrator can become a bottleneck         |
+| Best for simple linear flows          | Best for complex branching logic             |
 
 > **💡 Interview Tip:** "Sagas give you ACD without the I of ACID — Atomicity (via compensations), Consistency, Durability, but NOT Isolation. Other sagas can observe intermediate state. Design UIs to show 'processing' states."
 
@@ -12758,6 +13244,7 @@ PlaceOrder Saga:
 ### Concepts
 
 **Two-Phase Commit (2PC)** is the classical protocol for distributed transactions:
+
 - **Phase 1 (Prepare):** Coordinator asks all participants "can you commit?" Each locks resources and votes Yes/No.
 - **Phase 2 (Commit/Abort):** If all voted Yes, coordinator sends Commit; otherwise sends Abort.
 
@@ -12768,10 +13255,12 @@ PlaceOrder Saga:
 ```js
 // Idempotent API handler with Redis-backed deduplication
 async function createOrderHandler(req, res) {
-    const idempotencyKey = req.headers['idempotency-key'];
+    const idempotencyKey = req.headers["idempotency-key"];
 
     if (!idempotencyKey) {
-        return res.status(400).json({ error: 'Idempotency-Key header required' });
+        return res
+            .status(400)
+            .json({ error: "Idempotency-Key header required" });
     }
 
     const cacheKey = `idempotency:${idempotencyKey}`;
@@ -12785,7 +13274,7 @@ async function createOrderHandler(req, res) {
 
     try {
         const order = await orderService.create(req.body);
-        const response = { orderId: order.id, status: 'created' };
+        const response = { orderId: order.id, status: "created" };
 
         // Cache the response for 24 hours (clients can safely retry within this window)
         await redis.setex(cacheKey, 86400, JSON.stringify(response));
@@ -12800,11 +13289,11 @@ async function createOrderHandler(req, res) {
 
 ### Optimistic vs Pessimistic Concurrency
 
-| Strategy | Mechanism | Best for |
-|---|---|---|
-| **Pessimistic** | Lock the row before reading (`SELECT FOR UPDATE`) | High contention, critical sections |
-| **Optimistic** | Add a `version` column; reject if version changed at write time | Low contention, read-heavy workloads |
-| **MVCC** | Database keeps multiple versions; readers never block writers | PostgreSQL, MySQL InnoDB default |
+| Strategy        | Mechanism                                                       | Best for                             |
+| --------------- | --------------------------------------------------------------- | ------------------------------------ |
+| **Pessimistic** | Lock the row before reading (`SELECT FOR UPDATE`)               | High contention, critical sections   |
+| **Optimistic**  | Add a `version` column; reject if version changed at write time | Low contention, read-heavy workloads |
+| **MVCC**        | Database keeps multiple versions; readers never block writers   | PostgreSQL, MySQL InnoDB default     |
 
 ```js
 // Optimistic locking with version field — prevents lost updates
@@ -12812,43 +13301,45 @@ async function transferFunds(fromId, toId, amount) {
     const maxRetries = 3;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
         const account = await db.query(
-            'SELECT id, balance, version FROM accounts WHERE id = $1',
-            [fromId]
+            "SELECT id, balance, version FROM accounts WHERE id = $1",
+            [fromId],
         );
 
-        if (account.balance < amount) throw new Error('Insufficient funds');
+        if (account.balance < amount) throw new Error("Insufficient funds");
 
         // Update ONLY if the version hasn't changed since we read it
         // If another process updated the account concurrently, version changed → rowsUpdated = 0
         const result = await db.query(
             `UPDATE accounts SET balance = balance - $1, version = version + 1
              WHERE id = $2 AND version = $3`,
-            [amount, fromId, account.version]
+            [amount, fromId, account.version],
         );
 
         if (result.rowCount === 1) {
             // Our update succeeded — no concurrent modification
             await db.query(
-                'UPDATE accounts SET balance = balance + $1 WHERE id = $2',
-                [amount, toId]
+                "UPDATE accounts SET balance = balance + $1 WHERE id = $2",
+                [amount, toId],
             );
             return; // Success
         }
         // rowCount = 0 → concurrent update detected → retry
-        await new Promise(r => setTimeout(r, Math.random() * 100)); // jitter before retry
+        await new Promise((r) => setTimeout(r, Math.random() * 100)); // jitter before retry
     }
-    throw new Error('Transaction failed after max retries — too much contention');
+    throw new Error(
+        "Transaction failed after max retries — too much contention",
+    );
 }
 ```
 
 > **📝 Quick Revision — Consistency Patterns:**
 >
-> | Pattern | Guarantee | Cost |
-> | --- | --- | --- |
-> | 2PC | ACID across services | Blocking, coordinator SPOF |
-> | Saga | ACD (no Isolation) | Compensating logic complexity |
-> | Outbox | At-least-once delivery | Consumers must be idempotent |
-> | Optimistic locking | No lost updates | Retry overhead on contention |
+> | Pattern            | Guarantee              | Cost                          |
+> | ------------------ | ---------------------- | ----------------------------- |
+> | 2PC                | ACID across services   | Blocking, coordinator SPOF    |
+> | Saga               | ACD (no Isolation)     | Compensating logic complexity |
+> | Outbox             | At-least-once delivery | Consumers must be idempotent  |
+> | Optimistic locking | No lost updates        | Retry overhead on contention  |
 
 [↑ Back to Index](#table-of-contents)
 
@@ -12890,19 +13381,22 @@ graph TB
 ### Redis Cluster — Sharding in Practice
 
 ```js
-const { Cluster } = require('ioredis');
+const { Cluster } = require("ioredis");
 
 // Redis Cluster: 16,384 hash slots distributed across N master nodes
 // Key routing is automatic — the client library handles it
-const cluster = new Cluster([
-    { host: '127.0.0.1', port: 7000 },
-    { host: '127.0.0.1', port: 7001 },
-    { host: '127.0.0.1', port: 7002 },
-], {
-    scaleReads: 'slave', // Read from replicas to distribute read load
-    redisOptions: { password: process.env.REDIS_PASSWORD },
-    clusterRetryStrategy: (times) => Math.min(times * 100, 3000), // Exponential backoff
-});
+const cluster = new Cluster(
+    [
+        { host: "127.0.0.1", port: 7000 },
+        { host: "127.0.0.1", port: 7001 },
+        { host: "127.0.0.1", port: 7002 },
+    ],
+    {
+        scaleReads: "slave", // Read from replicas to distribute read load
+        redisOptions: { password: process.env.REDIS_PASSWORD },
+        clusterRetryStrategy: (times) => Math.min(times * 100, 3000), // Exponential backoff
+    },
+);
 
 // Hash tags: {userId} forces related keys to the same slot (same node)
 // Needed when you use MGET or transactions across multiple keys
@@ -12913,7 +13407,7 @@ async function getUserData(userId) {
     pipeline.get(`{${userId}}:preferences`);
     pipeline.get(`{${userId}}:permissions`);
     const results = await pipeline.exec();
-    return results.map(([err, val]) => val ? JSON.parse(val) : null);
+    return results.map(([err, val]) => (val ? JSON.parse(val) : null));
 }
 ```
 
@@ -12934,7 +13428,7 @@ async function getWithStampedeProtection(key, fetchFn) {
 
         // Probabilistic early recompute: as expiry approaches, randomly recompute early
         // Probability increases as TTL decreases — prevents the cliff-edge miss
-        const recomputeProbability = 1 - (remaining / (CACHE_TTL * 1000));
+        const recomputeProbability = 1 - remaining / (CACHE_TTL * 1000);
         if (Math.random() > recomputeProbability) {
             return value; // Serve from cache
         }
@@ -12943,21 +13437,25 @@ async function getWithStampedeProtection(key, fetchFn) {
 
     // Distributed lock: only one process recomputes, others wait
     const lockKey = `lock:${key}`;
-    const lockToken = crypto.randomBytes(8).toString('hex');
-    const lockAcquired = await redis.set(lockKey, lockToken, 'NX', 'PX', 5000);
+    const lockToken = crypto.randomBytes(8).toString("hex");
+    const lockAcquired = await redis.set(lockKey, lockToken, "NX", "PX", 5000);
 
     if (!lockAcquired) {
         // Another process is recomputing — wait and retry from cache
-        await new Promise(r => setTimeout(r, 100));
+        await new Promise((r) => setTimeout(r, 100));
         return getWithStampedeProtection(key, fetchFn);
     }
 
     try {
         const fresh = await fetchFn();
-        await redis.setex(key, CACHE_TTL, JSON.stringify({
-            value: fresh,
-            expiresAt: Date.now() + CACHE_TTL * 1000,
-        }));
+        await redis.setex(
+            key,
+            CACHE_TTL,
+            JSON.stringify({
+                value: fresh,
+                expiresAt: Date.now() + CACHE_TTL * 1000,
+            }),
+        );
         return fresh;
     } finally {
         // Release lock (only if we still own it)
@@ -12995,20 +13493,26 @@ In a monolith, a stack trace tells you exactly what happened. In a distributed s
 - **Baggage:** Key-value pairs propagated across service boundaries alongside trace context (e.g., `userId`, `tenantId`).
 
 ```js
-const { NodeSDK } = require('@opentelemetry/sdk-node');
-const { getNodeAutoInstrumentations } = require('@opentelemetry/auto-instrumentations-node');
-const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-http');
-const { Resource } = require('@opentelemetry/resources');
-const { SemanticResourceAttributes } = require('@opentelemetry/semantic-conventions');
+const { NodeSDK } = require("@opentelemetry/sdk-node");
+const {
+    getNodeAutoInstrumentations,
+} = require("@opentelemetry/auto-instrumentations-node");
+const {
+    OTLPTraceExporter,
+} = require("@opentelemetry/exporter-trace-otlp-http");
+const { Resource } = require("@opentelemetry/resources");
+const {
+    SemanticResourceAttributes,
+} = require("@opentelemetry/semantic-conventions");
 
 // Initialize OpenTelemetry — must happen BEFORE requiring http, express, pg, etc.
 const sdk = new NodeSDK({
     resource: new Resource({
-        [SemanticResourceAttributes.SERVICE_NAME]: 'order-service',
-        [SemanticResourceAttributes.SERVICE_VERSION]: '1.0.0',
+        [SemanticResourceAttributes.SERVICE_NAME]: "order-service",
+        [SemanticResourceAttributes.SERVICE_VERSION]: "1.0.0",
     }),
     traceExporter: new OTLPTraceExporter({
-        url: 'http://otel-collector:4318/v1/traces',
+        url: "http://otel-collector:4318/v1/traces",
     }),
     // Auto-instruments: HTTP, Express, pg, Redis, gRPC, MongoDB, etc.
     instrumentations: [getNodeAutoInstrumentations()],
@@ -13016,25 +13520,28 @@ const sdk = new NodeSDK({
 sdk.start();
 
 // Manual span for custom business operations
-const { trace, context, propagation } = require('@opentelemetry/api');
-const tracer = trace.getTracer('order-service');
+const { trace, context, propagation } = require("@opentelemetry/api");
+const tracer = trace.getTracer("order-service");
 
 async function processOrder(orderId) {
     // Create a custom span for this business operation
-    return tracer.startActiveSpan('processOrder', async (span) => {
+    return tracer.startActiveSpan("processOrder", async (span) => {
         span.setAttributes({
-            'order.id': orderId,
-            'order.source': 'api',
+            "order.id": orderId,
+            "order.source": "api",
         });
 
         try {
             const order = await db.findOrder(orderId); // auto-instrumented DB span created
-            await paymentService.charge(order);        // auto-instrumented HTTP span created
+            await paymentService.charge(order); // auto-instrumented HTTP span created
             span.setStatus({ code: SpanStatusCode.OK });
             return order;
         } catch (err) {
             span.recordException(err);
-            span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+            span.setStatus({
+                code: SpanStatusCode.ERROR,
+                message: err.message,
+            });
             throw err;
         } finally {
             span.end(); // Always end spans — unclosed spans leak memory
@@ -13046,8 +13553,8 @@ async function processOrder(orderId) {
 ### Correlation ID Pattern with AsyncLocalStorage
 
 ```js
-const { AsyncLocalStorage } = require('async_hooks');
-const crypto = require('crypto');
+const { AsyncLocalStorage } = require("async_hooks");
+const crypto = require("crypto");
 
 // AsyncLocalStorage provides request-scoped storage that propagates through async calls
 // No need to thread a 'requestId' parameter through every function
@@ -13055,44 +13562,51 @@ const requestContext = new AsyncLocalStorage();
 
 // Middleware: extract or generate correlation ID, store in async context
 function correlationMiddleware(req, res, next) {
-    const correlationId = req.headers['x-correlation-id'] || crypto.randomUUID();
-    const traceId = req.headers['x-trace-id'] || crypto.randomUUID();
+    const correlationId =
+        req.headers["x-correlation-id"] || crypto.randomUUID();
+    const traceId = req.headers["x-trace-id"] || crypto.randomUUID();
 
     // Every async operation spawned from this request automatically inherits this store
-    requestContext.run({ correlationId, traceId, startTime: Date.now() }, () => {
-        res.setHeader('x-correlation-id', correlationId);
-        next();
-    });
+    requestContext.run(
+        { correlationId, traceId, startTime: Date.now() },
+        () => {
+            res.setHeader("x-correlation-id", correlationId);
+            next();
+        },
+    );
 }
 
 // Logger automatically picks up the current request context — no parameter passing needed
 const logger = {
     info: (msg, data = {}) => {
         const ctx = requestContext.getStore() ?? {};
-        console.log(JSON.stringify({
-            level: 'info', msg,
-            correlationId: ctx.correlationId,
-            traceId: ctx.traceId,
-            ...data,
-            timestamp: new Date().toISOString(),
-        }));
+        console.log(
+            JSON.stringify({
+                level: "info",
+                msg,
+                correlationId: ctx.correlationId,
+                traceId: ctx.traceId,
+                ...data,
+                timestamp: new Date().toISOString(),
+            }),
+        );
     },
 };
 
 // Deep in the call stack — no 'req' object needed to get the correlation ID
 async function chargePayment(amount) {
-    logger.info('Charging payment', { amount }); // Automatically includes correlationId
+    logger.info("Charging payment", { amount }); // Automatically includes correlationId
     // ... payment logic
 }
 ```
 
 > **📝 Quick Revision — Observability:**
 >
-> | Signal | What it answers | Tool |
-> | --- | --- | --- |
-> | Logs | What happened in this service? | Winston, Pino, CloudWatch |
-> | Metrics | How is the system behaving over time? | Prometheus, Datadog |
-> | Traces | Why was this request slow / where did it fail? | Jaeger, Zipkin, Honeycomb |
+> | Signal  | What it answers                                | Tool                      |
+> | ------- | ---------------------------------------------- | ------------------------- |
+> | Logs    | What happened in this service?                 | Winston, Pino, CloudWatch |
+> | Metrics | How is the system behaving over time?          | Prometheus, Datadog       |
+> | Traces  | Why was this request slow / where did it fail? | Jaeger, Zipkin, Honeycomb |
 
 [↑ Back to Index](#table-of-contents)
 
@@ -13120,25 +13634,31 @@ async function withRetry(fn, options = {}) {
         maxAttempts = 3,
         baseDelayMs = 100,
         maxDelayMs = 10000,
-        retryableErrors = ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED'],
+        retryableErrors = ["ECONNRESET", "ETIMEDOUT", "ECONNREFUSED"],
     } = options;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
             return await fn();
         } catch (err) {
-            const isRetryable = retryableErrors.includes(err.code) || err.status >= 500;
+            const isRetryable =
+                retryableErrors.includes(err.code) || err.status >= 500;
             const isLastAttempt = attempt === maxAttempts;
 
             if (!isRetryable || isLastAttempt) throw err;
 
             // Exponential backoff: 100ms, 200ms, 400ms... capped at maxDelayMs
-            const exponential = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
+            const exponential = Math.min(
+                baseDelayMs * 2 ** (attempt - 1),
+                maxDelayMs,
+            );
             // Jitter: randomise ±50% to prevent all retries hitting at the same time
             const jitter = exponential * (0.5 + Math.random() * 0.5);
 
-            console.warn(`Attempt ${attempt} failed (${err.message}). Retrying in ${Math.round(jitter)}ms`);
-            await new Promise(r => setTimeout(r, jitter));
+            console.warn(
+                `Attempt ${attempt} failed (${err.message}). Retrying in ${Math.round(jitter)}ms`,
+            );
+            await new Promise((r) => setTimeout(r, jitter));
         }
     }
 }
@@ -13146,7 +13666,7 @@ async function withRetry(fn, options = {}) {
 // ── Bulkhead: separate connection pools per service ───────────────────────────
 // Without bulkhead: one slow service exhausts the single shared HTTP agent
 // With bulkhead: each downstream service has its own connection pool limit
-const http = require('http');
+const http = require("http");
 
 const paymentServiceAgent = new http.Agent({ maxSockets: 10 }); // max 10 concurrent connections to payment
 const inventoryServiceAgent = new http.Agent({ maxSockets: 20 }); // separate pool for inventory
@@ -13154,8 +13674,8 @@ const inventoryServiceAgent = new http.Agent({ maxSockets: 20 }); // separate po
 async function callPaymentService(data) {
     // Even if inventory is slow and its 20 connections are all busy,
     // payment service still has its own 10 connections available
-    return fetch('http://payment-service/charge', {
-        method: 'POST',
+    return fetch("http://payment-service/charge", {
+        method: "POST",
         body: JSON.stringify(data),
         agent: paymentServiceAgent, // Isolated pool
     });
@@ -13173,13 +13693,13 @@ async function handleRequest(req, res) {
     const timer = setTimeout(() => controller.abort(), downstreamTimeout);
 
     try {
-        const result = await fetch('http://downstream-service/data', {
+        const result = await fetch("http://downstream-service/data", {
             signal: controller.signal, // Downstream call cancelled if it takes too long
         });
         res.json(await result.json());
     } catch (err) {
-        if (err.name === 'AbortError') {
-            res.status(504).json({ error: 'Upstream timeout' });
+        if (err.name === "AbortError") {
+            res.status(504).json({ error: "Upstream timeout" });
         } else {
             throw err;
         }
@@ -13196,22 +13716,24 @@ async function handleRequest(req, res) {
 class CircuitBreaker {
     constructor(fn, options = {}) {
         this.fn = fn;
-        this.failureThreshold = options.failureThreshold ?? 5;  // Open after 5 failures
-        this.successThreshold = options.successThreshold ?? 2;  // Close after 2 successes
-        this.timeout = options.timeout ?? 60000;                 // Stay open for 60s
-        this.state = 'CLOSED';
+        this.failureThreshold = options.failureThreshold ?? 5; // Open after 5 failures
+        this.successThreshold = options.successThreshold ?? 2; // Close after 2 successes
+        this.timeout = options.timeout ?? 60000; // Stay open for 60s
+        this.state = "CLOSED";
         this.failureCount = 0;
         this.successCount = 0;
         this.nextAttempt = Date.now();
     }
 
     async call(...args) {
-        if (this.state === 'OPEN') {
+        if (this.state === "OPEN") {
             if (Date.now() < this.nextAttempt) {
-                throw new Error('Circuit breaker is OPEN — request rejected (fast fail)');
+                throw new Error(
+                    "Circuit breaker is OPEN — request rejected (fast fail)",
+                );
             }
             // Timeout elapsed — try one request to probe recovery
-            this.state = 'HALF-OPEN';
+            this.state = "HALF-OPEN";
         }
 
         try {
@@ -13226,12 +13748,12 @@ class CircuitBreaker {
 
     onSuccess() {
         this.failureCount = 0;
-        if (this.state === 'HALF-OPEN') {
+        if (this.state === "HALF-OPEN") {
             this.successCount++;
             if (this.successCount >= this.successThreshold) {
-                this.state = 'CLOSED'; // Downstream recovered — resume normal traffic
+                this.state = "CLOSED"; // Downstream recovered — resume normal traffic
                 this.successCount = 0;
-                console.log('Circuit CLOSED — service recovered');
+                console.log("Circuit CLOSED — service recovered");
             }
         }
     }
@@ -13239,8 +13761,11 @@ class CircuitBreaker {
     onFailure() {
         this.failureCount++;
         this.successCount = 0;
-        if (this.failureCount >= this.failureThreshold || this.state === 'HALF-OPEN') {
-            this.state = 'OPEN';
+        if (
+            this.failureCount >= this.failureThreshold ||
+            this.state === "HALF-OPEN"
+        ) {
+            this.state = "OPEN";
             this.nextAttempt = Date.now() + this.timeout;
             console.warn(`Circuit OPEN — blocking calls for ${this.timeout}ms`);
         }
@@ -13257,9 +13782,12 @@ async function processPayment(data) {
     try {
         return await paymentBreaker.call(data);
     } catch (err) {
-        if (err.message.includes('OPEN')) {
+        if (err.message.includes("OPEN")) {
             // Return a cached result or a graceful degraded response
-            return { status: 'queued', message: 'Payment will be processed shortly' };
+            return {
+                status: "queued",
+                message: "Payment will be processed shortly",
+            };
         }
         throw err;
     }
